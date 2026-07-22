@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+# Lock, unlock, or revert files protected by the _<user>-lock pattern.
+# Invoked via sudo: chown elevates to root. Sudo auth (password, pam_tid,
+# sudowhat, ...) is the user's choice -- locked doesn't configure it.
+#
+#   sudo locked unlock <file>...    snapshot taken; chown to <user>; mode restored from meta
+#   sudo locked lock   <file>...    diff snapshot -> current; chown to lock account; mode restored from meta
+#   sudo locked revert <file>...    save current to .attic; restore snapshot; mode restored from meta
+#   sudo locked setup               provision _<user>-lock user/group, sudoers; self-install
+
+# Pin PATH so bare command names (dscl, awk, install, ...) can't be hijacked
+# even if sudoers env_keep ever leaks PATH from the invoker.
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+set -euo pipefail
+
+# Override-friendly defaults (handy for testing).
+: "${INSTALL_TARGET:=/usr/local/sbin/locked}"
+: "${SNAPSHOTS_ROOT:=/var/db/locked-snapshots}"
+
+usage() {
+  cat >&2 <<EOF
+usage: sudo locked <action> [args]
+
+  unlock <file>...   chown to <user>; snapshot taken; mode restored from .meta
+  lock   <file>...   diff snapshot -> current; chown to _<user>-lock; mode restored
+  revert <file>...   save current to .attic; restore snapshot; relock with meta mode
+  setup              provision lock user/group, sudoers; self-install to \$INSTALL_TARGET
+EOF
+  exit 1
+}
+
+[ $# -ge 1 ] || usage
+action="$1"
+shift
+
+inv="${SUDO_USER:-}"
+[ -n "$inv" ] || { echo "must be invoked via sudo" >&2; exit 1; }
+lock_user="_${inv}-lock"
+
+log_action() {
+  # Tag goes to unified logging; visible via:
+  #   log show --predicate 'eventMessage CONTAINS "locked: user="' --last 1h
+  logger -t locked "user=$inv action=$1 file=${2:-} result=${3:-ok}"
+}
+
+# ---- setup ----------------------------------------------------------------
+
+# Verify a path is root:wheel owned with no group/other write. Used to refuse
+# install when /usr/local was previously chowned to a user (legacy Homebrew on
+# Intel macs), which would let any process at that UID replace the binary and
+# escalate to root after the next Touch ID approval.
+verify_root_owned_path() {
+  local path="$1" owner mode
+  owner="$(stat -f '%Su:%Sg' "$path")"
+  mode="$(stat -f '%OLp' "$path")"
+  if [ "$owner" != "root:wheel" ]; then
+    echo "ERROR: $path is owned $owner, expected root:wheel" >&2
+    echo "       refusing to install: a non-root owner of an ancestor dir can replace the binary" >&2
+    echo "       fix manually: sudo chown root:wheel $path && sudo chmod 755 $path" >&2
+    return 1
+  fi
+  case "$mode" in
+    755|750|700|555|550|500) ;;
+    *)
+      echo "ERROR: $path has mode $mode, expected 755 or stricter" >&2
+      echo "       fix manually: sudo chmod 755 $path" >&2
+      return 1
+      ;;
+  esac
+}
+
+do_setup() {
+  [ "$EUID" -eq 0 ] || { echo "setup must run as root (sudo $0 setup)" >&2; exit 1; }
+
+  # 1. Self-install. Verify every ancestor dir of INSTALL_TARGET is root-owned
+  #    BEFORE writing the binary, so we never install into a user-writable path.
+  local self target target_dir
+  self="$(readlink -f "$0")"
+  target="$INSTALL_TARGET"
+  target_dir="$(dirname "$target")"
+
+  install -d -m 755 -o root -g wheel "$target_dir"
+
+  # Walk ancestry from target_dir up to /, verify each.
+  local p="$target_dir"
+  while [ "$p" != "/" ]; do
+    verify_root_owned_path "$p" || exit 1
+    p="$(dirname "$p")"
+  done
+
+  if [ "$self" != "$target" ]; then
+    install -m 755 -o root -g wheel "$self" "$target"
+    echo "installed: $target"
+  else
+    echo "binary already at $target"
+  fi
+
+  # 2. Lock group
+  local gid used_gids id
+  if dscl . -read "/Groups/${lock_user}" >/dev/null 2>&1; then
+    gid="$(dscl . -read "/Groups/${lock_user}" PrimaryGroupID 2>/dev/null | awk '{print $2}')"
+    echo "group exists: ${lock_user} (GID $gid)"
+  else
+    used_gids="$(dscl . -list /Groups PrimaryGroupID | awk '{print $2}')"
+    gid=
+    # Prefer 401 deterministically (the reserved lock slot; the Claude trust group
+    # _jooize-readonly takes 402). Fall back to the first free in the 400-499
+    # service lane if 401 is somehow taken.
+    for id in 401 $(seq 400 499); do
+      if ! printf '%s\n' "$used_gids" | grep -qx "$id"; then
+        gid="$id"; break
+      fi
+    done
+    [ -n "$gid" ] || { echo "no free GID in [400, 499]" >&2; exit 1; }
+    dscl . -create "/Groups/${lock_user}"
+    dscl . -create "/Groups/${lock_user}" RealName "Lock group for ${inv}"
+    dscl . -create "/Groups/${lock_user}" PrimaryGroupID "$gid"
+    echo "created group: ${lock_user} (GID $gid)"
+  fi
+
+  # 3. Lock user
+  local uid used_uids
+  if dscl . -read "/Users/${lock_user}" >/dev/null 2>&1; then
+    uid="$(dscl . -read "/Users/${lock_user}" UniqueID 2>/dev/null | awk '{print $2}')"
+    echo "user exists: ${lock_user} (UID $uid)"
+  else
+    used_uids="$(dscl . -list /Users UniqueID | awk '{print $2}')"
+    uid=
+    # Prefer 401 so the lock account has uid==gid (matches the group above). Fall
+    # back to the first free in 400-499 if 401 is taken.
+    for id in 401 $(seq 400 499); do
+      if ! printf '%s\n' "$used_uids" | grep -qx "$id"; then
+        uid="$id"; break
+      fi
+    done
+    [ -n "$uid" ] || { echo "no free UID in [400, 499]" >&2; exit 1; }
+    dscl . -create "/Users/${lock_user}"
+    dscl . -create "/Users/${lock_user}" UniqueID "$uid"
+    dscl . -create "/Users/${lock_user}" PrimaryGroupID "$gid"
+    dscl . -create "/Users/${lock_user}" UserShell /usr/bin/false
+    dscl . -create "/Users/${lock_user}" NFSHomeDirectory /var/empty
+    dscl . -create "/Users/${lock_user}" RealName "Lock user for ${inv}"
+    dscl . -create "/Users/${lock_user}" IsHidden 1
+    echo "created user: ${lock_user} (UID $uid)"
+  fi
+
+  # 4. Add invoker to lock group
+  if dseditgroup -o checkmember -m "$inv" "$lock_user" >/dev/null 2>&1; then
+    echo "$inv already member of ${lock_user}"
+  else
+    dseditgroup -o edit -a "$inv" -t user "$lock_user"
+    echo "added $inv to ${lock_user}"
+  fi
+
+  # 5. Sudoers entry with binary-digest pin (validated before installing).
+  #    sudoers Digest_Spec causes sudo to compute the binary's SHA-256 at
+  #    invocation and refuse to run if it doesn't match. This moves the
+  #    "binary integrity" check OUT of locked itself (where a swapped binary
+  #    would just skip the check) into sudo's code, which is enforced before
+  #    our binary executes. A swap causes sudo to refuse silently -- no
+  #    Touch ID prompt, no execution, no escalation.
+  local sudoers_target sudoers_line digest tmp
+  sudoers_target=/etc/sudoers.d/locked
+  digest="$(shasum -a 256 "$INSTALL_TARGET" | awk '{print $1}')"
+  sudoers_line="$inv ALL=(root) sha256:$digest ${INSTALL_TARGET}"
+  if [ -f "$sudoers_target" ] && grep -qF "$sudoers_line" "$sudoers_target"; then
+    echo "sudoers digest current: $sudoers_target"
+  else
+    tmp="$(mktemp)"
+    printf '%s\n' "$sudoers_line" >"$tmp"
+    if visudo -c -f "$tmp" >/dev/null 2>&1; then
+      install -m 440 -o root -g wheel "$tmp" "$sudoers_target"
+      echo "wrote sudoers entry with digest: $sudoers_target"
+      echo "  digest: sha256:$digest"
+    else
+      echo "sudoers validation failed; not installing" >&2
+      rm -f "$tmp"
+      exit 1
+    fi
+    rm -f "$tmp"
+  fi
+
+  # 6. Flush directory service cache so new accounts are visible immediately.
+  dscacheutil -flushcache
+
+  log_action setup "" ok
+  echo
+  echo "setup complete."
+  echo "  test: sudo locked unlock /nonexistent     # should print 'does not exist'"
+  echo "  next: chown a real file into the lock pool, then sudo locked unlock <file>"
+}
+
+if [ "$action" = "setup" ]; then
+  do_setup
+  exit 0
+fi
+
+# ---- regular actions: require lock account to exist -----------------------
+
+# Re-verify INSTALL_TARGET ancestry on every invocation, not just at setup.
+# Catches the case where /usr/local was tampered with after setup ran (e.g.,
+# a later "sudo chown -R $USER /usr/local" Homebrew permission-fix recipe).
+# Refuses to run if any ancestor became user-writable, since the next sudo
+# Touch ID approval would otherwise escalate a swapped binary.
+verify_install_ancestry() {
+  [ -f "$INSTALL_TARGET" ] || return 0   # pre-install; let other checks handle.
+  local p
+  p="$(dirname "$INSTALL_TARGET")"
+  while [ "$p" != "/" ]; do
+    verify_root_owned_path "$p" || return 1
+    p="$(dirname "$p")"
+  done
+}
+verify_install_ancestry || exit 1
+
+id -u "$lock_user" >/dev/null 2>&1 || {
+  echo "lock account $lock_user does not exist -- run: sudo $0 setup" >&2
+  exit 1
+}
+
+[ $# -ge 1 ] || usage
+
+install -d -m 700 -o root -g wheel "$SNAPSHOTS_ROOT"
+USER_SNAPSHOTS="$SNAPSHOTS_ROOT/$inv"
+install -d -m 700 -o "$lock_user" -g "$lock_user" "$USER_SNAPSHOTS"
+
+# URL-encode % and / so a path becomes an unambiguous flat filename.
+# Order matters: % first, then /, otherwise %2F gets re-encoded to %252F.
+encode() {
+  printf '%s' "$1" | sed -e 's|%|%25|g' -e 's|/|%2F|g'
+}
+
+write_meta() {
+  local meta="$1" owner="$2" group="$3" mode="$4"
+  cat >"$meta" <<EOF
+owner=$owner
+group=$group
+mode=$mode
+EOF
+  chown "$lock_user:$lock_user" "$meta"
+  chmod 600 "$meta"
+}
+
+meta_field() {
+  awk -F= -v f="$2" '$1==f{print $2; exit}' "$1"
+}
+
+# Atomic destination replace. Staging happens in $USER_SNAPSHOTS/.staging/,
+# which is mode 700 lock-account-owned -- the temp file is never visible to
+# any user-UID process during cp/chown/chmod. Once prepped, a single rename
+# moves it to dst. Rename is atomic ONLY when same filesystem (always true
+# on stock macOS where /var/db and /Users are both on the data volume); if
+# dst is on a different filesystem, we refuse rather than fall back to a
+# non-atomic copy+unlink.
+#
+# Caveats (residual, not fixable in pure bash):
+# TODO(toctou): closes destination-side TOCTOU. Source-side (attacker swaps
+# src between path resolution and cp's open(2)) is NOT closed -- bash has
+# no O_NOFOLLOW fd ops. Same residual as `install`; not made worse by this
+# helper. A Swift/Python helper using open(O_NOFOLLOW) + fchmod/fchown
+# would close it.
+# TODO(parent-swap): if an attacker renames a parent of dst between path
+# resolution and the final mv, the rename writes to the wrong location.
+# Same residual as install; needs fd-based parent verification.
+# TODO(xattrs): cp doesn't preserve extended attributes, ACLs, or BSD flags.
+# Designed for textual config files. If extended to lock files with critical
+# xattrs (quarantine, code-sign, custom ACLs), round-trip via `xattr -p`/`-w`
+# and `/bin/chmod +a`/`chflags` capture/restore.
+atomic_replace() {
+  local src="$1" dst="$2" owner="$3" mode="$4"
+  local stage_dir="$USER_SNAPSHOTS/.staging"
+  install -d -m 700 -o "$lock_user" -g "$lock_user" "$stage_dir"
+  local tmp
+  tmp="$(mktemp "${stage_dir}/replace.XXXXXX")"
+  cp -p "$src" "$tmp"
+  chown "$owner" "$tmp"
+  chmod "$mode" "$tmp"
+  # Same-filesystem check: rename is atomic only when source and destination
+  # share a device. macOS data volume covers /var/db and /Users on stock
+  # installs, but bail loudly if someone has e.g. mounted ~/ on a different
+  # volume.
+  local stage_dev dst_dev
+  stage_dev="$(stat -f '%d' "$tmp")"
+  dst_dev="$(stat -f '%d' "$(dirname "$dst")")"
+  if [ "$stage_dev" != "$dst_dev" ]; then
+    rm -f "$tmp"
+    echo "ERROR: $dst is on a different filesystem from $stage_dir; refusing non-atomic mv" >&2
+    return 1
+  fi
+  mv -f "$tmp" "$dst"
+}
+
+# Per-file body wrapped so partial failure on one file doesn't abort the loop.
+process_one() {
+  local f="$1"
+  f="$(readlink -f "$f")"
+  if [ ! -e "$f" ]; then
+    echo "skip $f: does not exist" >&2
+    log_action "$action" "$f" skip-noent
+    return 0
+  fi
+
+  local owner_now group_now mode_now enc snap attic meta
+  owner_now="$(stat -f '%Su' "$f")"
+  group_now="$(stat -f '%Sg' "$f")"
+  mode_now="$(stat -f '%OLp' "$f")"
+  enc="$(encode "$f")"
+  snap="$USER_SNAPSHOTS/${enc}.snap"
+  attic="$USER_SNAPSHOTS/${enc}.attic"
+  meta="$USER_SNAPSHOTS/${enc}.meta"
+
+  case "$action" in
+    unlock)
+      if [ "$owner_now" != "$lock_user" ]; then
+        echo "skip $f: not locked (owner=$owner_now)" >&2
+        log_action unlock "$f" skip-not-locked
+        return 0
+      fi
+      local target_owner target_group target_mode
+      if [ -f "$meta" ]; then
+        target_owner="$(meta_field "$meta" owner)"
+        target_group="$(meta_field "$meta" group)"
+        target_mode="$(meta_field "$meta" mode)"
+      else
+        echo "  warning: no meta for $f, capturing current mode $mode_now as canonical -- review and fix .meta if this is a transient permission state" >&2
+        target_owner="$inv"
+        target_group=staff
+        target_mode="$mode_now"
+      fi
+      atomic_replace "$f" "$snap" "${lock_user}:${lock_user}" 600
+      chown -h "${target_owner}:${target_group}" "$f"
+      chmod "$target_mode" "$f"
+      echo "unlocked: $f"
+      echo "  snapshot: $snap"
+      log_action unlock "$f" ok
+      ;;
+
+    lock)
+      if [ "$owner_now" != "$inv" ]; then
+        echo "skip $f: not owned by you (owner=$owner_now)" >&2
+        log_action lock "$f" skip-not-owned
+        return 0
+      fi
+      if [ ! -f "$meta" ]; then
+        write_meta "$meta" "$owner_now" "$group_now" "$mode_now"
+        echo "  initialized meta: $meta (owner=$owner_now group=$group_now mode=$mode_now)"
+      else
+        local expected_mode
+        expected_mode="$(meta_field "$meta" mode)"
+        if [ "$mode_now" != "$expected_mode" ]; then
+          echo "  note: mode drifted from $expected_mode to $mode_now during edit; restoring to $expected_mode on lock" >&2
+        fi
+      fi
+      if [ -f "$snap" ]; then
+        printf '\n--- diff snapshot -> current ---\n'
+        diff -u "$snap" "$f" || true
+        echo
+      else
+        echo "$f: no snapshot found -- locking without diff" >&2
+      fi
+      chown -h "${lock_user}:${lock_user}" "$f"
+      chmod "$(meta_field "$meta" mode)" "$f"
+      echo "locked: $f"
+      log_action lock "$f" ok
+      ;;
+
+    revert)
+      if [ ! -f "$snap" ]; then
+        echo "skip $f: no snapshot to revert from" >&2
+        log_action revert "$f" skip-no-snap
+        return 0
+      fi
+      # Guard against double-revert: if file already matches snapshot, the
+      # current attic IS the legitimate discarded edit; overwriting it would
+      # destroy that record without changing anything else.
+      if cmp -s "$f" "$snap"; then
+        echo "skip $f: file already matches snapshot (preserving existing .attic)" >&2
+        log_action revert "$f" skip-already-reverted
+        return 0
+      fi
+      local target_mode=600
+      [ -f "$meta" ] && target_mode="$(meta_field "$meta" mode)"
+      atomic_replace "$f"    "$attic" "${lock_user}:${lock_user}" 600
+      atomic_replace "$snap" "$f"     "${lock_user}:${lock_user}" "$target_mode"
+      echo "reverted: $f from snapshot"
+      echo "  discarded content saved to: $attic"
+      log_action revert "$f" ok
+      ;;
+
+    *)
+      usage
+      ;;
+  esac
+}
+
+# Loop over files, isolating failures so one bad file doesn't abort the rest.
+for f in "$@"; do
+  if ! process_one "$f"; then
+    echo "error processing $f (continuing)" >&2
+    log_action "$action" "$f" error
+  fi
+done
