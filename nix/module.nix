@@ -126,15 +126,32 @@ in
       type = lib.types.nullOr lib.types.int;
       default = null;
       description = ''
-        Optional fixed uid for the lock account (also its gid unless gid
-        is set). Left null, the account is provisioned imperatively at
-        activation with the first free id in the hidden 401-499 service
-        range -- nothing consumes the number, so this is the
-        zero-configuration default. Set it to pin the number instead
-        (declarative users.knownUsers management): on-disk ownership of
-        the snapshot tree then survives any account recreation with its
-        meaning intact. Deletion is a manual ceremony either way --
-        nix-darwin refuses to delete accounts with ids <= 501.
+        Uid for the lock account (also its gid unless gid is set),
+        declared via users.knownUsers -- the preferred, declarative
+        mode: the number lives in the config, and on-disk ownership of
+        the snapshot tree survives any account recreation with its
+        meaning intact. Pick a free id in the hidden 400-499 service
+        range; list what is taken with:
+
+            dscl . -list /Users UniqueID | awk '$2 >= 400 && $2 < 500'
+            dscl . -list /Groups PrimaryGroupID | awk '$2 >= 400 && $2 < 500'
+
+        For a config that must not carry a machine-specific number, set
+        allocateId instead; one of the two is required. Deletion is a
+        manual ceremony either way -- nix-darwin refuses to delete
+        accounts with ids <= 501.
+      '';
+    };
+
+    allocateId = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Opt out of declaring a number: provision the lock account
+        imperatively at activation with the first free id in 401-499
+        (setup's own allocation logic; idempotent). Nothing consumes the
+        id number, so this is safe -- the trade is that the account
+        lives outside nix-darwin's users.knownUsers registry.
       '';
     };
 
@@ -188,6 +205,13 @@ in
           assertion = pkgs.stdenv.hostPlatform.isDarwin;
           message = "security.locked is Darwin-only (BSD file flags)";
         }
+        {
+          # Exactly one mode: declarative is the default expectation
+          # (spirit of nix -- the config carries the number); imperative
+          # allocation is the explicit opt-out, never a silent fallback.
+          assertion = (cfg.uid != null) != cfg.allocateId;
+          message = "security.locked: set uid (declarative, preferred) or allocateId = true (activation-time allocation) -- exactly one";
+        }
       ];
 
       environment.systemPackages = [ package ];
@@ -195,9 +219,10 @@ in
       environment.etc."sudoers.d/locked".source = sudoersFile;
     }
 
-    # Two provisioning modes, the user's choice (see the uid option):
-    # pinned number -> declarative and converged by nix-darwin; no number
-    # -> imperative first-free allocation, same as `setup` would do.
+    # Two provisioning modes, the assertion above enforcing a conscious
+    # choice: declared number -> users.knownUsers, converged by
+    # nix-darwin; allocateId -> imperative first-free allocation, same
+    # as `setup` would do.
     (lib.mkIf (cfg.uid != null) {
       users.knownUsers = [ lockAccount ];
       users.knownGroups = [ lockAccount ];
@@ -214,7 +239,7 @@ in
         members = [ cfg.user ];
       };
     })
-    (lib.mkIf (cfg.uid == null) {
+    (lib.mkIf cfg.allocateId {
       system.activationScripts.extraActivation.text = lib.mkAfter provisionAccounts;
     })
 

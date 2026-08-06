@@ -60,17 +60,18 @@ imports = [ inputs.locked.darwinModules.default ];
 security.locked = {
   enable = true;
   user = "jooize";
+  uid = 403;   # declared id (users.knownUsers); pick a free one in 400-499
 };
 ```
 
-The lock account and group are allocated the first free uid/gid in the
-hidden 401-499 service range at activation time (idempotent, same logic
-as `setup`); nothing consumes the id number -- sudoers, chown and the
-script go by name. Set `security.locked.uid` to pin the number instead
-(declarative `users.knownUsers` management; on-disk snapshot ownership
-then survives account recreation with its meaning intact). Deletion is
-a manual ceremony either way: nix-darwin refuses to delete accounts
-with ids <= 501.
+The id is declared in the config (spirit of nix; on-disk snapshot
+ownership survives account recreation with its meaning intact). For a
+config that must not carry a machine-specific number, set
+`allocateId = true` instead -- the account is then provisioned
+imperatively at activation with the first free id in 401-499 (`setup`'s
+own logic); exactly one of the two is required. Deletion is a manual
+ceremony either way: nix-darwin refuses to delete accounts with ids
+<= 501.
 
 A nix-managed install refuses `setup` (the module owns provisioning) and
 accepts `/nix/store` in the install-ancestry walk -- keyed to that
