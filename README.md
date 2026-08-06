@@ -60,9 +60,13 @@ imports = [ inputs.locked.darwinModules.default ];
 security.locked = {
   enable = true;
   user = "jooize";
-  uid = 403;   # pick a free id in the hidden 400-499 range; see the option doc
 };
 ```
+
+The lock account and group are allocated the first free uid/gid in the
+hidden 401-499 service range at activation time (idempotent, same logic
+as `setup`); nothing consumes the id number -- sudoers, chown and the
+script go by name.
 
 A nix-managed install refuses `setup` (the module owns provisioning) and
 accepts `/nix/store` in the install-ancestry walk -- keyed to that

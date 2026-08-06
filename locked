@@ -1,5 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # locked v2 -- three-tier BSD-flag protection for user-space trust surfaces.
+#
+# /bin/bash, not `env bash`: sudo passes the caller's PATH through (probed
+# live 2026-08-06), and env resolves the interpreter from it BEFORE the
+# PATH pin below runs -- a user-writable bash would run as root. /bin/bash
+# is SIP-sealed and present on every macOS, and this tool is Darwin-only.
 #
 # Tiers (see DESIGN-v2.md):
 #   content    uchg,  owned by _<user>-lock; leaf files, or leaf dirs (recursive)

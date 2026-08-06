@@ -18,28 +18,22 @@ let
 
   srcText = builtins.readFile ../locked;
 
-  # Anchor-line rewrites, failing the eval loudly if any anchor ever
-  # changes shape in the script:
+  # One anchor-line rewrite, failing the eval loudly if the anchor ever
+  # changes shape in the script: INSTALL_TARGET's default becomes the
+  # system-profile path (stable across generations, always resolving to
+  # the current build).
   #
-  #   - INSTALL_TARGET default becomes the system-profile path (stable
-  #     across generations, always resolving to the current build).
-  #   - The shebang becomes /bin/bash: `env bash` resolves the interpreter
-  #     from the CALLER's environment before the script's own PATH pin
-  #     runs, and /bin/bash is the exact interpreter the harness proves
-  #     the script against.
-  #
-  # Unlike pinned's module, PATH is deliberately NOT rewritten to prepend
-  # the system profile: every probe in locked speaks BSD (stat -f,
-  # chflags, dscl), and a GNU coreutils `stat` from the profile would
-  # shadow it with different semantics. The OS-only PATH is correct here.
+  # Deliberate non-rewrites, unlike pinned's module: the shebang is
+  # already /bin/bash in the repo (see the script's own header -- sudo
+  # passes the caller's PATH through, so `env bash` would let the invoker
+  # pick root's interpreter), and PATH is NOT profile-prepended: every
+  # probe in locked speaks BSD (stat -f, chflags, dscl), and a GNU
+  # coreutils `stat` from the profile would shadow it with different
+  # semantics. The OS-only PATH is correct here.
   anchors = [
     {
       from = '': "''${INSTALL_TARGET:=/usr/local/sbin/locked}"'';
       to = '': "''${INSTALL_TARGET:=${cfg.installPath}}"'';
-    }
-    {
-      from = "#!/usr/bin/env bash";
-      to = "#!/bin/bash";
     }
   ];
   scriptText =
@@ -62,6 +56,56 @@ let
 
   # Same derivation as the script's lock_account_for().
   lockAccount = "_${cfg.user}-lock";
+
+  # Account provisioning mirrors `setup` steps 2-4 (proven idempotent),
+  # the same way pinned's module provisions its groups: Darwin has no id
+  # allocator, so a declarative users.users entry would force a hand-
+  # picked uid into the config. Instead scan the hidden 401-499 service
+  # range for the first free id at activation time. The trade, accepted
+  # knowingly: nix-darwin does not manage the account's lifecycle
+  # (creation-if-absent only, no declarative deletion); nothing consumes
+  # the id NUMBER -- sudoers, chown and the script all go by name.
+  provisionAccounts = ''
+    if ! /usr/bin/dscl . -read "/Groups/${lockAccount}" PrimaryGroupID >/dev/null 2>&1; then
+      taken="$(/usr/bin/dscl . -list /Groups PrimaryGroupID | /usr/bin/awk '{print $2}')"
+      locked_gid=""
+      for c in $(/usr/bin/seq 401 499); do
+        if ! printf '%s\n' "$taken" | /usr/bin/grep -qx "$c"; then locked_gid="$c"; break; fi
+      done
+      if [ -z "$locked_gid" ]; then
+        echo "locked: no free gid in 401-499; refusing to provision ${lockAccount}" >&2
+        exit 1
+      fi
+      echo "creating group ${lockAccount} (gid $locked_gid, hidden range)..." >&2
+      /usr/bin/dscl . -create "/Groups/${lockAccount}"
+      /usr/bin/dscl . -create "/Groups/${lockAccount}" RealName "Lock group for ${cfg.user}"
+      /usr/bin/dscl . -create "/Groups/${lockAccount}" PrimaryGroupID "$locked_gid"
+    fi
+    if ! /usr/bin/dscl . -read "/Users/${lockAccount}" UniqueID >/dev/null 2>&1; then
+      locked_gid="$(/usr/bin/dscl . -read "/Groups/${lockAccount}" PrimaryGroupID | /usr/bin/awk '{print $2}')"
+      taken="$(/usr/bin/dscl . -list /Users UniqueID | /usr/bin/awk '{print $2}')"
+      locked_uid=""
+      for c in $(/usr/bin/seq 401 499); do
+        if ! printf '%s\n' "$taken" | /usr/bin/grep -qx "$c"; then locked_uid="$c"; break; fi
+      done
+      if [ -z "$locked_uid" ]; then
+        echo "locked: no free uid in 401-499; refusing to provision ${lockAccount}" >&2
+        exit 1
+      fi
+      echo "creating user ${lockAccount} (uid $locked_uid, hidden range)..." >&2
+      /usr/bin/dscl . -create "/Users/${lockAccount}"
+      /usr/bin/dscl . -create "/Users/${lockAccount}" UniqueID "$locked_uid"
+      /usr/bin/dscl . -create "/Users/${lockAccount}" PrimaryGroupID "$locked_gid"
+      /usr/bin/dscl . -create "/Users/${lockAccount}" UserShell /usr/bin/false
+      /usr/bin/dscl . -create "/Users/${lockAccount}" NFSHomeDirectory /var/empty
+      /usr/bin/dscl . -create "/Users/${lockAccount}" RealName "Lock user for ${cfg.user}"
+      /usr/bin/dscl . -create "/Users/${lockAccount}" IsHidden 1
+      /usr/bin/dscacheutil -flushcache
+    fi
+    # Membership grants add-rights in placement-tier dirs; asserted on
+    # every activation.
+    /usr/sbin/dseditgroup -o edit -a "${cfg.user}" -t user "${lockAccount}" 2>/dev/null || true
+  '';
 in
 {
   options.security.locked = {
@@ -74,31 +118,9 @@ in
         (digest-pinned, no NOPASSWD) and made a member of the lock group,
         which carries add-rights in placement-tier directories. The lock
         account and group are named _<user>-lock, matching the script's
-        own derivation.
+        own derivation, and are allocated the first free uid/gid in the
+        hidden 401-499 service range at activation time.
       '';
-    };
-
-    uid = lib.mkOption {
-      type = lib.types.int;
-      description = ''
-        Uid for the lock account (also its gid unless gid is set).
-        Darwin has no id allocator, so pick a free id in the hidden
-        400-499 service range consciously; list what is taken with:
-
-            dscl . -list /Users UniqueID | awk '$2 >= 400 && $2 < 500'
-            dscl . -list /Groups PrimaryGroupID | awk '$2 >= 400 && $2 < 500'
-
-        No default on purpose: a collision at activation is skipped with
-        a warning by nix-darwin, which would leave the account missing
-        while everything else deploys.
-      '';
-    };
-
-    gid = lib.mkOption {
-      type = lib.types.int;
-      default = cfg.uid;
-      defaultText = lib.literalExpression "config.security.locked.uid";
-      description = "Gid for the lock group.";
     };
 
     installPath = lib.mkOption {
@@ -149,29 +171,13 @@ in
 
     environment.etc."sudoers.d/locked".source = sudoersFile;
 
-    # Declarative replacement for setup's dscl block. home and shell are
-    # left null: nix-darwin then creates the account with /var/empty and
-    # /usr/bin/false, exactly the imperative values.
-    users.knownUsers = [ lockAccount ];
-    users.knownGroups = [ lockAccount ];
-    users.users.${lockAccount} = {
-      uid = cfg.uid;
-      gid = cfg.gid;
-      description = "Lock user for ${cfg.user}";
-      # isHidden default true; uid < 500 hides it from loginwindow anyway.
-    };
-    users.groups.${lockAccount} = {
-      gid = cfg.gid;
-      description = "Lock group for ${cfg.user}";
-      # Membership grants add-rights in placement-tier dirs (group-write
-      # there); nix-darwin converges membership to exactly this list.
-      members = [ cfg.user ];
-    };
+    system.activationScripts.extraActivation.text = lib.mkAfter provisionAccounts;
 
     # Declarative replacement for install_verify_timer. The daemon runs
     # the store path directly: launchd needs no digest gate (it is root
     # already), and the plist changing per build makes nix-darwin reload
-    # it with each generation.
+    # it with each generation. Label is set explicitly so the plist keeps
+    # the documented path /Library/LaunchDaemons/locked.verify.plist.
     launchd.daemons.locked-verify = {
       serviceConfig = {
         Label = "locked.verify";
