@@ -137,21 +137,23 @@ in
             dscl . -list /Groups PrimaryGroupID | awk '$2 >= 400 && $2 < 500'
 
         For a config that must not carry a machine-specific number, set
-        allocateId instead; one of the two is required. Deletion is a
+        allocateIds instead; one of the two is required. Deletion is a
         manual ceremony either way -- nix-darwin refuses to delete
         accounts with ids <= 501.
       '';
     };
 
-    allocateId = lib.mkOption {
+    allocateIds = lib.mkOption {
       type = lib.types.bool;
       default = false;
       description = ''
-        Opt out of declaring a number: provision the lock account
-        imperatively at activation with the first free id in 401-499
-        (setup's own allocation logic; idempotent). Nothing consumes the
-        id number, so this is safe -- the trade is that the account
-        lives outside nix-darwin's users.knownUsers registry.
+        Opt out of declaring numbers: provision the lock account and
+        group imperatively at activation with the first free ids in
+        401-499 (setup's own allocation logic; idempotent). Nothing
+        consumes the id numbers, so this is safe -- the trade is that
+        the account lives outside nix-darwin's users.knownUsers
+        registry. (One option name, allocateIds, across this module
+        family -- see security.pinned.allocateIds.)
       '';
     };
 
@@ -209,8 +211,8 @@ in
           # Exactly one mode: declarative is the default expectation
           # (spirit of nix -- the config carries the number); imperative
           # allocation is the explicit opt-out, never a silent fallback.
-          assertion = (cfg.uid != null) != cfg.allocateId;
-          message = "security.locked: set uid (declarative, preferred) or allocateId = true (activation-time allocation) -- exactly one";
+          assertion = (cfg.uid != null) != cfg.allocateIds;
+          message = "security.locked: set uid (declarative, preferred) or allocateIds = true (activation-time allocation) -- exactly one";
         }
       ];
 
@@ -221,7 +223,7 @@ in
 
     # Two provisioning modes, the assertion above enforcing a conscious
     # choice: declared number -> users.knownUsers, converged by
-    # nix-darwin; allocateId -> imperative first-free allocation, same
+    # nix-darwin; allocateIds -> imperative first-free allocation, same
     # as `setup` would do.
     (lib.mkIf (cfg.uid != null) {
       users.knownUsers = [ lockAccount ];
@@ -239,7 +241,7 @@ in
         members = [ cfg.user ];
       };
     })
-    (lib.mkIf cfg.allocateId {
+    (lib.mkIf cfg.allocateIds {
       system.activationScripts.extraActivation.text = lib.mkAfter provisionAccounts;
     })
 

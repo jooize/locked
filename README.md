@@ -67,7 +67,7 @@ security.locked = {
 The id is declared in the config (spirit of nix; on-disk snapshot
 ownership survives account recreation with its meaning intact). For a
 config that must not carry a machine-specific number, set
-`allocateId = true` instead -- the account is then provisioned
+`allocateIds = true` instead -- the account is then provisioned
 imperatively at activation with the first free id in 401-499 (`setup`'s
 own logic); exactly one of the two is required. Deletion is a manual
 ceremony either way: nix-darwin refuses to delete accounts with ids
