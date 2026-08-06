@@ -26,6 +26,10 @@ Three tiers, named by what they protect:
   whole ancestor chain (placement for user-owned parents, anchor for `~`),
   stops only at a root-owned node, shows the snapshot diff, and asks
   before sealing (`--yes` for scripted runs, `--dry-run` to preview).
+- `sudo locked edit <file>` -- sudoedit-style edit, the preferred flow:
+  your editor runs as you on a user-owned temp copy, the candidate is
+  staged out of reach, then diff + confirm installs and reseals. The
+  file is never left unlocked and no chain release is needed.
 - `sudo locked unlock <path>` -- release just that node (snapshot taken);
   `--chain` also drops the ancestors' flags when an edit needs a rename
   into a frozen parent (atomic-save editors).

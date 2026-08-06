@@ -54,6 +54,13 @@ usage: sudo locked <action> [options] [args]
       files/dirs). --chain also drops flags on chain ancestors, for
       edits that need a rename into a frozen parent (atomic-save
       editors). Next lock re-seals the chain.
+  edit [--editor CMD] [--yes] <file>...
+      sudoedit-style: copy the locked file to a user-owned temp copy,
+      run your editor on it as you, then diff and confirm before the
+      staged result is installed and resealed. The file is never left
+      unlocked and no chain release is needed. Editor: --editor, else
+      SUDO_EDITOR/VISUAL/EDITOR, else vi (single command, gets the
+      copy's path as its argument).
   revert [--dry-run] <path>...
       Files only: save current to .attic, restore snapshot, re-seal if
       the file was locked.
@@ -88,6 +95,7 @@ shift
 OPT_TIER=""
 OPT_FLAG=sappnd
 OPT_FLAG_SET=0
+OPT_EDITOR=""
 OPT_YES=0
 OPT_DRY=0
 OPT_CHAIN=0
@@ -100,6 +108,8 @@ while [ $# -gt 0 ]; do
     --tier=*)  OPT_TIER="${1#--tier=}"; shift ;;
     --flag)    OPT_FLAG="${2:?--flag needs a value}"; OPT_FLAG_SET=1; shift 2 ;;
     --flag=*)  OPT_FLAG="${1#--flag=}"; OPT_FLAG_SET=1; shift ;;
+    --editor)   OPT_EDITOR="${2:?--editor needs a value}"; shift 2 ;;
+    --editor=*) OPT_EDITOR="${1#--editor=}"; shift ;;
     --yes)     OPT_YES=1; shift ;;
     --dry-run) OPT_DRY=1; shift ;;
     --chain)   OPT_CHAIN=1; shift ;;
@@ -1021,6 +1031,100 @@ EOF
   fi
 }
 
+# sudoedit-style edit: the locked file never spends time unlocked. The
+# editor runs AS THE INVOKER on a user-owned temp copy; the candidate is
+# then pulled into lock-account staging (out of user reach) BEFORE the
+# diff is shown, so what you approve is exactly what installs -- a
+# tampered copy shows up in the diff. atomic_replace lifts append flags
+# on the parent, so no chain release is needed.
+do_edit_one() {
+  local f="$1"
+  f="$(readlink -f "$f")" || { echo "skip: cannot resolve $1" >&2; return 1; }
+  snap_paths "$f"
+  [ -f "$META" ] || { echo "skip $f: not in pool (edit works on locked files; use lock to adopt)" >&2; return 1; }
+  [ -f "$f" ] || { echo "skip $f: edit supports regular files only" >&2; return 1; }
+
+  local tier state flag mode owner group
+  tier="$(meta_field "$META" tier)"
+  state="$(meta_field "$META" state)"
+  flag="$(meta_field "$META" flag)"
+  mode="$(meta_field "$META" mode)"
+  owner="$(meta_field "$META" owner)"
+  group="$(meta_field "$META" group)"
+  case "$tier" in
+    content|anchor) ;;
+    *) echo "skip $f: edit supports content/anchor files, not tier '$tier'" >&2; return 1 ;;
+  esac
+  if [ "$state" != "locked" ]; then
+    echo "skip $f: currently unlocked -- edit it directly, then: sudo locked lock $f" >&2
+    return 1
+  fi
+
+  # User-owned working copy in a private temp dir.
+  local editdir copy
+  editdir="$(mktemp -d /tmp/locked-edit.XXXXXX)" || return 1
+  copy="$editdir/$(basename "$f")"
+  cp -- "$f" "$copy" || { rm -rf -- "$editdir"; return 1; }
+  chown -R "$inv" "$editdir" || { rm -rf -- "$editdir"; return 1; }
+  chmod 700 "$editdir" || { rm -rf -- "$editdir"; return 1; }
+  chmod 600 "$copy" || { rm -rf -- "$editdir"; return 1; }
+
+  local editor
+  editor="${OPT_EDITOR:-${SUDO_EDITOR:-${VISUAL:-${EDITOR:-vi}}}}"
+  if ! sudo -u "$inv" -- "$editor" "$copy"; then
+    echo "editor exited nonzero; nothing installed: $f" >&2
+    rm -rf -- "$editdir"
+    return 1
+  fi
+
+  if cmp -s -- "$copy" "$f"; then
+    echo "no changes: $f"
+    rm -rf -- "$editdir"
+    log_action edit "$f" skip-unchanged
+    return 0
+  fi
+
+  # Pull the candidate out of user reach BEFORE showing the diff.
+  local stage_dir stage
+  stage_dir="$USER_SNAPSHOTS/.staging"
+  install -d -m 700 -o "$lock_user" -g "$lock_user" "$stage_dir" || { rm -rf -- "$editdir"; return 1; }
+  stage="$(mktemp "${stage_dir}/edit.XXXXXX")" || { rm -rf -- "$editdir"; return 1; }
+  cp -- "$copy" "$stage" || { rm -f -- "$stage"; rm -rf -- "$editdir"; return 1; }
+  rm -rf -- "$editdir"
+
+  printf -- '\n--- diff current -> edited: %s ---\n' "$f"
+  diff -u "$f" "$stage" || true
+  echo
+  confirm "Install and reseal $f?" || {
+    echo "aborted: $f (edit discarded)" >&2
+    rm -f -- "$stage"
+    return 2
+  }
+
+  # Snapshot := pre-edit content, so revert undoes exactly this edit.
+  run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || { rm -f -- "$stage"; return 1; }
+
+  local install_owner="${lock_user}:${lock_user}"
+  [ "$tier" = "anchor" ] && install_owner="${owner}:${group}"
+  fclear "$flag" "$f" || { rm -f -- "$stage"; return 1; }
+  run atomic_replace "$stage" "$f" "$install_owner" "$mode" || { rm -f -- "$stage"; return 1; }
+  rm -f -- "$stage"
+  fset "$flag" "$f" || return 1
+  write_meta "$META" \
+    "owner=$owner" \
+    "group=$group" \
+    "mode=$mode" \
+    "lockmode=$(meta_field "$META" lockmode)" \
+    "tier=$tier" \
+    "flag=$flag" \
+    "flagsym=$(flags_of "$f")" \
+    "id=$(node_id "$f")" \
+    "recursive=0" \
+    "state=locked" || return 1
+  echo "edited and resealed: $f"
+  log_action edit "$f" ok
+}
+
 do_revert_one() {
   local f="$1"
   f="$(readlink -f "$f")" || { echo "skip: cannot resolve $1" >&2; return 1; }
@@ -1200,7 +1304,11 @@ require_paths() {
 }
 
 case "$action" in
-  lock|unlock|revert|status)
+  lock|unlock|revert|status|edit)
+    if [ "$action" = "edit" ] && [ "$OPT_DRY" -eq 1 ]; then
+      echo "edit does not support --dry-run (the diff+confirm IS the preview)" >&2
+      exit 1
+    fi
     require_paths
     failures=0
     for f in "${PATHS[@]}"; do
@@ -1208,6 +1316,7 @@ case "$action" in
         lock)   do_lock_one "$f"   || { rc=$?; [ "$rc" -eq 2 ] && exit 2; failures=$((failures + 1)); echo "error processing $f (continuing)" >&2; } ;;
         unlock) do_unlock_one "$f" || { failures=$((failures + 1)); echo "error processing $f (continuing)" >&2; } ;;
         revert) do_revert_one "$f" || { failures=$((failures + 1)); echo "error processing $f (continuing)" >&2; } ;;
+        edit)   do_edit_one "$f"   || { rc=$?; [ "$rc" -eq 2 ] && exit 2; failures=$((failures + 1)); echo "error processing $f (continuing)" >&2; } ;;
         status) do_status_one "$f" || failures=$((failures + 1)) ;;
       esac
     done

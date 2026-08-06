@@ -264,6 +264,21 @@ check "parent resealed uappnd"           "uappnd" "$(flags_of "$FAKE_HOME/sub")"
 check "home resealed sappnd"             "sappnd" "$(flags_of "$FAKE_HOME")"
 ok   "verify clean after chain reseal"   locked verify
 
+note "== cli: locked edit -- sudoedit-style, no unlock window =="
+ED="$SCRATCH/edscript"
+cat >"$ED" <<'EOS'
+#!/bin/sh
+printf 'edited by script\n' > "$1"
+EOS
+chmod 755 "$ED"
+ok   "edit installs via staging"         locked edit --yes --editor "$ED" "$CFG"
+check "edited content installed"         "edited by script" "$(head -1 "$CFG")"
+check "still locked after edit"          "uchg" "$(flags_of "$CFG")"
+check "owner still lock account"         "$LOCK_ACCT" "$(owner_of "$CFG")"
+ok   "verify clean after edit"           locked verify
+ok   "revert undoes the edit"            locked revert "$CFG"
+check "revert restored pre-edit"         "version 4" "$(head -1 "$CFG")"
+
 note "== cli: ~/.ssh class -- anchor only, ownership never changes =="
 as_user mkdir -m 700 -- "$FAKE_HOME/.ssh"
 SSHCFG="$FAKE_HOME/.ssh/config"
