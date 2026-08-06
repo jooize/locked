@@ -498,6 +498,27 @@ verify_ancestor() {
     echo "ERROR: /nix/store is owned $owner mode $mode, expected root-owned 1775" >&2
     return 1
   fi
+  case "$p" in
+    /nix/store/*)
+      # Store OBJECT dirs: owner root always, but the GROUP varies with
+      # how the object was realized (wheel when substituted, nixbld when
+      # the daemon built it locally -- both live on this machine). The
+      # strict no-write modes make the group name moot: there is no
+      # group-write bit to abuse. Owner and mode stay enforced.
+      local owner mode
+      owner="$(stat -f '%Su' "$p")"
+      mode="$(stat -f '%OLp' "$p")"
+      if [ "$owner" != "root" ]; then
+        echo "ERROR: $p is owned by $owner, expected root" >&2
+        return 1
+      fi
+      case "$mode" in
+        755|750|700|555|550|500) return 0 ;;
+      esac
+      echo "ERROR: $p has mode $mode, expected 755 or stricter" >&2
+      return 1
+      ;;
+  esac
   verify_root_owned_path "$p"
 }
 
