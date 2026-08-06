@@ -66,7 +66,11 @@ security.locked = {
 The lock account and group are allocated the first free uid/gid in the
 hidden 401-499 service range at activation time (idempotent, same logic
 as `setup`); nothing consumes the id number -- sudoers, chown and the
-script go by name.
+script go by name. Set `security.locked.uid` to pin the number instead
+(declarative `users.knownUsers` management; on-disk snapshot ownership
+then survives account recreation with its meaning intact). Deletion is
+a manual ceremony either way: nix-darwin refuses to delete accounts
+with ids <= 501.
 
 A nix-managed install refuses `setup` (the module owns provisioning) and
 accepts `/nix/store` in the install-ancestry walk -- keyed to that

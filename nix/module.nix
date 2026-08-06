@@ -118,9 +118,31 @@ in
         (digest-pinned, no NOPASSWD) and made a member of the lock group,
         which carries add-rights in placement-tier directories. The lock
         account and group are named _<user>-lock, matching the script's
-        own derivation, and are allocated the first free uid/gid in the
-        hidden 401-499 service range at activation time.
+        own derivation.
       '';
+    };
+
+    uid = lib.mkOption {
+      type = lib.types.nullOr lib.types.int;
+      default = null;
+      description = ''
+        Optional fixed uid for the lock account (also its gid unless gid
+        is set). Left null, the account is provisioned imperatively at
+        activation with the first free id in the hidden 401-499 service
+        range -- nothing consumes the number, so this is the
+        zero-configuration default. Set it to pin the number instead
+        (declarative users.knownUsers management): on-disk ownership of
+        the snapshot tree then survives any account recreation with its
+        meaning intact. Deletion is a manual ceremony either way --
+        nix-darwin refuses to delete accounts with ids <= 501.
+      '';
+    };
+
+    gid = lib.mkOption {
+      type = lib.types.nullOr lib.types.int;
+      default = cfg.uid;
+      defaultText = lib.literalExpression "config.security.locked.uid";
+      description = "Gid for the lock group when uid is set.";
     };
 
     installPath = lib.mkOption {
@@ -155,37 +177,63 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
-    assertions = [
-      {
-        assertion = validUser cfg.user;
-        message = "security.locked.user must match [A-Za-z_][A-Za-z0-9_-]* (it is spliced into sudoers)";
-      }
-      {
-        assertion = pkgs.stdenv.hostPlatform.isDarwin;
-        message = "security.locked is Darwin-only (BSD file flags)";
-      }
-    ];
+  config = lib.mkIf cfg.enable (lib.mkMerge [
+    {
+      assertions = [
+        {
+          assertion = validUser cfg.user;
+          message = "security.locked.user must match [A-Za-z_][A-Za-z0-9_-]* (it is spliced into sudoers)";
+        }
+        {
+          assertion = pkgs.stdenv.hostPlatform.isDarwin;
+          message = "security.locked is Darwin-only (BSD file flags)";
+        }
+      ];
 
-    environment.systemPackages = [ package ];
+      environment.systemPackages = [ package ];
 
-    environment.etc."sudoers.d/locked".source = sudoersFile;
+      environment.etc."sudoers.d/locked".source = sudoersFile;
+    }
 
-    system.activationScripts.extraActivation.text = lib.mkAfter provisionAccounts;
-
-    # Declarative replacement for install_verify_timer. The daemon runs
-    # the store path directly: launchd needs no digest gate (it is root
-    # already), and the plist changing per build makes nix-darwin reload
-    # it with each generation. Label is set explicitly so the plist keeps
-    # the documented path /Library/LaunchDaemons/locked.verify.plist.
-    launchd.daemons.locked-verify = {
-      serviceConfig = {
-        Label = "locked.verify";
-        ProgramArguments = [ "${package}/bin/locked" "verify" "--quiet" ];
-        StartInterval = cfg.verifyInterval;
-        RunAtLoad = true;
-        StandardErrorPath = "/var/log/locked-verify.log";
+    # Two provisioning modes, the user's choice (see the uid option):
+    # pinned number -> declarative and converged by nix-darwin; no number
+    # -> imperative first-free allocation, same as `setup` would do.
+    (lib.mkIf (cfg.uid != null) {
+      users.knownUsers = [ lockAccount ];
+      users.knownGroups = [ lockAccount ];
+      users.users.${lockAccount} = {
+        uid = cfg.uid;
+        gid = cfg.gid;
+        description = "Lock user for ${cfg.user}";
+        # home/shell left null: nix-darwin creates with /var/empty and
+        # /usr/bin/false, exactly the imperative values.
       };
-    };
-  };
+      users.groups.${lockAccount} = {
+        gid = cfg.gid;
+        description = "Lock group for ${cfg.user}";
+        members = [ cfg.user ];
+      };
+    })
+    (lib.mkIf (cfg.uid == null) {
+      system.activationScripts.extraActivation.text = lib.mkAfter provisionAccounts;
+    })
+
+    {
+      # Declarative replacement for install_verify_timer. The daemon runs
+      # the store path directly: launchd needs no digest gate (it is root
+      # already), and the plist changing per build makes nix-darwin
+      # reload it with each generation. Label is set explicitly so the
+      # plist keeps the documented path
+      # /Library/LaunchDaemons/locked.verify.plist.
+      launchd.daemons.locked-verify = {
+        serviceConfig = {
+          Label = "locked.verify";
+          ProgramArguments = [ "${package}/bin/locked" "verify" "--quiet" ];
+          StartInterval = cfg.verifyInterval;
+          RunAtLoad = true;
+          StandardErrorPath = "/var/log/locked-verify.log";
+        };
+      };
+    }
+  ]);
 }
