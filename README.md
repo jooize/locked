@@ -44,6 +44,30 @@ Three tiers, named by what they protect:
 Tests: `sudo /bin/bash tests/harness.bash` (scratch-dir only; stands in
 `daemon` for the lock account, no global state touched).
 
+## Nix install (nix-darwin module)
+
+The flake exports `darwinModules.default` (Darwin-only on purpose: the
+whole mechanism is BSD file flags). It declares everything `setup` does
+imperatively -- binary in the system profile, hidden lock account and
+group, verify LaunchDaemon -- and generates `/etc/sudoers.d/locked` at
+build time from the same string the installed script is built from, so
+the sudoers sha256 digest can never drift from the deployed bytes; a
+rebuild moves both atomically with the generation.
+
+```nix
+# flake input (no inputs of its own), then:
+imports = [ inputs.locked.darwinModules.default ];
+security.locked = {
+  enable = true;
+  user = "jooize";
+  uid = 403;   # pick a free id in the hidden 400-499 range; see the option doc
+};
+```
+
+A nix-managed install refuses `setup` (the module owns provisioning) and
+accepts `/nix/store` in the install-ancestry walk -- keyed to that
+literal path, so `/usr/local`-shaped paths get no relaxation.
+
 ## One-shot install: `sudo ./locked setup`
 
 From this folder, after cloning/copying:
