@@ -1,93 +1,120 @@
-# locked v2 design -- BSD flags + no-root multiuser
+# locked v2 design -- three-tier BSD-flag chains
 
-Distilled from the 2026-07-22 trusted-chain discussion (threat model: a tool
-running as the user -- terminal-app scope, no TCC-protected dirs -- tampering
-with files between "I read it" and "I sign/deploy it").
+Supersedes the 2026-07-22 two-tier draft. Grounded in the 2026-08-05 probe
+round (all primitives verified live on macOS 26.5.1, SIP enabled,
+securelevel 0; system-flag probe 18/18). Threat model unchanged: a tool
+running as the user -- terminal-app scope, no TCC-protected dirs --
+tampering with files between "I read it" and "I sign/deploy it".
 
-## Why change: ownership flip alone does not protect the *name*
+## Why flags: ownership alone does not protect the *name*
 
-v1 protects file *content* (EACCES on write), but anyone with write permission
-on the parent directory can still `mv` the locked file aside and drop a
-replacement -- no ownership needed. This is the TODO(parent-swap) residual
-seen from the other side.
+v1 protects file *content* (EACCES on write), but anyone with write
+permission on the parent directory can `mv` the locked file aside and drop
+a replacement. BSD flags close exactly that: a flagged node cannot be
+renamed or deleted even by a user with parent write permission, and
+`chflags` is owner-or-root only (kernel EPERM, probed), so a flag on a
+node the user does not own binds every user-UID process.
 
-BSD immutable flags close exactly that hole: a flagged file cannot be
-modified, deleted, **or renamed**, even by a user with write permission on the
-parent, regardless of who owns the file. Verified empirically 2026-07-22:
-user-owned file + `schg` -> `mv` over it fails EPERM.
+## The three tiers (named by what they protect)
 
-## Flag choice: uchg, owned by the lock account
+| Tier | Flag | Ownership | For | Effect |
+|---|---|---|---|---|
+| `content` | `uchg` | `_<user>-lock` | leaf files; leaf dirs (recursive) | total freeze: content, rename, delete. Edit = unlock, edit, lock. |
+| `placement` | `uappnd` | `_<user>-lock` + group-write | shared parent dirs (`~/.config`, `~/Library`, ...) | new entries allowed; rename/delete/replace of existing entries denied; dir itself immovable. Unlock only for uninstall/replace ceremonies. |
+| `anchor` | `sappnd` (default) or `schg` | **unchanged** (stays the user) | nodes the OS identity-checks against the user's UID: `~`, `~/.ssh` and its files | system flags are root-only to set AND clear, so the flag binds all user processes while the user stays owner -- sshd StrictModes and every owner==user check keep passing. |
 
-- `schg` (system immutable): only root can set/clear.
-- `uchg` (user immutable): the file's **owner** or root can clear.
+Probed facts the tiers rest on:
 
-v2 uses `uchg` with files owned by `_<user>-lock`:
+- `uappnd` dir: mkdir/create/mv-INTO allowed (append); rename/delete of
+  existing entries denied; the dir itself immovable; subdir interiors
+  unaffected.
+- `uchg` dir: total entry freeze + node immovable. Flags do NOT inherit:
+  contents of existing user-owned children stay writable -- which is why
+  `content` on a directory is **recursive** (every node in the tree gets
+  `uchg` and lock-account ownership).
+- `chflags` is owner-or-root only. `sappnd`/`schg` require root even to
+  set; the owner cannot clear or zero the flag word.
+- `sappnd` dir = create-allowed / replace-denied; `sappnd` file =
+  append-only. `schg` = total freeze.
+- ACLs were evaluated and rejected for the anchor problem: the owner can
+  always rewrite their own node's ACL, so self-deny entries are advisory.
+  Flags are primary.
 
-- The attacker (runs as the user) is not the owner -> cannot clear the flag.
-- The lock account can clear it -> unlock authority becomes "may act as
-  `_<user>-lock`", NOT "is root".
-- Sudoers grants each user only `( _<user>-lock )` -- e.g.
-  `alice ALL=(_alice-lock) /usr/local/sbin/locked-helper` -- so on a
-  multiuser machine every user gets lock/unlock over their own pool with
-  **zero root grants** after initial provisioning. This is the elegant
-  multiuser property v1's root-sudo model lacks.
+## Chain-walking
 
-## Mechanism: ownership stays fixed, group-write toggles
+`locked lock <leaf>` derives and provisions the **entire chain** in one
+ceremony:
 
-chown requires root, so a no-root design cannot flip ownership per cycle.
-Instead ownership is permanent and the editability toggle is group-write +
-flag, all doable by the owner:
+1. The leaf gets its requested tier (default: `content`).
+2. Every ancestor owned by the invoker gets `placement` -- except `$HOME`
+   itself, which gets `anchor` (`sappnd`; ownership must not change).
+3. Ancestors already in the pool (meta exists) are verified, not
+   re-provisioned. The walk stops at the first node owned by neither the
+   invoker nor the lock account; that node must be root-owned with no
+   group/other write (`/Users` on stock macOS) or the lock is refused.
 
-- File: `_<user>-lock:_<user>-lock` forever; user is a member of the group.
-- **lock**   = (as lock account) `chmod g-w` + `chflags uchg`
-- **unlock** = (as lock account) `chflags nouchg` + `chmod g+w`
-- Snapshot/diff/revert flow carries over from v1 unchanged in spirit.
+`locked status <leaf>` verifies the FULL chain: per level owner, group,
+mode, exact flag word vs meta, and dev/ino identity. `locked unlock`
+releases only the named node (`--chain` additionally drops the flags on
+the chain's ancestors, for edits that need a rename into a frozen parent
+-- atomic-save editors); the next `lock` re-walks and re-seals the chain
+in reverse.
 
-Ordering constraint: immutable blocks chmod/chown too -- always clear the
-flag first on unlock, set it last on lock.
+## Diff-witness on relock
 
-Initial adoption of a file still needs one root chown (`chown _<user>-lock`).
-That is setup-time, not per-cycle.
+`locked lock` shows the snapshot-vs-current diff and requires explicit
+confirmation before sealing (pinned-style "the diff matches what I
+intended"). Plain `/usr/bin/diff` on bytes under the pinned PATH --
+trusted-binary != trusted-output: no git drivers/textconv anywhere in the
+display path. `--yes` answers the prompt for non-interactive use;
+`--dry-run` prints every mutation and performs none.
 
-## Caveats (honest ones)
+## Detection layer: `locked verify` + alerts
 
-- **Atomic-save editors break the fast path.** Editors that write-then-rename
-  (most GUI editors, vim with default backupcopy) replace the file with a new
-  inode owned by the *user*, ejecting it from the pool. In-place writes
-  (`>>`, `sed -i ''`? no -- also renames; `tee`, direct `open(O_WRONLY)`) are
-  fine. `lock` must detect owner != lock account and fall back to a root
-  re-adopt path (or refuse with a clear message). Document per-editor advice
-  or keep the root fallback from v1.
-- **Ancestor rename is NOT closed.** Flags protect the node, not the path:
-  `schg dir/child` does not stop `mv dir dir2`. Pinning `~/.config/ghostty`
-  still allows an attacker to rename `~/.config` wholesale and plant a copy
-  (needs only write on $HOME). Freezing $HOME or ~/.config with flags is not
-  viable (immutable dirs block all entry create/delete -> breaks everything).
-  Countermeasure is a fail-closed check at point of use (e.g. root-owned
-  trusted.fish verifying inode + `ls -lO` flags at session start), not
-  prevention.
-- **Flags don't survive v1's cp-based restore** -- fold flag capture/restore
-  into the TODO(xattrs) helper work.
-- `revert`/`atomic_replace` must clear the flag on dst before `mv -f`, re-set
-  after.
+Flags deny with silent EPERM -- the attacker sees the failure, the user
+does not. `locked verify` re-checks every locked chain (existence, owner,
+group, mode, full flag word, recursive-tree spot checks) and exits
+nonzero on drift; it also catches a ceremony that forgot to relock. A
+root LaunchDaemon runs it on a timer; failures raise
+`~/.local/state/agents/claude/alerts/locked--drift` (one timestamped
+ASCII line, statusline renders it as a red row), cleared on clean
+re-verify. The alert file is staged in the root-owned snapshots dir and
+renamed into place so a planted symlink is replaced, never followed.
+EndpointSecurity/eslogger EPERM-monitoring is explicitly later.
 
-## Relation to the trusted-chain stack
+## Kept from v1
 
-locked v2 pins the links of the read/sign chain that live in $HOME:
-`~/.config/ghostty` (contains the `command` line launching
-`fish --no-config --init-command 'source /etc/fish/trusted.fish'`) and any
-other config the verification session depends on. Content of trust-critical
-config should still live root-owned in the nix store /etc where possible;
-locked covers what must remain in $HOME. Signing integrity itself comes from
-sign-the-committed-SHA + deploy by `rev=$SHA` with signature verification
-against a root-owned allowed-signers file -- locked hardens the display path,
-it is not the root of trust.
+- Digest-pinned sudoers (`sha256:` Digest_Spec): binary integrity is
+  enforced by sudo before our code runs; a swapped binary gets a silent
+  refusal, not a Touch ID prompt.
+- Snapshot / diff / revert flow and the `.snap`/`.attic`/`.meta` layout;
+  meta gains `tier`, `flag`, the exact post-lock flag word, and dev/ino.
+  v1 metas are not migrated -- v1 was never provisioned.
+- Root-sudo invocation model. The two-tier draft's no-root runas
+  (`(_<user>-lock)`) multiuser path is deferred: the anchor tier needs
+  root regardless, and one elevation path is simpler to audit.
+- `atomic_replace` staging (now flag-aware: clears/restores flags on dst
+  and temporarily lifts `uappnd` on the destination parent around the
+  rename, restoring it even on failure).
 
-## Migration sketch (v1 -> v2)
+## Caveats
 
-1. Add flag handling to lock/unlock/revert (order rules above).
-2. Add `locked adopt <file>` (root): chown to lock account, set group, meta.
-3. New sudoers shape: per-user `(_<user>-lock)` rule for the no-root fast
-   path; keep a root rule only for `setup`/`adopt`/re-adopt.
-4. Keep digest-pinned sudoers entries (v1's best idea) for both rules.
-5. Update snapshot layout docs; no format change needed.
+- **Atomic-save editors** replace the file with a new inode via rename;
+  under a flagged parent the rename is denied. Unlock prints a hint when
+  the parent chain would deny it; `unlock --chain` is the escape. In-place
+  writers (`tee`, `vim` with `backupcopy=yes`, `>>`) are unaffected.
+- **Parent-swap above the anchor is out of scope by construction**: the
+  chain terminates at a root-owned dir, so there is no user-writable
+  ancestor left to swap. What remains is the standing floor: pinned
+  ceremonies never trust the terminal; terminal hardening protects
+  orientation.
+- `sappnd` on `~` does not stop *creates*: absent exec-class dotfiles must
+  be created empty and content-locked first (ceremony pre-work).
+- Flags are invisible to `ls` without `-lO`; `locked status` is the
+  intended lens.
+
+## chflags invocation gotcha (probed)
+
+`chflags -- <flagword> <path>`, never `chflags <flagword> -- <path>`: BSD
+getopt stops at the flag word, so a later `--` becomes a filename and
+poisons the exit code while the flag still gets applied.

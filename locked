@@ -1,78 +1,282 @@
 #!/usr/bin/env bash
-# Lock, unlock, or revert files protected by the _<user>-lock pattern.
-# Invoked via sudo: chown elevates to root. Sudo auth (password, pam_tid,
-# sudowhat, ...) is the user's choice -- locked doesn't configure it.
+# locked v2 -- three-tier BSD-flag protection for user-space trust surfaces.
 #
-#   sudo locked unlock <file>...    snapshot taken; chown to <user>; mode restored from meta
-#   sudo locked lock   <file>...    diff snapshot -> current; chown to lock account; mode restored from meta
-#   sudo locked revert <file>...    save current to .attic; restore snapshot; mode restored from meta
-#   sudo locked setup               provision _<user>-lock user/group, sudoers; self-install
+# Tiers (see DESIGN-v2.md):
+#   content    uchg,  owned by _<user>-lock; leaf files, or leaf dirs (recursive)
+#   placement  uappnd, owned by _<user>-lock + group-write; shared parent dirs
+#   anchor     sappnd/schg, ownership UNCHANGED; nodes the OS identity-checks
+#              against the user's UID (~, ~/.ssh, ...)
+#
+# Invoked via sudo; sudoers pins the binary by sha256 digest (setup writes it).
+# Sudo auth (password, pam_tid, sudowhat, ...) is the user's choice.
+#
+#   sudo locked lock   [--tier T] [--flag F] [--yes] [--dry-run] <path>...
+#   sudo locked unlock [--chain] [--dry-run] <path>...
+#   sudo locked revert [--dry-run] <path>...
+#   sudo locked status <path>...
+#   sudo locked verify [--quiet]
+#   sudo locked setup
 
-# Pin PATH so bare command names (dscl, awk, install, ...) can't be hijacked
-# even if sudoers env_keep ever leaks PATH from the invoker.
+# Pin PATH so bare command names (dscl, awk, install, chflags, ...) can't be
+# hijacked even if sudoers env_keep ever leaks PATH from the invoker.
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
 set -euo pipefail
+IFS=$'\n\t'
+shopt -s nullglob
 
-# Override-friendly defaults (handy for testing).
+VERSION=2.0.0
+
+# Override-friendly defaults (test seams; sudo's env_reset strips these on
+# real invocations, so they are only reachable when the script is executed
+# directly as root -- i.e. by the test harness).
 : "${INSTALL_TARGET:=/usr/local/sbin/locked}"
 : "${SNAPSHOTS_ROOT:=/var/db/locked-snapshots}"
+: "${LOCKED_LOCK_ACCOUNT:=}"
+: "${LOCKED_USER_HOME:=}"
+: "${LOCKED_ALERT_DIR:=}"
+: "${LOCKED_VERIFY_PLIST:=/Library/LaunchDaemons/locked.verify.plist}"
+: "${LOCKED_VERIFY_INTERVAL:=900}"
 
 usage() {
-  cat >&2 <<EOF
-usage: sudo locked <action> [args]
+  cat <<EOF
+usage: sudo locked <action> [options] [args]
 
-  unlock <file>...   chown to <user>; snapshot taken; mode restored from .meta
-  lock   <file>...   diff snapshot -> current; chown to _<user>-lock; mode restored
-  revert <file>...   save current to .attic; restore snapshot; relock with meta mode
-  setup              provision lock user/group, sudoers; self-install to \$INSTALL_TARGET
+  lock [--tier T] [--flag F] [--yes] [--dry-run] <path>...
+      Adopt or relock. Derives and provisions the whole ancestor chain:
+      leaf tier (default content), placement for user-owned ancestors,
+      anchor for \$HOME. Shows snapshot->current diff and asks before
+      sealing; --yes answers yes (required when stdin is not a tty).
+      --tier content|placement|anchor    leaf tier (default content)
+      --flag sappnd|schg                 anchor flag (default sappnd)
+  unlock [--chain] [--dry-run] <path>...
+      Release the named node only (snapshot taken first for content
+      files/dirs). --chain also drops flags on chain ancestors, for
+      edits that need a rename into a frozen parent (atomic-save
+      editors). Next lock re-seals the chain.
+  revert [--dry-run] <path>...
+      Files only: save current to .attic, restore snapshot, re-seal if
+      the file was locked.
+  status <path>...
+      Verify and print the full chain for each path (no changes made).
+  verify [--quiet]
+      Re-check every locked node against its meta. Exit 0 clean, 5 on
+      drift. Raises/clears the locked--drift alert file per user.
+  setup
+      Provision lock user/group, digest-pinned sudoers, verify timer;
+      self-install to \$INSTALL_TARGET.
+
+  --help     this text
+  --version  print version
+
+Exit codes:  0 ok  1 input/validation error  2 user abort
+             3 partial failure  5 verify found drift
 EOF
-  exit 1
 }
 
-[ $# -ge 1 ] || usage
+case "${1:-}" in
+  --help|-h|help) usage; exit 0 ;;
+  --version) echo "locked $VERSION"; exit 0 ;;
+esac
+
+[ $# -ge 1 ] || { usage >&2; exit 1; }
 action="$1"
 shift
 
+# ---- option parsing --------------------------------------------------------
+
+OPT_TIER=""
+OPT_FLAG=sappnd
+OPT_YES=0
+OPT_DRY=0
+OPT_CHAIN=0
+OPT_QUIET=0
+PATHS=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tier)    OPT_TIER="${2:?--tier needs a value}"; shift 2 ;;
+    --tier=*)  OPT_TIER="${1#--tier=}"; shift ;;
+    --flag)    OPT_FLAG="${2:?--flag needs a value}"; shift 2 ;;
+    --flag=*)  OPT_FLAG="${1#--flag=}"; shift ;;
+    --yes)     OPT_YES=1; shift ;;
+    --dry-run) OPT_DRY=1; shift ;;
+    --chain)   OPT_CHAIN=1; shift ;;
+    --quiet)   OPT_QUIET=1; shift ;;
+    --)        shift; while [ $# -gt 0 ]; do PATHS+=("$1"); shift; done ;;
+    -*)        echo "unknown option: $1" >&2; usage >&2; exit 1 ;;
+    *)         PATHS+=("$1"); shift ;;
+  esac
+done
+
+case "$OPT_TIER" in ''|content|placement|anchor) ;; *)
+  echo "invalid --tier: $OPT_TIER (content|placement|anchor)" >&2; exit 1 ;;
+esac
+case "$OPT_FLAG" in sappnd|schg) ;; *)
+  echo "invalid --flag: $OPT_FLAG (sappnd|schg)" >&2; exit 1 ;;
+esac
+
+[ "$EUID" -eq 0 ] || { echo "locked must run as root (sudo locked ...)" >&2; exit 1; }
+
+# verify can run from launchd with no SUDO_USER; everything else needs the
+# invoking user to derive the lock account.
 inv="${SUDO_USER:-}"
-[ -n "$inv" ] || { echo "must be invoked via sudo" >&2; exit 1; }
-lock_user="_${inv}-lock"
+if [ "$action" != "verify" ]; then
+  [ -n "$inv" ] || { echo "must be invoked via sudo" >&2; exit 1; }
+fi
+
+lock_account_for() { echo "_${1}-lock"; }
+lock_user=""
+[ -n "$inv" ] && lock_user="${LOCKED_LOCK_ACCOUNT:-$(lock_account_for "$inv")}"
+
+home_for() {
+  # NFSHomeDirectory from Directory Services, not ~ expansion.
+  dscl . -read "/Users/$1" NFSHomeDirectory 2>/dev/null | awk '{print $2; exit}'
+}
+user_home=""
+if [ -n "$inv" ]; then
+  user_home="${LOCKED_USER_HOME:-$(home_for "$inv")}"
+  [ -n "$user_home" ] || { echo "cannot determine home directory of $inv" >&2; exit 1; }
+fi
 
 log_action() {
-  # Tag goes to unified logging; visible via:
+  # ASCII only; visible via:
   #   log show --predicate 'eventMessage CONTAINS "locked: user="' --last 1h
-  logger -t locked "user=$inv action=$1 file=${2:-} result=${3:-ok}"
+  logger -t locked "user=${inv:-launchd} action=$1 file=${2:-} result=${3:-ok}"
 }
 
-# ---- setup ----------------------------------------------------------------
+run() {
+  if [ "$OPT_DRY" -eq 1 ]; then
+    printf 'DRY-RUN: '
+    printf '%q ' "$@"
+    printf '\n'
+  else
+    "$@"
+  fi
+}
 
-# Verify a path is root:wheel owned with no group/other write. Used to refuse
-# install when /usr/local was previously chowned to a user (legacy Homebrew on
-# Intel macs), which would let any process at that UID replace the binary and
-# escalate to root after the next Touch ID approval.
+confirm() {
+  # $1: prompt. Returns 0 on yes. Fail closed: non-tty without --yes aborts.
+  [ "$OPT_YES" -eq 1 ] && return 0
+  if [ ! -t 0 ]; then
+    echo "stdin is not a tty and --yes not given; aborting" >&2
+    return 1
+  fi
+  local reply
+  printf '%s [y/N] ' "$1" >&2
+  IFS= read -r reply
+  case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# ---- shared helpers --------------------------------------------------------
+
+# Verify a path is root:wheel owned with no group/other write. Used both to
+# refuse installing into a user-writable ancestry and to validate the chain
+# stop node.
 verify_root_owned_path() {
   local path="$1" owner mode
   owner="$(stat -f '%Su:%Sg' "$path")"
   mode="$(stat -f '%OLp' "$path")"
   if [ "$owner" != "root:wheel" ]; then
     echo "ERROR: $path is owned $owner, expected root:wheel" >&2
-    echo "       refusing to install: a non-root owner of an ancestor dir can replace the binary" >&2
-    echo "       fix manually: sudo chown root:wheel $path && sudo chmod 755 $path" >&2
     return 1
   fi
   case "$mode" in
     755|750|700|555|550|500) ;;
     *)
       echo "ERROR: $path has mode $mode, expected 755 or stricter" >&2
-      echo "       fix manually: sudo chmod 755 $path" >&2
       return 1
       ;;
   esac
 }
 
-do_setup() {
-  [ "$EUID" -eq 0 ] || { echo "setup must run as root (sudo $0 setup)" >&2; exit 1; }
+# URL-encode % and / so a path becomes an unambiguous flat filename.
+# Order matters: % first, then /, otherwise %2F gets re-encoded.
+encode() {
+  printf '%s' "$1" | sed -e 's|%|%25|g' -e 's|/|%2F|g'
+}
+decode() {
+  printf '%s' "$1" | sed -e 's|%2F|/|g' -e 's|%25|%|g'
+}
 
+flags_of() {
+  # Symbolic flag word ("" when none), spaces stripped so comma-list matching
+  # and string equality are stable. stat's keyword order is fixed on a given
+  # OS, so equality is a sound comparison.
+  local s
+  s="$(stat -f '%Sf' "$1")"
+  printf '%s' "${s// /}"
+}
+node_id() {
+  stat -f '%d.%i' "$1"
+}
+
+# chflags gotcha (probed 2026-08-05): "--" must come BEFORE the flag word;
+# after it, BSD getopt treats "--" as a filename and poisons the exit code.
+fset() {   # fset <flagword> <path> [-R]
+  local flagword="$1" path="$2" recur="${3:-}"
+  if [ -n "$recur" ]; then
+    run chflags -R -- "$flagword" "$path"
+  else
+    run chflags -- "$flagword" "$path"
+  fi
+}
+fclear() { # fclear <flagword> <path> [-R]
+  fset "no$1" "$2" "${3:-}"
+}
+
+meta_field() {
+  awk -F= -v f="$2" '$1==f{print substr($0, length(f)+2); exit}' "$1"
+}
+
+# write_meta <metafile> key=value...
+# NOTE on error handling below: every per-file entry point runs in a || or
+# if context, which suspends errexit for the whole call tree -- so every
+# mutating step in this file carries an explicit || return 1. Do not rely
+# on set -e inside these functions.
+write_meta() {
+  local meta="$1"
+  shift
+  local tmp
+  tmp="$(mktemp "${USER_SNAPSHOTS}/.meta.XXXXXX")" || return 1
+  printf '%s\n' "$@" >"$tmp" || return 1
+  chown "$lock_user:$lock_user" "$tmp" || return 1
+  chmod 600 "$tmp" || return 1
+  mv -f -- "$tmp" "$meta" || return 1
+}
+
+# ---- setup -----------------------------------------------------------------
+
+install_verify_timer() {
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>locked.verify</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${INSTALL_TARGET}</string>
+    <string>verify</string>
+    <string>--quiet</string>
+  </array>
+  <key>StartInterval</key><integer>${LOCKED_VERIFY_INTERVAL}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>/var/log/locked-verify.log</string>
+</dict>
+</plist>
+EOF
+  install -m 644 -o root -g wheel "$tmp" "$LOCKED_VERIFY_PLIST"
+  rm -f -- "$tmp"
+  # Idempotent (re)load.
+  launchctl bootout system "$LOCKED_VERIFY_PLIST" 2>/dev/null || true
+  launchctl bootstrap system "$LOCKED_VERIFY_PLIST"
+  echo "verify timer installed: $LOCKED_VERIFY_PLIST (every ${LOCKED_VERIFY_INTERVAL}s)"
+}
+
+do_setup() {
   # 1. Self-install. Verify every ancestor dir of INSTALL_TARGET is root-owned
   #    BEFORE writing the binary, so we never install into a user-writable path.
   local self target target_dir
@@ -82,10 +286,12 @@ do_setup() {
 
   install -d -m 755 -o root -g wheel "$target_dir"
 
-  # Walk ancestry from target_dir up to /, verify each.
   local p="$target_dir"
   while [ "$p" != "/" ]; do
-    verify_root_owned_path "$p" || exit 1
+    verify_root_owned_path "$p" || {
+      echo "       refusing to install: a non-root owner of an ancestor dir can replace the binary" >&2
+      exit 1
+    }
     p="$(dirname "$p")"
   done
 
@@ -104,9 +310,9 @@ do_setup() {
   else
     used_gids="$(dscl . -list /Groups PrimaryGroupID | awk '{print $2}')"
     gid=
-    # Prefer 401 deterministically (the reserved lock slot; the Claude trust group
-    # _jooize-readonly takes 402). Fall back to the first free in the 400-499
-    # service lane if 401 is somehow taken.
+    # Prefer 401 deterministically (the reserved lock slot; the Claude trust
+    # group _jooize-readonly takes 402). Fall back to the first free in the
+    # 400-499 service lane if 401 is somehow taken.
     for id in 401 $(seq 400 499); do
       if ! printf '%s\n' "$used_gids" | grep -qx "$id"; then
         gid="$id"; break
@@ -127,8 +333,6 @@ do_setup() {
   else
     used_uids="$(dscl . -list /Users UniqueID | awk '{print $2}')"
     uid=
-    # Prefer 401 so the lock account has uid==gid (matches the group above). Fall
-    # back to the first free in 400-499 if 401 is taken.
     for id in 401 $(seq 400 499); do
       if ! printf '%s\n' "$used_uids" | grep -qx "$id"; then
         uid="$id"; break
@@ -145,7 +349,7 @@ do_setup() {
     echo "created user: ${lock_user} (UID $uid)"
   fi
 
-  # 4. Add invoker to lock group
+  # 4. Add invoker to lock group (grants add-rights in placement-tier dirs).
   if dseditgroup -o checkmember -m "$inv" "$lock_user" >/dev/null 2>&1; then
     echo "$inv already member of ${lock_user}"
   else
@@ -154,12 +358,8 @@ do_setup() {
   fi
 
   # 5. Sudoers entry with binary-digest pin (validated before installing).
-  #    sudoers Digest_Spec causes sudo to compute the binary's SHA-256 at
-  #    invocation and refuse to run if it doesn't match. This moves the
-  #    "binary integrity" check OUT of locked itself (where a swapped binary
-  #    would just skip the check) into sudo's code, which is enforced before
-  #    our binary executes. A swap causes sudo to refuse silently -- no
-  #    Touch ID prompt, no execution, no escalation.
+  #    Digest_Spec makes sudo compute the binary's sha256 at invocation and
+  #    refuse on mismatch -- binary integrity enforced before our code runs.
   local sudoers_target sudoers_line digest tmp
   sudoers_target=/etc/sudoers.d/locked
   digest="$(shasum -a 256 "$INSTALL_TARGET" | awk '{print $1}')"
@@ -175,20 +375,23 @@ do_setup() {
       echo "  digest: sha256:$digest"
     else
       echo "sudoers validation failed; not installing" >&2
-      rm -f "$tmp"
+      rm -f -- "$tmp"
       exit 1
     fi
-    rm -f "$tmp"
+    rm -f -- "$tmp"
   fi
 
-  # 6. Flush directory service cache so new accounts are visible immediately.
+  # 6. Verify timer.
+  install_verify_timer
+
+  # 7. Flush directory service cache so new accounts are visible immediately.
   dscacheutil -flushcache
 
   log_action setup "" ok
   echo
   echo "setup complete."
-  echo "  test: sudo locked unlock /nonexistent     # should print 'does not exist'"
-  echo "  next: chown a real file into the lock pool, then sudo locked unlock <file>"
+  echo "  test:  sudo locked status /nonexistent    # should print 'not in pool'"
+  echo "  next:  sudo locked lock <path>            # adopt a first target"
 }
 
 if [ "$action" = "setup" ]; then
@@ -196,13 +399,11 @@ if [ "$action" = "setup" ]; then
   exit 0
 fi
 
-# ---- regular actions: require lock account to exist -----------------------
+# ---- invocation-time integrity ---------------------------------------------
 
 # Re-verify INSTALL_TARGET ancestry on every invocation, not just at setup.
-# Catches the case where /usr/local was tampered with after setup ran (e.g.,
-# a later "sudo chown -R $USER /usr/local" Homebrew permission-fix recipe).
-# Refuses to run if any ancestor became user-writable, since the next sudo
-# Touch ID approval would otherwise escalate a swapped binary.
+# Catches /usr/local being chowned user-writable after setup (e.g. a legacy
+# "sudo chown -R \$USER /usr/local" Homebrew recipe).
 verify_install_ancestry() {
   [ -f "$INSTALL_TARGET" ] || return 0   # pre-install; let other checks handle.
   local p
@@ -214,190 +415,746 @@ verify_install_ancestry() {
 }
 verify_install_ancestry || exit 1
 
-id -u "$lock_user" >/dev/null 2>&1 || {
-  echo "lock account $lock_user does not exist -- run: sudo $0 setup" >&2
-  exit 1
-}
-
-[ $# -ge 1 ] || usage
+if [ -n "$lock_user" ]; then
+  id -u "$lock_user" >/dev/null 2>&1 || {
+    echo "lock account $lock_user does not exist -- run: sudo locked setup" >&2
+    exit 1
+  }
+fi
 
 install -d -m 700 -o root -g wheel "$SNAPSHOTS_ROOT"
-USER_SNAPSHOTS="$SNAPSHOTS_ROOT/$inv"
-install -d -m 700 -o "$lock_user" -g "$lock_user" "$USER_SNAPSHOTS"
+USER_SNAPSHOTS=""
+if [ -n "$inv" ]; then
+  USER_SNAPSHOTS="$SNAPSHOTS_ROOT/$inv"
+  install -d -m 700 -o "$lock_user" -g "$lock_user" "$USER_SNAPSHOTS"
+fi
 
-# URL-encode % and / so a path becomes an unambiguous flat filename.
-# Order matters: % first, then /, otherwise %2F gets re-encoded to %252F.
-encode() {
-  printf '%s' "$1" | sed -e 's|%|%25|g' -e 's|/|%2F|g'
-}
+# ---- snapshot / replace machinery ------------------------------------------
 
-write_meta() {
-  local meta="$1" owner="$2" group="$3" mode="$4"
-  cat >"$meta" <<EOF
-owner=$owner
-group=$group
-mode=$mode
-EOF
-  chown "$lock_user:$lock_user" "$meta"
-  chmod 600 "$meta"
-}
-
-meta_field() {
-  awk -F= -v f="$2" '$1==f{print $2; exit}' "$1"
-}
-
-# Atomic destination replace. Staging happens in $USER_SNAPSHOTS/.staging/,
-# which is mode 700 lock-account-owned -- the temp file is never visible to
-# any user-UID process during cp/chown/chmod. Once prepped, a single rename
-# moves it to dst. Rename is atomic ONLY when same filesystem (always true
-# on stock macOS where /var/db and /Users are both on the data volume); if
-# dst is on a different filesystem, we refuse rather than fall back to a
-# non-atomic copy+unlink.
+# Atomic destination replace. Staging happens in the 700 lock-account-owned
+# .staging dir, so the temp file is never visible to user-UID processes.
+# Rename is atomic only on the same filesystem; refuse rather than fall back
+# to a non-atomic copy. If the destination's parent carries uappnd/sappnd,
+# lift the flag around the rename and restore it even on failure.
 #
-# Caveats (residual, not fixable in pure bash):
-# TODO(toctou): closes destination-side TOCTOU. Source-side (attacker swaps
-# src between path resolution and cp's open(2)) is NOT closed -- bash has
-# no O_NOFOLLOW fd ops. Same residual as `install`; not made worse by this
-# helper. A Swift/Python helper using open(O_NOFOLLOW) + fchmod/fchown
-# would close it.
-# TODO(parent-swap): if an attacker renames a parent of dst between path
-# resolution and the final mv, the rename writes to the wrong location.
-# Same residual as install; needs fd-based parent verification.
-# TODO(xattrs): cp doesn't preserve extended attributes, ACLs, or BSD flags.
-# Designed for textual config files. If extended to lock files with critical
-# xattrs (quarantine, code-sign, custom ACLs), round-trip via `xattr -p`/`-w`
-# and `/bin/chmod +a`/`chflags` capture/restore.
+# Residuals unchanged from v1 (see REVIEW.md): TODO(toctou) source-side swap
+# during cp's open; TODO(parent-swap) between resolution and mv; TODO(xattrs)
+# cp does not carry xattrs/ACLs. BSD flags ARE now handled by the callers.
 atomic_replace() {
   local src="$1" dst="$2" owner="$3" mode="$4"
   local stage_dir="$USER_SNAPSHOTS/.staging"
-  install -d -m 700 -o "$lock_user" -g "$lock_user" "$stage_dir"
+  install -d -m 700 -o "$lock_user" -g "$lock_user" "$stage_dir" || return 1
   local tmp
-  tmp="$(mktemp "${stage_dir}/replace.XXXXXX")"
-  cp -p "$src" "$tmp"
-  chown "$owner" "$tmp"
-  chmod "$mode" "$tmp"
-  # Same-filesystem check: rename is atomic only when source and destination
-  # share a device. macOS data volume covers /var/db and /Users on stock
-  # installs, but bail loudly if someone has e.g. mounted ~/ on a different
-  # volume.
-  local stage_dev dst_dev
+  tmp="$(mktemp "${stage_dir}/replace.XXXXXX")" || return 1
+  cp -p -- "$src" "$tmp" || { rm -f -- "$tmp"; return 1; }
+  chown "$owner" "$tmp" || { rm -f -- "$tmp"; return 1; }
+  chmod "$mode" "$tmp" || { rm -f -- "$tmp"; return 1; }
+  local stage_dev dst_dev dst_parent
+  dst_parent="$(dirname "$dst")"
   stage_dev="$(stat -f '%d' "$tmp")"
-  dst_dev="$(stat -f '%d' "$(dirname "$dst")")"
+  dst_dev="$(stat -f '%d' "$dst_parent")"
   if [ "$stage_dev" != "$dst_dev" ]; then
-    rm -f "$tmp"
+    rm -f -- "$tmp"
     echo "ERROR: $dst is on a different filesystem from $stage_dir; refusing non-atomic mv" >&2
     return 1
   fi
-  mv -f "$tmp" "$dst"
+  local pflags lifted=""
+  pflags="$(flags_of "$dst_parent")"
+  case ",$pflags," in
+    *,uappnd,*) lifted=uappnd ;;
+    *,sappnd,*) lifted=sappnd ;;
+  esac
+  if [ -n "$lifted" ]; then
+    chflags -- "no$lifted" "$dst_parent" || { rm -f -- "$tmp"; return 1; }
+  fi
+  local rc=0
+  mv -f -- "$tmp" "$dst" || rc=1
+  if [ -n "$lifted" ]; then
+    chflags -- "$lifted" "$dst_parent" || {
+      echo "ERROR: failed to restore $lifted on $dst_parent -- restore by hand" >&2
+      rc=1
+    }
+  fi
+  [ "$rc" -eq 0 ] || { rm -f -- "$tmp" 2>/dev/null || true; return 1; }
 }
 
-# Per-file body wrapped so partial failure on one file doesn't abort the loop.
-process_one() {
-  local f="$1"
-  f="$(readlink -f "$f")"
+# Directory snapshots: whole-tree copy under .snapdir, staged then swapped.
+snapshot_tree() {
+  local src="$1" snapdir="$2"
+  local stage_dir="$USER_SNAPSHOTS/.staging"
+  install -d -m 700 -o "$lock_user" -g "$lock_user" "$stage_dir"
+  local tmp
+  tmp="$(mktemp -d "${stage_dir}/tree.XXXXXX")" || return 1
+  cp -Rp -- "$src" "$tmp/tree" || { rm -rf -- "$tmp"; return 1; }
+  chown -R "$lock_user:$lock_user" "$tmp" || { rm -rf -- "$tmp"; return 1; }
+  if [ -d "$snapdir" ]; then
+    local old
+    old="$(mktemp -d "${stage_dir}/old.XXXXXX")" || return 1
+    mv -f -- "$snapdir" "$old/prev" || return 1
+    rm -rf -- "$old"
+  fi
+  mv -f -- "$tmp/tree" "$snapdir" || return 1
+  rmdir -- "$tmp"
+}
+
+# ---- meta + node verification ----------------------------------------------
+
+# Per-path snapshot locations.
+snap_paths() { # sets ENC SNAP SNAPDIR ATTIC META for path $1
+  ENC="$(encode "$1")"
+  SNAP="$USER_SNAPSHOTS/${ENC}.snap"
+  SNAPDIR="$USER_SNAPSHOTS/${ENC}.snapdir"
+  ATTIC="$USER_SNAPSHOTS/${ENC}.attic"
+  META="$USER_SNAPSHOTS/${ENC}.meta"
+}
+
+# verify_node <path> <metafile> <lock_user>
+# Prints drift descriptions; returns 0 clean/open, 1 drift.
+verify_node() {
+  local f="$1" meta="$2" lu="$3"
+  local tier state flag flagsym mode lockmode owner group id recursive
+  tier="$(meta_field "$meta" tier)"
+  state="$(meta_field "$meta" state)"
+  flag="$(meta_field "$meta" flag)"
+  flagsym="$(meta_field "$meta" flagsym)"
+  lockmode="$(meta_field "$meta" lockmode)"
+  owner="$(meta_field "$meta" owner)"
+  group="$(meta_field "$meta" group)"
+  id="$(meta_field "$meta" id)"
+  recursive="$(meta_field "$meta" recursive)"
+
   if [ ! -e "$f" ]; then
-    echo "skip $f: does not exist" >&2
-    log_action "$action" "$f" skip-noent
+    echo "  DRIFT $f: missing"
+    return 1
+  fi
+  if [ "$state" = "unlocked" ]; then
+    echo "  open  $f (intentionally unlocked; relock with: sudo locked lock)"
     return 0
   fi
 
-  local owner_now group_now mode_now enc snap attic meta
+  local bad=0 want_owner cur
+  case "$tier" in
+    content|placement) want_owner="$lu" ;;
+    anchor)            want_owner="$owner" ;;
+    *) echo "  DRIFT $f: meta has unknown tier '$tier'"; return 1 ;;
+  esac
+  cur="$(stat -f '%Su' "$f")"
+  [ "$cur" = "$want_owner" ] || { echo "  DRIFT $f: owner $cur, expected $want_owner"; bad=1; }
+  cur="$(stat -f '%OLp' "$f")"
+  [ "$cur" = "$lockmode" ] || { echo "  DRIFT $f: mode $cur, expected $lockmode"; bad=1; }
+  cur="$(flags_of "$f")"
+  [ "$cur" = "$flagsym" ] || { echo "  DRIFT $f: flags '$cur', expected '$flagsym'"; bad=1; }
+  cur="$(node_id "$f")"
+  [ "$cur" = "$id" ] || { echo "  DRIFT $f: dev/ino $cur, expected $id (node replaced)"; bad=1; }
+
+  if [ "$recursive" = "1" ] && [ -d "$f" ]; then
+    local stray
+    stray="$(find "$f" \( ! -user "$lu" -o ! -flags +uchg \) -print 2>/dev/null | head -3)"
+    if [ -n "$stray" ]; then
+      echo "  DRIFT $f: tree nodes without lock ownership/uchg:"
+      printf '%s\n' "$stray" | sed 's/^/          /'
+      bad=1
+    fi
+  fi
+  return "$bad"
+}
+
+# ---- chain derivation ------------------------------------------------------
+
+# chain_for <leaf>: prints user-owned/lock-owned ancestors nearest-first,
+# then validates the stop node (first foreign-owned ancestor) is root-owned.
+# Fails closed if it is not.
+chain_for() {
+  local p owner
+  p="$(dirname "$1")"
+  while :; do
+    owner="$(stat -f '%Su' "$p")"
+    if [ "$owner" = "$inv" ] || [ "$owner" = "$lock_user" ]; then
+      printf '%s\n' "$p"
+      [ "$p" = "/" ] && break
+      p="$(dirname "$p")"
+    else
+      verify_root_owned_path "$p" || {
+        echo "ERROR: chain stop node $p is not a trustworthy anchor; refusing" >&2
+        return 1
+      }
+      break
+    fi
+  done
+}
+
+tier_for_ancestor() {
+  if [ "$1" = "$user_home" ]; then echo anchor; else echo placement; fi
+}
+
+# ---- seal / release primitives ---------------------------------------------
+
+# seal_content <path>: adopt or relock a content-tier node (file or dir).
+seal_content() {
+  local f="$1"
+  snap_paths "$f"
+  local is_dir=0
+  [ -d "$f" ] && is_dir=1
+
+  local owner_now group_now mode_now
   owner_now="$(stat -f '%Su' "$f")"
   group_now="$(stat -f '%Sg' "$f")"
   mode_now="$(stat -f '%OLp' "$f")"
-  enc="$(encode "$f")"
-  snap="$USER_SNAPSHOTS/${enc}.snap"
-  attic="$USER_SNAPSHOTS/${enc}.attic"
-  meta="$USER_SNAPSHOTS/${enc}.meta"
 
-  case "$action" in
-    unlock)
-      if [ "$owner_now" != "$lock_user" ]; then
-        echo "skip $f: not locked (owner=$owner_now)" >&2
-        log_action unlock "$f" skip-not-locked
+  local target_owner target_group target_mode
+  if [ -f "$META" ]; then
+    target_owner="$(meta_field "$META" owner)"
+    target_group="$(meta_field "$META" group)"
+    target_mode="$(meta_field "$META" mode)"
+    local state
+    state="$(meta_field "$META" state)"
+    if [ "$state" = "locked" ]; then
+      if verify_node "$f" "$META" "$lock_user" >/dev/null 2>&1; then
+        echo "already locked: $f"
+        log_action lock "$f" skip-already-locked
         return 0
       fi
-      local target_owner target_group target_mode
-      if [ -f "$meta" ]; then
-        target_owner="$(meta_field "$meta" owner)"
-        target_group="$(meta_field "$meta" group)"
-        target_mode="$(meta_field "$meta" mode)"
-      else
-        echo "  warning: no meta for $f, capturing current mode $mode_now as canonical -- review and fix .meta if this is a transient permission state" >&2
-        target_owner="$inv"
-        target_group=staff
-        target_mode="$mode_now"
-      fi
-      atomic_replace "$f" "$snap" "${lock_user}:${lock_user}" 600
-      chown -h "${target_owner}:${target_group}" "$f"
-      chmod "$target_mode" "$f"
-      echo "unlocked: $f"
-      echo "  snapshot: $snap"
-      log_action unlock "$f" ok
-      ;;
+      echo "ERROR: $f is marked locked but drifted -- investigate before relocking:" >&2
+      verify_node "$f" "$META" "$lock_user" >&2 || true
+      return 1
+    fi
+    if [ "$mode_now" != "$target_mode" ]; then
+      echo "  note: mode drifted from $target_mode to $mode_now during edit; restoring $target_mode on lock" >&2
+    fi
+  else
+    # Initial adoption: current identity becomes canonical.
+    if [ "$owner_now" != "$inv" ]; then
+      echo "skip $f: not owned by you (owner=$owner_now)" >&2
+      log_action lock "$f" skip-not-owned
+      return 1
+    fi
+    target_owner="$owner_now"
+    target_group="$group_now"
+    target_mode="$mode_now"
+  fi
 
-    lock)
-      if [ "$owner_now" != "$inv" ]; then
-        echo "skip $f: not owned by you (owner=$owner_now)" >&2
-        log_action lock "$f" skip-not-owned
-        return 0
-      fi
-      if [ ! -f "$meta" ]; then
-        write_meta "$meta" "$owner_now" "$group_now" "$mode_now"
-        echo "  initialized meta: $meta (owner=$owner_now group=$group_now mode=$mode_now)"
-      else
-        local expected_mode
-        expected_mode="$(meta_field "$meta" mode)"
-        if [ "$mode_now" != "$expected_mode" ]; then
-          echo "  note: mode drifted from $expected_mode to $mode_now during edit; restoring to $expected_mode on lock" >&2
-        fi
-      fi
-      if [ -f "$snap" ]; then
-        printf '\n--- diff snapshot -> current ---\n'
-        diff -u "$snap" "$f" || true
-        echo
-      else
-        echo "$f: no snapshot found -- locking without diff" >&2
-      fi
-      chown -h "${lock_user}:${lock_user}" "$f"
-      chmod "$(meta_field "$meta" mode)" "$f"
-      echo "locked: $f"
-      log_action lock "$f" ok
-      ;;
+  # Recursive adoption sanity: single owner + single group across the tree,
+  # so unlock's chown -R restore is lossless.
+  if [ "$is_dir" -eq 1 ]; then
+    local stray
+    stray="$(find "$f" \( ! -user "$target_owner" ! -user "$lock_user" \) -o \( ! -group "$target_group" ! -group "$lock_user" \) 2>/dev/null | head -3)"
+    if [ -n "$stray" ]; then
+      echo "ERROR: $f tree has mixed ownership; content tier needs a uniform tree:" >&2
+      printf '%s\n' "$stray" | sed 's/^/    /' >&2
+      return 1
+    fi
+  fi
 
-    revert)
-      if [ ! -f "$snap" ]; then
-        echo "skip $f: no snapshot to revert from" >&2
-        log_action revert "$f" skip-no-snap
-        return 0
-      fi
-      # Guard against double-revert: if file already matches snapshot, the
-      # current attic IS the legitimate discarded edit; overwriting it would
-      # destroy that record without changing anything else.
-      if cmp -s "$f" "$snap"; then
-        echo "skip $f: file already matches snapshot (preserving existing .attic)" >&2
-        log_action revert "$f" skip-already-reverted
-        return 0
-      fi
-      local target_mode=600
-      [ -f "$meta" ] && target_mode="$(meta_field "$meta" mode)"
-      atomic_replace "$f"    "$attic" "${lock_user}:${lock_user}" 600
-      atomic_replace "$snap" "$f"     "${lock_user}:${lock_user}" "$target_mode"
-      echo "reverted: $f from snapshot"
-      echo "  discarded content saved to: $attic"
-      log_action revert "$f" ok
-      ;;
+  # Diff-witness: snapshot (unlock-time state) vs current, then confirm.
+  if [ "$is_dir" -eq 0 ] && [ -f "$SNAP" ]; then
+    if cmp -s "$SNAP" "$f"; then
+      echo "no changes since unlock: $f"
+    else
+      printf -- '\n--- diff snapshot -> current: %s ---\n' "$f"
+      diff -u "$SNAP" "$f" || true
+      echo
+    fi
+  elif [ "$is_dir" -eq 1 ] && [ -d "$SNAPDIR" ]; then
+    printf -- '\n--- diff snapshot -> current: %s ---\n' "$f"
+    diff -ru "$SNAPDIR" "$f" && echo "(no changes)" || true
+    echo
+  else
+    echo "adopting into pool (no prior snapshot): $f"
+  fi
+  confirm "Seal $f (tier content)?" || { echo "aborted: $f" >&2; return 2; }
 
-    *)
-      usage
-      ;;
-  esac
+  # Baseline snapshot on first adoption so revert always has one.
+  if [ "$is_dir" -eq 0 ] && [ ! -f "$SNAP" ]; then
+    run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || return 1
+  elif [ "$is_dir" -eq 1 ] && [ ! -d "$SNAPDIR" ]; then
+    run snapshot_tree "$f" "$SNAPDIR" || return 1
+  fi
+
+  # Seal: ownership, mode, then flag LAST (flags block chmod/chown).
+  if [ "$is_dir" -eq 1 ]; then
+    run chown -R "${lock_user}:${lock_user}" "$f" || return 1
+    run chmod "$target_mode" "$f" || return 1
+    fset uchg "$f" -R || return 1
+  else
+    run chown -h "${lock_user}:${lock_user}" "$f" || return 1
+    run chmod "$target_mode" "$f" || return 1
+    fset uchg "$f" || return 1
+  fi
+
+  if [ "$OPT_DRY" -eq 0 ]; then
+    write_meta "$META" \
+      "owner=$target_owner" \
+      "group=$target_group" \
+      "mode=$target_mode" \
+      "lockmode=$target_mode" \
+      "tier=content" \
+      "flag=uchg" \
+      "flagsym=$(flags_of "$f")" \
+      "id=$(node_id "$f")" \
+      "recursive=$is_dir" \
+      "state=locked" || return 1
+  fi
+  echo "locked: $f (content)"
+  log_action lock "$f" ok
 }
 
-# Loop over files, isolating failures so one bad file doesn't abort the rest.
-for f in "$@"; do
-  if ! process_one "$f"; then
-    echo "error processing $f (continuing)" >&2
-    log_action "$action" "$f" error
+# seal_placement <dir>: adopt or relock a placement-tier parent dir.
+seal_placement() {
+  local d="$1"
+  snap_paths "$d"
+  [ -d "$d" ] || { echo "ERROR: placement tier needs a directory: $d" >&2; return 1; }
+
+  local owner_now group_now mode_now
+  owner_now="$(stat -f '%Su' "$d")"
+  group_now="$(stat -f '%Sg' "$d")"
+  mode_now="$(stat -f '%OLp' "$d")"
+
+  if [ -f "$META" ]; then
+    local state
+    state="$(meta_field "$META" state)"
+    if [ "$state" = "locked" ]; then
+      if verify_node "$d" "$META" "$lock_user" >/dev/null 2>&1; then
+        return 0   # chain ancestor already good; stay quiet.
+      fi
+      echo "ERROR: $d is marked locked but drifted -- investigate:" >&2
+      verify_node "$d" "$META" "$lock_user" >&2 || true
+      return 1
+    fi
+    # Re-seal after an unlock ceremony: reapply flag only.
+    fset uappnd "$d" || return 1
+    if [ "$OPT_DRY" -eq 0 ]; then
+      write_meta "$META" \
+        "owner=$(meta_field "$META" owner)" \
+        "group=$(meta_field "$META" group)" \
+        "mode=$(meta_field "$META" mode)" \
+        "lockmode=$(meta_field "$META" lockmode)" \
+        "tier=placement" \
+        "flag=uappnd" \
+        "flagsym=$(flags_of "$d")" \
+        "id=$(node_id "$d")" \
+        "recursive=0" \
+        "state=locked" || return 1
+    fi
+    echo "relocked: $d (placement)"
+    log_action lock "$d" ok
+    return 0
   fi
-done
+
+  if [ "$owner_now" != "$inv" ]; then
+    echo "ERROR: $d owned by $owner_now; placement adoption needs your ownership" >&2
+    return 1
+  fi
+  confirm "Provision $d (tier placement: owner ${lock_user}, group-write, uappnd)?" || {
+    echo "aborted: $d" >&2; return 2
+  }
+  # Ownership to the lock account; the invoker keeps add-rights via the lock
+  # group. Flag last.
+  run chown "${lock_user}:${lock_user}" "$d" || return 1
+  run chmod g+rwx "$d" || return 1
+  fset uappnd "$d" || return 1
+  if [ "$OPT_DRY" -eq 0 ]; then
+    write_meta "$META" \
+      "owner=$owner_now" \
+      "group=$group_now" \
+      "mode=$mode_now" \
+      "lockmode=$(stat -f '%OLp' "$d")" \
+      "tier=placement" \
+      "flag=uappnd" \
+      "flagsym=$(flags_of "$d")" \
+      "id=$(node_id "$d")" \
+      "recursive=0" \
+      "state=locked" || return 1
+  fi
+  echo "locked: $d (placement)"
+  log_action lock "$d" ok
+}
+
+# seal_anchor <path> <flagword>: system flag, ownership and mode untouched.
+seal_anchor() {
+  local f="$1" flagword="$2"
+  snap_paths "$f"
+
+  local owner_now group_now mode_now
+  owner_now="$(stat -f '%Su' "$f")"
+  group_now="$(stat -f '%Sg' "$f")"
+  mode_now="$(stat -f '%OLp' "$f")"
+
+  if [ -f "$META" ]; then
+    local state prev_flag
+    state="$(meta_field "$META" state)"
+    prev_flag="$(meta_field "$META" flag)"
+    if [ "$state" = "locked" ] && [ "$prev_flag" = "$flagword" ]; then
+      if verify_node "$f" "$META" "$lock_user" >/dev/null 2>&1; then
+        return 0
+      fi
+      echo "ERROR: $f is marked locked but drifted -- investigate:" >&2
+      verify_node "$f" "$META" "$lock_user" >&2 || true
+      return 1
+    fi
+    # Tier-internal escalation (sappnd <-> schg) is a normal relock: clear
+    # the previous system flag before applying the new one.
+    if [ "$state" = "locked" ] && [ "$prev_flag" != "$flagword" ]; then
+      confirm "Change anchor flag on $f: $prev_flag -> $flagword?" || {
+        echo "aborted: $f" >&2; return 2
+      }
+      fclear "$prev_flag" "$f" || return 1
+    fi
+  else
+    confirm "Anchor $f ($flagword; ownership unchanged)?" || {
+      echo "aborted: $f" >&2; return 2
+    }
+  fi
+
+  fset "$flagword" "$f" || return 1
+  if [ "$OPT_DRY" -eq 0 ]; then
+    write_meta "$META" \
+      "owner=$owner_now" \
+      "group=$group_now" \
+      "mode=$mode_now" \
+      "lockmode=$mode_now" \
+      "tier=anchor" \
+      "flag=$flagword" \
+      "flagsym=$(flags_of "$f")" \
+      "id=$(node_id "$f")" \
+      "recursive=0" \
+      "state=locked" || return 1
+  fi
+  echo "locked: $f (anchor $flagword)"
+  log_action lock "$f" ok
+}
+
+# release_node <path>: clear the flag, restore ownership for content tier,
+# refresh the snapshot. Meta flips to state=unlocked.
+release_node() {
+  local f="$1"
+  snap_paths "$f"
+  [ -f "$META" ] || { echo "skip $f: not in pool" >&2; log_action unlock "$f" skip-no-meta; return 0; }
+
+  local tier flag recursive owner group mode
+  tier="$(meta_field "$META" tier)"
+  flag="$(meta_field "$META" flag)"
+  recursive="$(meta_field "$META" recursive)"
+  owner="$(meta_field "$META" owner)"
+  group="$(meta_field "$META" group)"
+  mode="$(meta_field "$META" mode)"
+
+  local state
+  state="$(meta_field "$META" state)"
+  if [ "$state" = "unlocked" ]; then
+    echo "already unlocked: $f"
+    log_action unlock "$f" skip-already-unlocked
+    return 0
+  fi
+
+  # Clear flag FIRST (flags block chmod/chown), then restore identity.
+  case "$tier" in
+    content)
+      if [ "$recursive" = "1" ]; then
+        fclear "$flag" "$f" -R || return 1
+        run snapshot_tree "$f" "$SNAPDIR" || return 1
+        run chown -R "${owner}:${group}" "$f" || return 1
+      else
+        fclear "$flag" "$f" || return 1
+        run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || return 1
+        run chown -h "${owner}:${group}" "$f" || return 1
+      fi
+      run chmod "$mode" "$f" || return 1
+      ;;
+    placement|anchor)
+      fclear "$flag" "$f" || return 1
+      ;;
+    *)
+      echo "ERROR: $f meta has unknown tier '$tier'" >&2
+      return 1
+      ;;
+  esac
+
+  if [ "$OPT_DRY" -eq 0 ]; then
+    write_meta "$META" \
+      "owner=$owner" \
+      "group=$group" \
+      "mode=$mode" \
+      "lockmode=$(meta_field "$META" lockmode)" \
+      "tier=$tier" \
+      "flag=$flag" \
+      "flagsym=$(flags_of "$f")" \
+      "id=$(node_id "$f")" \
+      "recursive=$recursive" \
+      "state=unlocked" || return 1
+  fi
+  echo "unlocked: $f ($tier)"
+  [ "$tier" = "content" ] && [ "$recursive" != "1" ] && echo "  snapshot: $SNAP"
+
+  # Atomic-save hint: if the parent still carries an append/immutable flag,
+  # editors that save via rename will fail until --chain releases it.
+  local pflags
+  pflags="$(flags_of "$(dirname "$f")")"
+  case ",$pflags," in
+    *,uappnd,*|*,sappnd,*|*,uchg,*|*,schg,*)
+      echo "  note: parent $(dirname "$f") is flagged ($pflags); atomic-save editors"
+      echo "        (write-then-rename) will fail. In-place edits work, or use:"
+      echo "        sudo locked unlock --chain $f"
+      ;;
+  esac
+  log_action unlock "$f" ok
+}
+
+# ---- actions ---------------------------------------------------------------
+
+do_lock_one() {
+  local f="$1"
+  f="$(readlink -f "$f")" || { echo "skip: cannot resolve $1" >&2; return 1; }
+  [ -e "$f" ] || { echo "skip $f: does not exist" >&2; log_action lock "$f" skip-noent; return 1; }
+  if [ ! -f "$f" ] && [ ! -d "$f" ]; then
+    echo "skip $f: not a regular file or directory" >&2
+    return 1
+  fi
+
+  local leaf_tier="$OPT_TIER"
+  if [ -z "$leaf_tier" ]; then
+    leaf_tier=content
+    [ "$f" = "$user_home" ] && leaf_tier=anchor
+  fi
+
+  # Derive the chain before touching anything; refuse on a bad stop node.
+  local chain
+  chain="$(chain_for "$f")" || return 1
+
+  # Leaf first, then ancestors upward (reverse of unlock --chain).
+  case "$leaf_tier" in
+    content)   seal_content "$f" || return $? ;;
+    placement) seal_placement "$f" || return $? ;;
+    anchor)    seal_anchor "$f" "$OPT_FLAG" || return $? ;;
+  esac
+
+  local a t
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    [ "$a" = "$f" ] && continue
+    t="$(tier_for_ancestor "$a")"
+    case "$t" in
+      anchor)    seal_anchor "$a" sappnd || return $? ;;
+      placement) seal_placement "$a" || return $? ;;
+    esac
+  done <<EOF
+$chain
+EOF
+}
+
+do_unlock_one() {
+  local f="$1"
+  f="$(readlink -f "$f")" || { echo "skip: cannot resolve $1" >&2; return 1; }
+  release_node "$f" || return $?
+  if [ "$OPT_CHAIN" -eq 1 ]; then
+    local chain a
+    chain="$(chain_for "$f")" || return 1
+    while IFS= read -r a; do
+      [ -n "$a" ] || continue
+      snap_paths "$a"
+      [ -f "$META" ] || continue
+      release_node "$a" || return $?
+    done <<EOF
+$chain
+EOF
+    echo "chain released; relock with: sudo locked lock $f"
+  fi
+}
+
+do_revert_one() {
+  local f="$1"
+  f="$(readlink -f "$f")" || { echo "skip: cannot resolve $1" >&2; return 1; }
+  snap_paths "$f"
+  if [ -d "$f" ]; then
+    echo "skip $f: revert supports files only (unlock, restore by hand, lock)" >&2
+    return 1
+  fi
+  if [ ! -f "$SNAP" ]; then
+    echo "skip $f: no snapshot to revert from" >&2
+    log_action revert "$f" skip-no-snap
+    return 0
+  fi
+  # Guard against double-revert: if file already matches snapshot, the
+  # current attic IS the legitimate discarded edit; preserve it.
+  if cmp -s "$f" "$SNAP"; then
+    echo "skip $f: file already matches snapshot (preserving existing .attic)" >&2
+    log_action revert "$f" skip-already-reverted
+    return 0
+  fi
+
+  local was_locked=0 tier="" flag="" mode=600 owner="" group=""
+  if [ -f "$META" ]; then
+    tier="$(meta_field "$META" tier)"
+    flag="$(meta_field "$META" flag)"
+    mode="$(meta_field "$META" mode)"
+    owner="$(meta_field "$META" owner)"
+    group="$(meta_field "$META" group)"
+    [ "$(meta_field "$META" state)" = "locked" ] && was_locked=1
+  fi
+
+  if [ "$was_locked" -eq 1 ]; then
+    fclear "$flag" "$f" || return 1
+  fi
+  run atomic_replace "$f" "$ATTIC" "${lock_user}:${lock_user}" 600 || return 1
+  if [ "$was_locked" -eq 1 ]; then
+    run atomic_replace "$SNAP" "$f" "${lock_user}:${lock_user}" "$mode" || return 1
+    fset "$flag" "$f" || return 1
+    if [ "$OPT_DRY" -eq 0 ]; then
+      write_meta "$META" \
+        "owner=$owner" \
+        "group=$group" \
+        "mode=$mode" \
+        "lockmode=$(meta_field "$META" lockmode)" \
+        "tier=$tier" \
+        "flag=$flag" \
+        "flagsym=$(flags_of "$f")" \
+        "id=$(node_id "$f")" \
+        "recursive=0" \
+        "state=locked" || return 1
+    fi
+  else
+    run atomic_replace "$SNAP" "$f" "${owner:-$inv}:${group:-staff}" "$mode" || return 1
+  fi
+  echo "reverted: $f from snapshot"
+  echo "  discarded content saved to: $ATTIC"
+  log_action revert "$f" ok
+}
+
+do_status_one() {
+  local f="$1"
+  f="$(readlink -f "$f")" || { echo "cannot resolve $1" >&2; return 1; }
+  snap_paths "$f"
+  local leaf_meta="$META"
+
+  echo "chain for $f:"
+  local chain nodes=() a
+  if chain="$(chain_for "$f" 2>/dev/null)"; then
+    :
+  else
+    echo "  ✗ chain stop node is not root-owned (see: sudo locked lock $f)"
+    chain="$(dirname "$f")"
+  fi
+  # Root-first for readability.
+  while IFS= read -r a; do
+    [ -n "$a" ] && nodes=("$a" ${nodes[@]+"${nodes[@]}"})
+  done <<EOF
+$chain
+EOF
+  nodes=(${nodes[@]+"${nodes[@]}"} "$f")
+
+  local any=0 rc=0 n tier state
+  for n in "${nodes[@]}"; do
+    snap_paths "$n"
+    if [ ! -f "$META" ]; then
+      echo "    -  $n (not in pool)"
+      continue
+    fi
+    any=1
+    tier="$(meta_field "$META" tier)"
+    state="$(meta_field "$META" state)"
+    if [ "$state" = "unlocked" ]; then
+      echo "    ○  $n ($tier, unlocked)"
+      continue
+    fi
+    if verify_node "$n" "$META" "$lock_user" >/dev/null 2>&1; then
+      echo "    ✓  $n ($tier $(meta_field "$META" flag))"
+    else
+      echo "    ✗  $n ($tier) DRIFT:"
+      verify_node "$n" "$META" "$lock_user" | sed 's/^/      /' || true
+      rc=1
+    fi
+  done
+  [ "$any" -eq 1 ] || { echo "  not in pool: $leaf_meta absent"; }
+  return "$rc"
+}
+
+do_verify() {
+  local total_drift=0 udir uname ulock uhome alerts drift_count
+  for udir in "$SNAPSHOTS_ROOT"/*/; do
+    uname="$(basename "$udir")"
+    case "$uname" in .staging|.*) continue ;; esac
+    ulock="${LOCKED_LOCK_ACCOUNT:-$(lock_account_for "$uname")}"
+    uhome="${LOCKED_USER_HOME:-$(home_for "$uname")}"
+    drift_count=0
+    local meta fpath out
+    for meta in "$udir"*.meta; do
+      fpath="$(decode "$(basename "$meta" .meta)")"
+      if out="$(verify_node "$fpath" "$meta" "$ulock")"; then
+        [ "$OPT_QUIET" -eq 1 ] || [ -z "$out" ] || printf '%s\n' "$out"
+      else
+        printf '%s\n' "$out"
+        drift_count=$((drift_count + 1))
+      fi
+    done
+    if [ -n "$uhome" ]; then
+      alerts="${LOCKED_ALERT_DIR:-$uhome/.local/state/agents/claude/alerts}"
+      write_or_clear_alert "$uname" "$alerts" "$drift_count"
+    fi
+    total_drift=$((total_drift + drift_count))
+  done
+  if [ "$total_drift" -gt 0 ]; then
+    echo "verify: $total_drift node(s) drifted" >&2
+    log_action verify "" "drift-$total_drift"
+    return 5
+  fi
+  [ "$OPT_QUIET" -eq 1 ] || echo "verify: all locked nodes clean"
+  log_action verify "" ok
+  return 0
+}
+
+# Alert file handling runs AS THE USER (sudo -u): a planted symlink anywhere
+# under the user-writable alert path then redirects a user-UID write, not a
+# root one -- no escalation surface. Slug grammar: locked--drift.
+write_or_clear_alert() {
+  local uname="$1" alerts="$2" drift_count="$3"
+  local afile="$alerts/locked--drift"
+  if [ "$drift_count" -gt 0 ]; then
+    local ts line
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    line="$ts locked verify: $drift_count node(s) drifted; run: sudo locked verify"
+    run sudo -u "$uname" /bin/sh -c '
+      umask 022
+      mkdir -p "$1" || exit 1
+      printf "%s\n" "$2" >"$1/.locked--drift.tmp" && mv -f "$1/.locked--drift.tmp" "$1/locked--drift"
+    ' alertwrite "$alerts" "$line" || echo "warning: could not write alert for $uname" >&2
+  else
+    if sudo -u "$uname" /bin/sh -c 'test -e "$1"' alertclear "$afile" 2>/dev/null; then
+      run sudo -u "$uname" rm -f -- "$afile" || echo "warning: could not clear alert for $uname" >&2
+    fi
+  fi
+}
+
+# ---- dispatch --------------------------------------------------------------
+
+require_paths() {
+  if [ "${#PATHS[@]}" -eq 0 ]; then
+    echo "no paths given" >&2
+    usage >&2
+    exit 1
+  fi
+}
+
+case "$action" in
+  lock|unlock|revert|status)
+    require_paths
+    failures=0
+    for f in "${PATHS[@]}"; do
+      case "$action" in
+        lock)   do_lock_one "$f"   || { rc=$?; [ "$rc" -eq 2 ] && exit 2; failures=$((failures + 1)); echo "error processing $f (continuing)" >&2; } ;;
+        unlock) do_unlock_one "$f" || { failures=$((failures + 1)); echo "error processing $f (continuing)" >&2; } ;;
+        revert) do_revert_one "$f" || { failures=$((failures + 1)); echo "error processing $f (continuing)" >&2; } ;;
+        status) do_status_one "$f" || failures=$((failures + 1)) ;;
+      esac
+    done
+    if [ "$failures" -gt 0 ]; then
+      [ "$action" = "status" ] && exit 5
+      exit 3
+    fi
+    ;;
+  verify)
+    do_verify
+    ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac
