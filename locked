@@ -30,7 +30,7 @@ set -euo pipefail
 IFS=$'\n\t'
 shopt -s nullglob
 
-VERSION=2.0.1
+VERSION=2.0.2
 
 # Override-friendly defaults (test seams; sudo's env_reset strips these on
 # real invocations, so they are only reachable when the script is executed
@@ -1123,8 +1123,12 @@ do_lock_one() {
     anchor)    seal_anchor "$f" "$leaf_flag" || return $? ;;
   esac
 
+  # The chain feeds fd 3, not stdin: the loop body seals ancestors, and every
+  # seal asks for confirmation on stdin. A plain `done <<EOF` would put the
+  # heredoc there and confirm() -- which fails closed off a tty -- would abort
+  # the anchor even with a human at the terminal.
   local a t
-  while IFS= read -r a; do
+  while IFS= read -r a <&3; do
     [ -n "$a" ] || continue
     [ "$a" = "$f" ] && continue
     t="$(tier_for_ancestor "$a")"
@@ -1132,7 +1136,7 @@ do_lock_one() {
       anchor)    seal_anchor "$a" sappnd || return $? ;;
       placement) seal_placement "$a" || return $? ;;
     esac
-  done <<EOF
+  done 3<<EOF
 $chain
 EOF
 }
@@ -1144,12 +1148,13 @@ do_unlock_one() {
   if [ "$OPT_CHAIN" -eq 1 ]; then
     local chain a
     chain="$(chain_for "$f")" || return 1
-    while IFS= read -r a; do
+    # Chain on fd 3, stdin left alone, for the reason given in do_lock_one.
+    while IFS= read -r a <&3; do
       [ -n "$a" ] || continue
       snap_paths "$a"
       [ -f "$META" ] || continue
       release_node "$a" || return $?
-    done <<EOF
+    done 3<<EOF
 $chain
 EOF
     echo "chain released; relock with: sudo locked lock $f"

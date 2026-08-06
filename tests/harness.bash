@@ -343,6 +343,48 @@ check "home anchored sappnd"              "sappnd" "$(flags_of "$ADMHOME")"
 check "stop node left untouched"          "" "$(flags_of "$ADMSTOP")"
 ok   "verify clean with admin stop node"  locked_home "$ADMHOME" verify
 
+note "== cli: interactive chain seal keeps the tty (no --yes) =="
+# The chain loop feeds its ancestor list on fd 3 so the seal prompts still
+# read the terminal. When the heredoc sat on stdin the leaf prompt worked
+# (it runs before the loop) and the home anchor died fail-closed, so the
+# regression is only visible from a pty -- hence expect.
+if [ -x /usr/bin/expect ]; then
+  TTYSTOP="$SCRATCH/ttyusers"
+  install -d -m 755 -o root -g wheel "$TTYSTOP"
+  TTYHOME="$TTYSTOP/home"
+  install -d -o "$INV" -g staff "$TTYHOME"
+  TTYCFG="$TTYHOME/zshenv"
+  as_user /bin/sh -c "printf 'export EDITOR=vi\n' > '$TTYCFG'"
+  TTYEXP="$SCRATCH/tty-lock.exp"
+  cat >"$TTYEXP" <<EOF
+set timeout 15
+spawn env SNAPSHOTS_ROOT=$SNAPROOT INSTALL_TARGET=$SCRATCH/not-installed LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME LOCKED_ALERT_DIR=$ALERTS SUDO_USER=$INV /bin/bash $LOCKED lock $TTYCFG
+expect {
+  timeout { exit 1 }
+  eof     { exit 1 }
+  -ex "\[y/N\]"
+}
+send "y\r"
+expect {
+  timeout { exit 1 }
+  eof     { exit 1 }
+  -ex "\[y/N\]"
+}
+send "y\r"
+expect {
+  timeout { exit 1 }
+  eof
+}
+catch wait result
+exit [lindex \$result 3]
+EOF
+  ok   "interactive lock answers both prompts" /usr/bin/expect -f "$TTYEXP"
+  check "interactive leaf sealed uchg"         "uchg" "$(flags_of "$TTYCFG")"
+  check "interactive home anchored sappnd"     "sappnd" "$(flags_of "$TTYHOME")"
+else
+  note "  skip  interactive chain seal (no expect on this machine)"
+fi
+
 # ---- 3. nix deploy guards --------------------------------------------------
 #
 # The store-ancestry acceptance and the setup refusal ride the same seams
