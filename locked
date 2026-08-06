@@ -87,6 +87,7 @@ shift
 
 OPT_TIER=""
 OPT_FLAG=sappnd
+OPT_FLAG_SET=0
 OPT_YES=0
 OPT_DRY=0
 OPT_CHAIN=0
@@ -97,8 +98,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --tier)    OPT_TIER="${2:?--tier needs a value}"; shift 2 ;;
     --tier=*)  OPT_TIER="${1#--tier=}"; shift ;;
-    --flag)    OPT_FLAG="${2:?--flag needs a value}"; shift 2 ;;
-    --flag=*)  OPT_FLAG="${1#--flag=}"; shift ;;
+    --flag)    OPT_FLAG="${2:?--flag needs a value}"; OPT_FLAG_SET=1; shift 2 ;;
+    --flag=*)  OPT_FLAG="${1#--flag=}"; OPT_FLAG_SET=1; shift ;;
     --yes)     OPT_YES=1; shift ;;
     --dry-run) OPT_DRY=1; shift ;;
     --chain)   OPT_CHAIN=1; shift ;;
@@ -200,12 +201,14 @@ decode() {
 }
 
 flags_of() {
-  # Symbolic flag word ("" when none), spaces stripped so comma-list matching
-  # and string equality are stable. stat's keyword order is fixed on a given
-  # OS, so equality is a sound comparison.
+  # Symbolic flag word, normalized: "" when none (stat prints "-"), spaces
+  # stripped. stat's keyword order is fixed on a given OS (probed:
+  # "uappnd,uchg,hidden"), so string equality is a sound comparison.
   local s
   s="$(stat -f '%Sf' "$1")"
-  printf '%s' "${s// /}"
+  s="${s// /}"
+  [ "$s" = "-" ] && s=""
+  printf '%s' "$s"
 }
 node_id() {
   stat -f '%d.%i' "$1"
@@ -583,8 +586,15 @@ chain_for() {
   done
 }
 
+# ~ and ~/.ssh are identity-checked by the OS against the user's UID (sshd
+# StrictModes, ssh client config-ownership checks), so they must never leave
+# the user's ownership: anchor tier, not placement.
 tier_for_ancestor() {
-  if [ "$1" = "$user_home" ]; then echo anchor; else echo placement; fi
+  if [ "$1" = "$user_home" ] || [ "$1" = "$user_home/.ssh" ]; then
+    echo anchor
+  else
+    echo placement
+  fi
 }
 
 # ---- seal / release primitives ---------------------------------------------
@@ -770,17 +780,22 @@ seal_placement() {
 }
 
 # seal_anchor <path> <flagword>: system flag, ownership and mode untouched.
+# Anchor FILES still get the snapshot + diff-witness (ssh config class:
+# ownership never changes but the content is what's being sealed); dirs
+# (~, ~/.ssh) have no content snapshot.
 seal_anchor() {
   local f="$1" flagword="$2"
   snap_paths "$f"
+  local is_file=0
+  [ -f "$f" ] && is_file=1
 
   local owner_now group_now mode_now
   owner_now="$(stat -f '%Su' "$f")"
   group_now="$(stat -f '%Sg' "$f")"
   mode_now="$(stat -f '%OLp' "$f")"
 
+  local state="" prev_flag=""
   if [ -f "$META" ]; then
-    local state prev_flag
     state="$(meta_field "$META" state)"
     prev_flag="$(meta_field "$META" flag)"
     if [ "$state" = "locked" ] && [ "$prev_flag" = "$flagword" ]; then
@@ -791,18 +806,37 @@ seal_anchor() {
       verify_node "$f" "$META" "$lock_user" >&2 || true
       return 1
     fi
+  fi
+
+  if [ "$is_file" -eq 1 ]; then
+    if [ -f "$SNAP" ]; then
+      if cmp -s "$SNAP" "$f"; then
+        echo "no changes since unlock: $f"
+      else
+        printf -- '\n--- diff snapshot -> current: %s ---\n' "$f"
+        diff -u "$SNAP" "$f" || true
+        echo
+      fi
+    else
+      echo "adopting into pool (no prior snapshot): $f"
+    fi
+  fi
+
+  if [ "$state" = "locked" ] && [ "$prev_flag" != "$flagword" ]; then
     # Tier-internal escalation (sappnd <-> schg) is a normal relock: clear
     # the previous system flag before applying the new one.
-    if [ "$state" = "locked" ] && [ "$prev_flag" != "$flagword" ]; then
-      confirm "Change anchor flag on $f: $prev_flag -> $flagword?" || {
-        echo "aborted: $f" >&2; return 2
-      }
-      fclear "$prev_flag" "$f" || return 1
-    fi
+    confirm "Change anchor flag on $f: $prev_flag -> $flagword?" || {
+      echo "aborted: $f" >&2; return 2
+    }
+    fclear "$prev_flag" "$f" || return 1
   else
     confirm "Anchor $f ($flagword; ownership unchanged)?" || {
       echo "aborted: $f" >&2; return 2
     }
+  fi
+
+  if [ "$is_file" -eq 1 ] && [ ! -f "$SNAP" ]; then
+    run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || return 1
   fi
 
   fset "$flagword" "$f" || return 1
@@ -862,6 +896,11 @@ release_node() {
       ;;
     placement|anchor)
       fclear "$flag" "$f" || return 1
+      # Anchor files keep the snapshot flow so the relock diff-witness has
+      # a baseline (ownership untouched either way).
+      if [ "$tier" = "anchor" ] && [ -f "$f" ]; then
+        run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || return 1
+      fi
       ;;
     *)
       echo "ERROR: $f meta has unknown tier '$tier'" >&2
@@ -910,10 +949,32 @@ do_lock_one() {
     return 1
   fi
 
+  local under_ssh=0
+  case "$f" in
+    "$user_home/.ssh"|"$user_home/.ssh/"*) under_ssh=1 ;;
+  esac
+
   local leaf_tier="$OPT_TIER"
   if [ -z "$leaf_tier" ]; then
     leaf_tier=content
-    [ "$f" = "$user_home" ] && leaf_tier=anchor
+    if [ "$f" = "$user_home" ] || [ "$under_ssh" -eq 1 ]; then
+      leaf_tier=anchor
+    fi
+  fi
+  if [ "$under_ssh" -eq 1 ] && [ "$leaf_tier" != "anchor" ]; then
+    echo "ERROR: $f: ~/.ssh and its files take the anchor tier only -- sshd" >&2
+    echo "       StrictModes and the ssh client's config check require" >&2
+    echo "       user-or-root ownership, which content/placement would flip" >&2
+    return 1
+  fi
+
+  # Anchor-flag default: sappnd, except regular files under ~/.ssh freeze
+  # hard (schg) -- an append-only ssh config or authorized_keys is still an
+  # injection surface. Explicit --flag overrides (the TOFU known_hosts file
+  # WANTS sappnd).
+  local leaf_flag="$OPT_FLAG"
+  if [ "$under_ssh" -eq 1 ] && [ "$OPT_FLAG_SET" -eq 0 ] && [ -f "$f" ]; then
+    leaf_flag=schg
   fi
 
   # Derive the chain before touching anything; refuse on a bad stop node.
@@ -924,7 +985,7 @@ do_lock_one() {
   case "$leaf_tier" in
     content)   seal_content "$f" || return $? ;;
     placement) seal_placement "$f" || return $? ;;
-    anchor)    seal_anchor "$f" "$OPT_FLAG" || return $? ;;
+    anchor)    seal_anchor "$f" "$leaf_flag" || return $? ;;
   esac
 
   local a t
@@ -991,12 +1052,17 @@ do_revert_one() {
     [ "$(meta_field "$META" state)" = "locked" ] && was_locked=1
   fi
 
+  # Locked-state ownership depends on tier: content files belong to the
+  # lock account, anchor files stay the user's (ssh owner checks).
+  local restore_owner="${lock_user}:${lock_user}"
+  [ "$tier" = "anchor" ] && restore_owner="${owner}:${group}"
+
   if [ "$was_locked" -eq 1 ]; then
     fclear "$flag" "$f" || return 1
   fi
   run atomic_replace "$f" "$ATTIC" "${lock_user}:${lock_user}" 600 || return 1
   if [ "$was_locked" -eq 1 ]; then
-    run atomic_replace "$SNAP" "$f" "${lock_user}:${lock_user}" "$mode" || return 1
+    run atomic_replace "$SNAP" "$f" "$restore_owner" "$mode" || return 1
     fset "$flag" "$f" || return 1
     if [ "$OPT_DRY" -eq 0 ]; then
       write_meta "$META" \
