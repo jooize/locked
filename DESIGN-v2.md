@@ -101,8 +101,16 @@ EndpointSecurity/eslogger EPERM-monitoring is explicitly later.
 
 - **Atomic-save editors** replace the file with a new inode via rename;
   under a flagged parent the rename is denied. Unlock prints a hint when
-  the parent chain would deny it; `unlock --chain` is the escape. In-place
-  writers (`tee`, `vim` with `backupcopy=yes`, `>>`) are unaffected.
+  the parent chain would deny it; `unlock --chain` is the escape and
+  `locked edit` avoids the window entirely. In-place writers (`tee`,
+  `vim` with `backupcopy=yes`, `>>`) are unaffected.
+- **The rename hole partially reopens during a `--chain` window**: a
+  released ancestor can be swapped by anything with write on its parent
+  (rename checks parent write only). Locked leaves keep their own flags
+  throughout, and re-seal refuses to bless a swapped placement/anchor
+  node without a human at a tty (`--yes` deliberately does not satisfy
+  that prompt); `verify` checks dev/ino against meta. Keep windows
+  short; prefer `locked edit`.
 - **Parent-swap above the anchor is out of scope by construction**: the
   chain terminates at a root-owned dir, so there is no user-writable
   ancestor left to swap. What remains is the standing floor: pinned

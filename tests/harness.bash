@@ -64,18 +64,22 @@ as_user() {
 PASS=0
 FAIL=0
 note() { printf '%s\n' "$*"; }
-ok() {   # ok <desc> <cmd...>: expect success
+ok() {   # ok <desc> <cmd...>: expect success; prints the output on failure
   local desc="$1"; shift
-  if "$@" >/dev/null 2>&1; then
+  local out
+  if out="$("$@" 2>&1)"; then
     PASS=$((PASS + 1)); note "  ok    $desc"
   else
     FAIL=$((FAIL + 1)); note "  FAIL  $desc (expected success)"
+    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/        | /'
   fi
 }
-deny() { # deny <desc> <cmd...>: expect failure
+deny() { # deny <desc> <cmd...>: expect failure; prints the output on surprise
   local desc="$1"; shift
-  if "$@" >/dev/null 2>&1; then
+  local out
+  if out="$("$@" 2>&1)"; then
     FAIL=$((FAIL + 1)); note "  FAIL  $desc (expected denial)"
+    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/        | /'
   else
     PASS=$((PASS + 1)); note "  ok    $desc"
   fi

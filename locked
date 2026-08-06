@@ -179,6 +179,34 @@ confirm() {
   case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
 
+confirm_hard() {
+  # High-signal prompts (node identity changed): --yes does NOT satisfy
+  # this; a human at a tty must answer.
+  if [ ! -t 0 ]; then
+    echo "refusing: this decision needs a human at a tty (--yes does not apply)" >&2
+    return 1
+  fi
+  local reply
+  printf '%s [y/N] ' "$1" >&2
+  IFS= read -r reply
+  case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# During an unlock window a released ancestor can be swapped by anything
+# with write on ITS parent (rename checks parent write only). Re-sealing
+# must not silently bless a replaced node.
+check_reseal_identity() { # <path> <metafile>
+  local n="$1" meta="$2" prev_id cur_id
+  prev_id="$(meta_field "$meta" id)"
+  cur_id="$(node_id "$n")"
+  [ "$cur_id" = "$prev_id" ] && return 0
+  echo "WARNING: $n was REPLACED while unlocked (dev/ino $prev_id -> $cur_id)." >&2
+  echo "         If you did not swap this node yourself, STOP and investigate" >&2
+  echo "         (compare against the snapshot; check: log show --predicate" >&2
+  echo "         'eventMessage CONTAINS \"locked:\"' --last 1h)." >&2
+  confirm_hard "Re-seal the replaced node $n anyway?"
+}
+
 # ---- shared helpers --------------------------------------------------------
 
 # Verify a path is root:wheel owned with no group/other write. Used both to
@@ -740,7 +768,9 @@ seal_placement() {
       verify_node "$d" "$META" "$lock_user" >&2 || true
       return 1
     fi
-    # Re-seal after an unlock ceremony: reapply flag only.
+    # Re-seal after an unlock ceremony: reapply flag only -- but never
+    # silently bless a node that was swapped during the window.
+    check_reseal_identity "$d" "$META" || { echo "aborted: $d" >&2; return 2; }
     fset uappnd "$d" || return 1
     if [ "$OPT_DRY" -eq 0 ]; then
       write_meta "$META" \
@@ -830,6 +860,13 @@ seal_anchor() {
     else
       echo "adopting into pool (no prior snapshot): $f"
     fi
+  fi
+
+  # Dirs have no content diff, so a swap during the window is invisible
+  # except by identity -- check it. (Files are covered by the diff above,
+  # and atomic-save legitimately changes a file's inode.)
+  if [ -f "$META" ] && [ "$is_file" -eq 0 ]; then
+    check_reseal_identity "$f" "$META" || { echo "aborted: $f" >&2; return 2; }
   fi
 
   if [ "$state" = "locked" ] && [ "$prev_flag" != "$flagword" ]; then
