@@ -11,7 +11,9 @@
 # `daemon` user (the account's identity is irrelevant to flag mechanics;
 # what matters is that the invoker does not own the node), snapshots and
 # fake home live in a scratch dir, and the cleanup trap clears all flags
-# before removing it. Group-write add-rights on placement dirs depend on
+# before removing it. Ancestry fixtures live in a second scratch under
+# /var/db (the 1777 /private/tmp would itself fail the walk), also removed
+# by the trap. Group-write add-rights on placement dirs depend on
 # membership in the real _<user>-lock group and are exercised at ceremony
 # time, not here.
 
@@ -32,9 +34,10 @@ chmod 755 "$SCRATCH"   # root:wheel 755 -> valid chain stop node
 
 cleanup() {
   # Clear every flag we may have set (system flags need root; we are root),
-  # then remove the scratch tree. Nothing outside SCRATCH is touched.
+  # then remove the scratch trees. No flags are ever set under ANC.
   chflags -R noschg,nosappnd,nouchg,nouappnd "$SCRATCH" 2>/dev/null || true
   rm -rf -- "$SCRATCH"
+  if [ -n "${ANC:-}" ]; then rm -rf -- "$ANC"; fi
 }
 trap cleanup EXIT
 
@@ -313,6 +316,111 @@ check "dry-run left owner"               "$INV" "$(owner_of "$DR")"
 check "dry-run left flags"               "" "$(flags_of "$DR")"
 deny "dry-run wrote no meta or snapshot" \
      /bin/sh -c "ls '$SNAPROOT/$INV' | grep -q dryrun"
+
+# ---- 3. nix deploy guards --------------------------------------------------
+#
+# The store-ancestry acceptance and the setup refusal ride the same seams
+# as everything above. Fixtures needing a STRICT root-owned chain live in
+# ANC under /var/db (root:wheel 755 all the way up); /private/tmp's 1777
+# would fail the walk on its own.
+
+note "== nix deploy guards: install ancestry =="
+ANC="$(mktemp -d /private/var/db/locked-harness-ancestry.XXXXXX)"
+chmod 755 "$ANC"
+
+locked_it() { # <install_target> <args...>: locked with a specific INSTALL_TARGET
+  local it="$1"; shift
+  env SNAPSHOTS_ROOT="$SNAPROOT" \
+      INSTALL_TARGET="$it" \
+      LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
+      LOCKED_USER_HOME="$FAKE_HOME" \
+      LOCKED_ALERT_DIR="$ALERTS" \
+      SUDO_USER="$INV" \
+      /bin/bash "$LOCKED" "$@"
+}
+
+refuse() { # <desc> <needle> <cmd...>: expect failure WITH the named message,
+           # so a denial can be attributed to the guard under test.
+  local desc="$1" needle="$2"; shift 2
+  local out
+  if out="$("$@" 2>&1)"; then
+    FAIL=$((FAIL + 1)); note "  FAIL  $desc (expected refusal)"
+    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/        | /'
+  elif printf '%s\n' "$out" | grep -qF "$needle"; then
+    PASS=$((PASS + 1)); note "  ok    $desc"
+  else
+    FAIL=$((FAIL + 1)); note "  FAIL  $desc (refused, but not with '$needle')"
+    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/        | /'
+  fi
+}
+
+# Accepted: strict root:wheel 755 chain (the /usr/local shape).
+install -d -m 755 -o root -g wheel "$ANC/ok/sbin"
+install -m 755 -o root -g wheel /dev/null "$ANC/ok/sbin/locked"
+ok   "strict root-755 ancestry accepted"  locked_it "$ANC/ok/sbin/locked" verify --quiet
+
+# Refused: group-writable ancestor. Sticky must NOT rescue it outside the
+# literal /nix/store -- the carve-out may never weaken /usr/local-shaped
+# paths. (%OLp strips the sticky bit, so both report mode 775.)
+install -d -m 775 -o root -g wheel "$ANC/gw"
+install -d -m 755 -o root -g wheel "$ANC/gw/sbin"
+install -m 755 -o root -g wheel /dev/null "$ANC/gw/sbin/locked"
+refuse "group-writable ancestor refused" "mode 775" \
+       locked_it "$ANC/gw/sbin/locked" verify --quiet
+install -d -m 1775 -o root -g wheel "$ANC/sticky"
+install -d -m 755 -o root -g wheel "$ANC/sticky/sbin"
+install -m 755 -o root -g wheel /dev/null "$ANC/sticky/sbin/locked"
+refuse "sticky+group-write refused outside /nix/store" "mode 775" \
+       locked_it "$ANC/sticky/sbin/locked" verify --quiet
+
+# The REAL chain is walked too: a root-owned symlink pointing into a
+# user-writable directory must be refused, and the same link shape into
+# the strict chain is the control.
+install -d -m 777 -o root -g wheel "$ANC/userland"
+install -m 755 -o root -g wheel /dev/null "$ANC/userland/locked"
+install -d -m 755 -o root -g wheel "$ANC/links"
+ln -s "$ANC/userland/locked" "$ANC/links/via-userland"
+refuse "symlink into user-writable real chain refused" "mode 777" \
+       locked_it "$ANC/links/via-userland" verify --quiet
+ln -s "$ANC/ok/sbin/locked" "$ANC/links/via-ok"
+ok   "control: symlink into root-755 real chain accepted" \
+     locked_it "$ANC/links/via-ok" verify --quiet
+
+# Symlink ANCESTORS are judged on owner alone: root-owned passes (the
+# system-profile shape), user-owned is refused.
+ln -s "$ANC/ok/sbin" "$ANC/links/root-sym"
+ok   "control: root-owned symlink ancestor accepted" \
+     locked_it "$ANC/links/root-sym/locked" verify --quiet
+ln -s "$ANC/ok/sbin" "$ANC/links/user-sym"
+chown -h "$INV" "$ANC/links/user-sym"
+refuse "non-root symlink ancestor refused" "symlink owned by" \
+       locked_it "$ANC/links/user-sym/locked" verify --quiet
+
+# On a nix machine the deployed shape is live-testable: the profile path
+# (symlink components down to a store path) and the resolved store path
+# (/nix/store itself root-owned 1775) must both pass.
+if [ -d /nix/store ] && [ -d /run/current-system/sw/bin ]; then
+  PROFILE_BIN="$(/usr/bin/find /run/current-system/sw/bin/. -mindepth 1 -maxdepth 1 -print 2>/dev/null | /usr/bin/head -1)"
+  if [ -n "$PROFILE_BIN" ]; then
+    ok "system-profile install path accepted" locked_it "$PROFILE_BIN" verify --quiet
+    ok "resolved store path accepted"         locked_it "$(readlink -f "$PROFILE_BIN")" verify --quiet
+  fi
+else
+  note "  skip  nix store ancestry (no nix on this machine)"
+fi
+
+note "== nix deploy guards: setup refusal =="
+# The INSTALL_TARGET prefix alone must trigger the refusal. The probe
+# target is routed THROUGH an existing regular file where possible, so if
+# the refusal ever regressed, setup's first step (install -d) dies on
+# ENOTDIR before mutating anything -- and the wrong message fails the
+# needle, catching the regression.
+SETUP_IT=/run/current-system/nowhere/locked
+if [ -e /run/current-system ]; then
+  CS_FILE="$(/usr/bin/find /run/current-system/. -mindepth 1 -maxdepth 1 -type f -print 2>/dev/null | /usr/bin/head -1)"
+  if [ -n "$CS_FILE" ]; then SETUP_IT="$CS_FILE/x/locked"; fi
+fi
+refuse "setup refused when nix-managed" "nix-managed" locked_it "$SETUP_IT" setup
 
 # ---- summary ---------------------------------------------------------------
 

@@ -71,7 +71,8 @@ usage: sudo locked <action> [options] [args]
       drift. Raises/clears the locked--drift alert file per user.
   setup
       Provision lock user/group, digest-pinned sudoers, verify timer;
-      self-install to \$INSTALL_TARGET.
+      self-install to \$INSTALL_TARGET. Refused on nix-managed installs
+      (the nix module declares all of this; rebuild instead).
 
   --help     this text
   --version  print version
@@ -288,6 +289,14 @@ write_meta() {
 
 # ---- setup -----------------------------------------------------------------
 
+# The nix build rewrites INSTALL_TARGET's default to the system profile;
+# a copy executing from the store is nix-managed however it was invoked.
+nix_managed() {
+  case "$INSTALL_TARGET" in /run/current-system/*) return 0 ;; esac
+  case "$(readlink -f "$0")" in /nix/store/*) return 0 ;; esac
+  return 1
+}
+
 install_verify_timer() {
   local tmp
   tmp="$(mktemp)"
@@ -318,6 +327,18 @@ EOF
 }
 
 do_setup() {
+  # Under the nix deployment every step below is declared by the nix
+  # module (security.locked): binary in the system profile, lock account
+  # and group, digest-pinned sudoers, verify daemon. Refuse rather than
+  # fight the declarative config; a rebuild is the whole setup there.
+  if nix_managed; then
+    echo "ERROR: this locked is nix-managed; setup here is declarative." >&2
+    echo "       Change the nix module config (security.locked) and rebuild" >&2
+    echo "       instead. Standalone setup remains available by running" >&2
+    echo "       ./locked setup from a repo checkout." >&2
+    exit 1
+  fi
+
   # 1. Self-install. Verify every ancestor dir of INSTALL_TARGET is root-owned
   #    BEFORE writing the binary, so we never install into a user-writable path.
   local self target target_dir
@@ -445,14 +466,61 @@ fi
 # Re-verify INSTALL_TARGET ancestry on every invocation, not just at setup.
 # Catches /usr/local being chowned user-writable after setup (e.g. a legacy
 # "sudo chown -R \$USER /usr/local" Homebrew recipe).
-verify_install_ancestry() {
-  [ -f "$INSTALL_TARGET" ] || return 0   # pre-install; let other checks handle.
+#
+# Two relaxations for the nix deployment, each deliberately narrow:
+#
+#   - Symlink ancestors (the system profile: /run, /run/current-system,
+#     ...) are judged on OWNER only. A symlink's mode and group gate
+#     nothing on macOS -- the only way to change where it points is to
+#     replace it, which its PARENT directory governs, and every parent is
+#     itself on the walk. stat(1) defaults to lstat, so "$p" names the
+#     link, not its target.
+#
+#   - /nix/store is the one legitimate group-writable ancestor: root-owned
+#     1775 (sticky, group nixbld, mutations mediated by the nix-daemon;
+#     store objects are immutable by construction). The acceptance is
+#     keyed to the LITERAL path, so it can never relax the rule for
+#     /usr/local or any other prefix.
+verify_ancestor() {
+  local p="$1"
+  if [ -L "$p" ]; then
+    local owner
+    owner="$(stat -f '%Su' "$p")"
+    [ "$owner" = "root" ] && return 0
+    echo "ERROR: $p is a symlink owned by $owner, expected root" >&2
+    return 1
+  fi
+  if [ "$p" = "/nix/store" ]; then
+    local owner mode
+    owner="$(stat -f '%Su' "$p")"
+    mode="$(stat -f '%OMp%OLp' "$p")"
+    [ "$owner" = "root" ] && [ "$mode" = "1775" ] && return 0
+    echo "ERROR: /nix/store is owned $owner mode $mode, expected root-owned 1775" >&2
+    return 1
+  fi
+  verify_root_owned_path "$p"
+}
+
+verify_ancestors() { # <path>: check every ancestor dir of <path>
   local p
-  p="$(dirname "$INSTALL_TARGET")"
+  p="$(dirname "$1")"
   while [ "$p" != "/" ]; do
-    verify_root_owned_path "$p" || return 1
+    verify_ancestor "$p" || return 1
     p="$(dirname "$p")"
   done
+}
+
+verify_install_ancestry() {
+  [ -f "$INSTALL_TARGET" ] || return 0   # pre-install; let other checks handle.
+  verify_ancestors "$INSTALL_TARGET" || return 1
+  # A symlinked install path (the nix profile) textually walks mostly
+  # symlinks; the bytes live elsewhere. Walk the REAL location too --
+  # both chains must hold.
+  local real
+  real="$(readlink -f "$INSTALL_TARGET")" || return 1
+  if [ "$real" != "$INSTALL_TARGET" ]; then
+    verify_ancestors "$real" || return 1
+  fi
 }
 verify_install_ancestry || exit 1
 
