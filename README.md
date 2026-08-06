@@ -99,12 +99,12 @@ If you'd rather not run `sudo ./locked setup`, the same steps by hand. Replace `
 
 ### 1. Install the binary
 
-Verify `/usr/local/sbin` and every ancestor up to `/` are `root:wheel` mode `755` or stricter. A user-writable ancestor lets a swapped binary inherit root after the next sudo approval.
+Verify `/usr/local/sbin` and every ancestor up to `/` are root-owned with no group/other write -- mode `755` or stricter. A user-writable ancestor lets a swapped binary inherit root after the next sudo approval.
 ```sh
 for p in /usr/local/sbin /usr/local /usr; do
   stat -f '%Su:%Sg %OLp' "$p" 2>/dev/null
 done
-# Expect each line: "root:wheel" with mode 755 (or stricter: 750, 700, ...).
+# Expect each line: owner "root" (any group) with mode 755 (or stricter: 750, 700, ...).
 ```
 If any ancestor is user-owned -- common on Intel Macs where Homebrew once `chown`ed `/usr/local` -- repair before continuing: `sudo chown root:wheel <path> && sudo chmod 755 <path>`.
 
@@ -198,7 +198,7 @@ The `owner`/`group`/`mode` restore targets are captured on the first `lock` of a
 - `readlink -f` requires macOS 12+. On older macOS, replace with `realpath` or a Python one-liner.
 - **Extended attributes and ACLs are not preserved across snapshot/restore.** `cp`/`install` don't carry xattrs by default; quarantine, code-signature, and custom-ACL metadata are lost on a `revert`. BSD flags ARE handled in v2 (meta records the exact word; revert re-seals). Designed for textual config files (authorized_keys, ssh config, settings.json), not binaries or files with critical attached metadata. **Future work** (deferred): round-trip xattrs via `xattr -p`/`-w`, ACLs via `/bin/chmod +a/-a` capture. Search for `TODO(xattrs)` in the script.
 - Default install path is `/usr/local/sbin/locked`. **Why not `/usr/libexec/`** (the natural spot for system helpers): `/usr/libexec` is on the sealed system volume since macOS 11; even root can't write there without booting to recovery and tearing down SSV. **Why not `/usr/local/bin/`**: same writable space but with the legacy Intel-Homebrew "chown -R \$USER /usr/local" footgun more common there. **Why `/usr/local/sbin/`**: less commonly tampered, semantically right for "needs sudo" admin tools, and in PATH by default.
-- Setup verifies the entire ancestry up to `/` is `root:wheel` mode `755` or stricter and refuses to install otherwise. The same verification runs on **every** subsequent invocation -- if `/usr/local` ever gets chowned to a user after setup (e.g., a later Homebrew permission-fix recipe), the next `sudo locked ...` refuses with a clear error. This closes the "post-setup escalation" wedge: a swapped binary at a writable ancestor would otherwise inherit root after the next Touch ID approval.
+- Setup verifies the entire ancestry up to `/` is root-owned with no group/other write -- mode `755` or stricter -- and refuses to install otherwise. The same verification runs on **every** subsequent invocation -- if `/usr/local` ever gets chowned to a user after setup (e.g., a later Homebrew permission-fix recipe), the next `sudo locked ...` refuses with a clear error. This closes the "post-setup escalation" wedge: a swapped binary at a writable ancestor would otherwise inherit root after the next Touch ID approval.
 - Override default install path via `INSTALL_TARGET=/path sudo -E ./locked setup`. If you go this route, you'll need to re-run setup any time you want to change the path -- the sudoers entry references the path, not a binary identity.
 
 ## Atomicity and TOCTOU

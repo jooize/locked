@@ -30,7 +30,7 @@ set -euo pipefail
 IFS=$'\n\t'
 shopt -s nullglob
 
-VERSION=2.0.0
+VERSION=2.0.1
 
 # Override-friendly defaults (test seams; sudo's env_reset strips these on
 # real invocations, so they are only reachable when the script is executed
@@ -215,15 +215,21 @@ check_reseal_identity() { # <path> <metafile>
 
 # ---- shared helpers --------------------------------------------------------
 
-# Verify a path is root:wheel owned with no group/other write. Used both to
-# refuse installing into a user-writable ancestry and to validate the chain
-# stop node.
+# Verify a path is root-owned with no group/other write. Used both to refuse
+# installing into a user-writable ancestry and to validate the chain stop
+# node. The group NAME is deliberately not pinned: the strict modes below
+# leave no group-write bit to abuse, so the group is moot and root:admin 755
+# is exactly as unwritable to a non-root process as root:wheel 755. Two real
+# shapes need that: /Users, which macOS ships root:admin 755, and store
+# object dirs, whose group is wheel or nixbld depending on whether the object
+# was substituted or built locally. Owner and mode stay enforced; the group
+# is still read so the error message can show it for diagnosis.
 verify_root_owned_path() {
   local path="$1" owner mode
   owner="$(stat -f '%Su:%Sg' "$path")"
   mode="$(stat -f '%OLp' "$path")"
-  if [ "$owner" != "root:wheel" ]; then
-    echo "ERROR: $path is owned $owner, expected root:wheel" >&2
+  if [ "${owner%%:*}" != "root" ]; then
+    echo "ERROR: $path is owned $owner, expected root owner" >&2
     return 1
   fi
   case "$mode" in
@@ -503,27 +509,6 @@ verify_ancestor() {
     echo "ERROR: /nix/store is owned $owner mode $mode, expected root-owned 1775" >&2
     return 1
   fi
-  case "$p" in
-    /nix/store/*)
-      # Store OBJECT dirs: owner root always, but the GROUP varies with
-      # how the object was realized (wheel when substituted, nixbld when
-      # the daemon built it locally -- both live on this machine). The
-      # strict no-write modes make the group name moot: there is no
-      # group-write bit to abuse. Owner and mode stay enforced.
-      local owner mode
-      owner="$(stat -f '%Su' "$p")"
-      mode="$(stat -f '%OLp' "$p")"
-      if [ "$owner" != "root" ]; then
-        echo "ERROR: $p is owned by $owner, expected root" >&2
-        return 1
-      fi
-      case "$mode" in
-        755|750|700|555|550|500) return 0 ;;
-      esac
-      echo "ERROR: $p has mode $mode, expected 755 or stricter" >&2
-      return 1
-      ;;
-  esac
   verify_root_owned_path "$p"
 }
 

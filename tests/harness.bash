@@ -30,7 +30,7 @@ LOCKED="$REPO/locked"
 [ -x "$LOCKED" ] || { echo "locked binary not found at $LOCKED" >&2; exit 1; }
 
 SCRATCH="$(mktemp -d /private/tmp/locked-harness.XXXXXX)"
-chmod 755 "$SCRATCH"   # root:wheel 755 -> valid chain stop node
+chmod 755 "$SCRATCH"   # root-owned 755, no group/other write -> valid chain stop node
 
 cleanup() {
   # Clear every flag we may have set (system flags need root; we are root),
@@ -317,6 +317,32 @@ check "dry-run left flags"               "" "$(flags_of "$DR")"
 deny "dry-run wrote no meta or snapshot" \
      /bin/sh -c "ls '$SNAPROOT/$INV' | grep -q dryrun"
 
+note "== cli: chain stop node whose group is not wheel =="
+# The real ~ walk stops at /Users, which macOS ships root:admin 755. The
+# stop-node check pins the owner and the mode, not the group name, so this
+# shape must lock exactly like a root:wheel stop node does.
+locked_home() { # <home> <args...>: locked with a different LOCKED_USER_HOME
+  local h="$1"; shift
+  env SNAPSHOTS_ROOT="$SNAPROOT" \
+      INSTALL_TARGET="$SCRATCH/not-installed" \
+      LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
+      LOCKED_USER_HOME="$h" \
+      LOCKED_ALERT_DIR="$ALERTS" \
+      SUDO_USER="$INV" \
+      /bin/bash "$LOCKED" "$@"
+}
+ADMSTOP="$SCRATCH/usersdir"
+install -d -m 755 -o root -g admin "$ADMSTOP"
+ADMHOME="$ADMSTOP/home"
+install -d -o "$INV" -g staff "$ADMHOME"
+ADMCFG="$ADMHOME/zshrc"
+as_user /bin/sh -c "printf 'setopt nomatch\n' > '$ADMCFG'"
+ok   "lock under a root:admin stop node"  locked_home "$ADMHOME" lock --yes "$ADMCFG"
+check "leaf sealed uchg"                  "uchg" "$(flags_of "$ADMCFG")"
+check "home anchored sappnd"              "sappnd" "$(flags_of "$ADMHOME")"
+check "stop node left untouched"          "" "$(flags_of "$ADMSTOP")"
+ok   "verify clean with admin stop node"  locked_home "$ADMHOME" verify
+
 # ---- 3. nix deploy guards --------------------------------------------------
 #
 # The store-ancestry acceptance and the setup refusal ride the same seams
@@ -358,6 +384,20 @@ refuse() { # <desc> <needle> <cmd...>: expect failure WITH the named message,
 install -d -m 755 -o root -g wheel "$ANC/ok/sbin"
 install -m 755 -o root -g wheel /dev/null "$ANC/ok/sbin/locked"
 ok   "strict root-755 ancestry accepted"  locked_it "$ANC/ok/sbin/locked" verify --quiet
+
+# Accepted: root owner, group admin, still no group write (the /Users shape).
+# The group name is not part of the rule; the missing write bit is.
+install -d -m 755 -o root -g admin "$ANC/adm/sbin"
+install -m 755 -o root -g admin /dev/null "$ANC/adm/sbin/locked"
+ok   "root:admin 755 ancestry accepted"   locked_it "$ANC/adm/sbin/locked" verify --quiet
+
+# Refused: a non-root OWNER stays fatal however strict the mode is -- the
+# widened group rule must not have loosened the owner check.
+install -d -m 755 -o "$INV" -g staff "$ANC/uown"
+install -d -m 755 -o root -g wheel "$ANC/uown/sbin"
+install -m 755 -o root -g wheel /dev/null "$ANC/uown/sbin/locked"
+refuse "non-root-owned ancestor refused" "expected root" \
+       locked_it "$ANC/uown/sbin/locked" verify --quiet
 
 # Refused: group-writable ancestor. Sticky must NOT rescue it outside the
 # literal /nix/store -- the carve-out may never weaken /usr/local-shaped
