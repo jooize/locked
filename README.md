@@ -1,18 +1,44 @@
 # locked
 
-> **v2 design pending:** see [DESIGN-v2.md](DESIGN-v2.md) -- BSD `uchg` flags
-> close the rename/replace hole (writable parent no longer enough to swap a
-> locked file), and a group-write toggle makes multiuser lock/unlock work
-> without root grants. The mechanism below is v1 (ownership flip via root).
+Per-user file protection for macOS, v2: BSD-flag chains on top of the v1
+ownership flip. A locked node can't be written, renamed, or deleted even by
+a process with write permission on its parent, and the flag can't be
+cleared by any process running as you (the node is owned by the lock
+account, or carries a root-only system flag). Design: [DESIGN-v2.md](DESIGN-v2.md).
+Every privileged action runs via `sudo`; whatever auth you've set up
+(password, `pam_tid` for Touch ID, [`sudowhat`](https://github.com/jooize/sudowhat)
+for trusted prompts) gates each operation. `locked` does not touch sudo's
+auth chain.
 
-Per-user file lock for macOS. Flips ownership to a dedicated unprivileged account so user-level processes can't modify protected files. Every privileged action runs via `sudo`; whatever auth you've set up (password, `pam_tid` for Touch ID, [`sudowhat`](https://github.com/jooize/sudowhat) for trusted prompts) gates each lock/unlock. `locked` does not touch sudo's auth chain.
+Three tiers, named by what they protect:
+
+- `content` (`uchg`, lock-account-owned) -- leaf files, or leaf dirs
+  recursively. Edit cycle: unlock, edit, lock.
+- `placement` (`uappnd`, lock-account-owned + group-write) -- shared parent
+  dirs (`~/.config`, `~/Library`, ...): new entries fine, replacing or
+  removing existing ones denied.
+- `anchor` (`sappnd` or `schg`, ownership unchanged) -- nodes the OS
+  identity-checks against your UID (`~`, `~/.ssh`): the system flag binds
+  every user process while sshd's owner checks keep passing.
 
 ## Workflow
-- `sudo locked unlock <file>` -- snapshot current state, chown to you.
-- App or you edit the file normally.
-- `sudo locked lock <file>` -- diff snapshot vs current, chown back to lock account.
-- `sudo locked revert <file>` -- save current to `.attic`, restore snapshot over file.
+- `sudo locked lock <path>` -- adopt or relock. Derives and provisions the
+  whole ancestor chain (placement for user-owned parents, anchor for `~`),
+  stops only at a root-owned node, shows the snapshot diff, and asks
+  before sealing (`--yes` for scripted runs, `--dry-run` to preview).
+- `sudo locked unlock <path>` -- release just that node (snapshot taken);
+  `--chain` also drops the ancestors' flags when an edit needs a rename
+  into a frozen parent (atomic-save editors).
+- `sudo locked revert <file>` -- save current to `.attic`, restore
+  snapshot, re-seal.
+- `sudo locked status <path>` -- verify and print the full chain.
+- `sudo locked verify` -- re-check every locked node against its meta;
+  exit 5 on drift; raises/clears the `locked--drift` statusline alert. A
+  launchd timer (installed by setup) runs this every 15 minutes.
 - `sudo locked setup` -- one-shot install + provision (see below).
+
+Tests: `sudo /bin/bash tests/harness.bash` (scratch-dir only; stands in
+`daemon` for the lock account, no global state touched).
 
 ## One-shot install: `sudo ./locked setup`
 
@@ -25,6 +51,7 @@ Idempotent. Provisions everything in section "Prerequisites" below in one go:
 - Adds you to the lock group.
 - Writes `/etc/sudoers.d/locked` with the matching sudoers entry; validates via `visudo -c` before installing.
 - Self-installs the script to `/usr/local/sbin/locked` (root:wheel, mode 755), refusing if any ancestor up to `/` is user-writable.
+- Installs and loads the verify LaunchDaemon (`/Library/LaunchDaemons/locked.verify.plist`, every 900 s).
 - Flushes directory service cache so the new account is visible immediately.
 
 Re-running setup is safe: each step is gated on existence/presence checks.
@@ -100,12 +127,9 @@ Touch ID/password prompt names `/usr/local/sbin/locked unlock /nonexistent`; bin
 
 ## Initial setup of a file
 
-Files you already own can be brought into the lock pool with a one-time chown:
-```sh
-sudo chown -h _jooize-lock:_jooize-lock ~/.ssh/authorized_keys
-sudo chmod 640 ~/.ssh/authorized_keys
-```
-After that, `sudo locked unlock` / `lock` / `revert` work as documented.
+`sudo locked lock <path>` adopts any file or dir you own -- no manual
+chown. The first lock captures owner/group/mode as canonical, takes a
+baseline snapshot, and provisions the ancestor chain.
 
 ## Snapshot layout
 ```
@@ -115,13 +139,18 @@ After that, `sudo locked unlock` / `lock` / `revert` work as documented.
     ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.attic
     └── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.meta
 ```
-- `.snap` -- pre-edit baseline, overwritten on each unlock.
+- `.snap` -- pre-edit baseline, overwritten on each unlock (`.snapdir` for
+  content-tier directories).
 - `.attic` -- discarded post-edit content, overwritten on each revert.
-- `.meta` -- captured owner/group/mode from first lock, restored on every unlock and lock. Format: `owner=<u>\ngroup=<g>\nmode=<octal>`.
+- `.meta` -- captured identity plus lock state, one `key=value` per line:
+  `owner`, `group`, `mode` (restore targets), `lockmode` (expected mode
+  while locked), `tier`, `flag`, `flagsym` (exact post-seal flag word),
+  `id` (dev.ino), `recursive`, `state` (`locked`/`unlocked`). `verify`
+  compares reality against this.
 
 ## Mode and ownership preservation
 
-`.meta` is captured on the first `lock` of a file (current owner/group/mode) and never overwritten by the script after that. On every subsequent `unlock`, `lock`, and `revert`, the script chmods/chowns the file back to the meta values. So:
+The `owner`/`group`/`mode` restore targets are captured on the first `lock` of a file and carried unchanged through every later meta rewrite (v2 rewrites the file on each state transition to track flags and state, but the captured identity persists). On every subsequent `unlock`, `lock`, and `revert`, the script chmods/chowns the file back to the meta values. So:
 - Accidental `chmod 666 ~/.ssh/authorized_keys` while unlocked -- next lock restores the captured mode.
 - An attacker that gets a single chmod through (somehow) is undone the next cycle.
 - To intentionally change the captured mode/owner, edit `.meta` directly: `sudo -u _jooize-lock vi /var/db/locked-snapshots/jooize/<encoded>.meta`. (Or delete the meta and re-lock to recapture.)
@@ -130,7 +159,7 @@ After that, `sudo locked unlock` / `lock` / `revert` work as documented.
 - First lock assumes file is currently owned by you. To bring a file owned by someone else into the pool: `sudo chown -h <you>:staff <file>` first, then `sudo locked lock <file>` captures meta and locks. Or hand-write the meta file before unlocking once.
 - Other admins on the same machine can read snapshots via `sudo` (root reads all). Only encryption fixes that; not in scope here.
 - `readlink -f` requires macOS 12+. On older macOS, replace with `realpath` or a Python one-liner.
-- **Extended attributes, ACLs, and BSD flags are not preserved across snapshot/restore.** `cp`/`install` don't carry xattrs by default. macOS-specific metadata like quarantine, code signatures, custom ACLs, or `chflags` (uchg/schg/...) are lost on a `revert`. Designed for textual config files (authorized_keys, ssh config, settings.json), not binaries or files with critical attached metadata. **Future work** (deferred): round-trip xattrs via `xattr -p`/`-w`, ACLs via `/bin/chmod +a/-a` capture, BSD flags via `chflags`. Search for `TODO(xattrs)` in the script.
+- **Extended attributes and ACLs are not preserved across snapshot/restore.** `cp`/`install` don't carry xattrs by default; quarantine, code-signature, and custom-ACL metadata are lost on a `revert`. BSD flags ARE handled in v2 (meta records the exact word; revert re-seals). Designed for textual config files (authorized_keys, ssh config, settings.json), not binaries or files with critical attached metadata. **Future work** (deferred): round-trip xattrs via `xattr -p`/`-w`, ACLs via `/bin/chmod +a/-a` capture. Search for `TODO(xattrs)` in the script.
 - Default install path is `/usr/local/sbin/locked`. **Why not `/usr/libexec/`** (the natural spot for system helpers): `/usr/libexec` is on the sealed system volume since macOS 11; even root can't write there without booting to recovery and tearing down SSV. **Why not `/usr/local/bin/`**: same writable space but with the legacy Intel-Homebrew "chown -R \$USER /usr/local" footgun more common there. **Why `/usr/local/sbin/`**: less commonly tampered, semantically right for "needs sudo" admin tools, and in PATH by default.
 - Setup verifies the entire ancestry up to `/` is `root:wheel` mode `755` or stricter and refuses to install otherwise. The same verification runs on **every** subsequent invocation -- if `/usr/local` ever gets chowned to a user after setup (e.g., a later Homebrew permission-fix recipe), the next `sudo locked ...` refuses with a clear error. This closes the "post-setup escalation" wedge: a swapped binary at a writable ancestor would otherwise inherit root after the next Touch ID approval.
 - Override default install path via `INSTALL_TARGET=/path sudo -E ./locked setup`. If you go this route, you'll need to re-run setup any time you want to change the path -- the sudoers entry references the path, not a binary identity.
