@@ -488,6 +488,12 @@ atomic_replace() {
   local tmp
   tmp="$(mktemp "${stage_dir}/replace.XXXXXX")" || return 1
   cp -p -- "$src" "$tmp" || { rm -f -- "$tmp"; return 1; }
+  # BSD cp -p preserves FILE FLAGS: a copy of a sealed (uchg/schg) source
+  # arrives immutable and even root's chown then gets EPERM (bit live in
+  # the first harness run, via locked edit -- the only caller whose source
+  # is still sealed). Staged copies and snapshots must never carry flags;
+  # meta owns flag state and sealing re-applies it.
+  chflags -- 0 "$tmp" || { rm -f -- "$tmp"; return 1; }
   chown "$owner" "$tmp" || { rm -f -- "$tmp"; return 1; }
   chmod "$mode" "$tmp" || { rm -f -- "$tmp"; return 1; }
   local stage_dev dst_dev dst_parent
@@ -527,6 +533,9 @@ snapshot_tree() {
   local tmp
   tmp="$(mktemp -d "${stage_dir}/tree.XXXXXX")" || return 1
   cp -Rp -- "$src" "$tmp/tree" || { rm -rf -- "$tmp"; return 1; }
+  # Same cp -p flag-preservation hazard as in atomic_replace: strip flags
+  # from the whole copied tree before touching it.
+  chflags -R -- 0 "$tmp" || { rm -rf -- "$tmp"; return 1; }
   chown -R "$lock_user:$lock_user" "$tmp" || { rm -rf -- "$tmp"; return 1; }
   if [ -d "$snapdir" ]; then
     local old
