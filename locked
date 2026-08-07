@@ -18,7 +18,7 @@
 #   sudo locked lock   [--tier T] [--flag F] [--yes] [--dry-run] <path>...
 #   sudo locked unlock [--chain] [--dry-run] <path>...
 #   sudo locked revert [--dry-run] <path>...
-#   sudo locked status <path>...
+#   sudo locked status [<path>...]
 #   sudo locked verify [--quiet]
 #   sudo locked setup
 
@@ -30,7 +30,7 @@ set -euo pipefail
 IFS=$'\n\t'
 shopt -s nullglob
 
-VERSION=0.2.2
+VERSION=0.3.0
 
 # Override-friendly defaults (test seams; sudo's env_reset strips these on
 # real invocations, so they are only reachable when the script is executed
@@ -69,8 +69,9 @@ usage: sudo locked <action> [options] [args]
   revert [--dry-run] <path>...
       Files only: save current to .attic, restore snapshot, re-seal if
       the file was locked.
-  status <path>...
+  status [<path>...]
       Verify and print the full chain for each path (no changes made).
+      With no path, list every node in your pool instead.
   verify [--quiet]
       Re-check every locked node against its meta. Exit 0 clean, 5 on
       drift. Raises/clears the locked--drift alert file per user.
@@ -797,7 +798,13 @@ seal_content() {
   else
     echo "adopting into pool (no prior snapshot): $f"
   fi
-  confirm "Seal $f (tier content)?" || { echo "aborted: $f" >&2; return 2; }
+  # Name the mechanism the way the placement and anchor prompts do, so what
+  # you approve is visible: a dir takes uchg on every node of its tree.
+  local seal_note="uchg"
+  if [ "$is_dir" -eq 1 ]; then
+    seal_note="uchg recursive"
+  fi
+  confirm "Seal $f (tier content, $seal_note)?" || { echo "aborted: $f" >&2; return 2; }
 
   # Baseline snapshot on first adoption so revert always has one.
   if [ "$is_dir" -eq 0 ] && [ ! -f "$SNAP" ]; then
@@ -1367,6 +1374,43 @@ EOF
   return "$rc"
 }
 
+# status with no path: list every node in the invoking user's pool, so the
+# whole locked surface is visible at a glance. Reporting only -- unlike
+# verify it never writes alert files and drift does not change the exit
+# code, so looking never turns into an enforcement action.
+do_status_pool() {
+  local listing meta n tier state flag
+  # Sorted by DECODED path, so the listing reads in filesystem order rather
+  # than in the encoding's order (%2F sorts nothing like /).
+  listing="$(
+    for meta in "$USER_SNAPSHOTS"/*.meta; do
+      printf '%s\n' "$(decode "$(basename "$meta" .meta)")"
+    done | sort
+  )"
+  if [ -z "$listing" ]; then
+    echo "pool for $inv is empty"
+    return 0
+  fi
+  echo "pool for $inv:"
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    snap_paths "$n"
+    tier="$(meta_field "$META" tier)"
+    state="$(meta_field "$META" state)"
+    flag="$(meta_field "$META" flag)"
+    if [ "$state" = "unlocked" ]; then
+      echo "    ○  $n ($tier, unlocked)"
+    elif verify_node "$n" "$META" "$lock_user" >/dev/null 2>&1; then
+      echo "    ✓  $n ($tier $flag)"
+    else
+      echo "    ✗  $n ($tier $flag) DRIFT -- details: sudo locked status $n"
+    fi
+  done <<EOF
+$listing
+EOF
+  return 0
+}
+
 do_verify() {
   local total_drift=0 udir uname ulock uhome alerts drift_count
   for udir in "$SNAPSHOTS_ROOT"/*/; do
@@ -1438,6 +1482,12 @@ case "$action" in
     if [ "$action" = "edit" ] && [ "$OPT_DRY" -eq 1 ]; then
       echo "edit does not support --dry-run (the diff+confirm IS the preview)" >&2
       exit 1
+    fi
+    # status is the one action that means something without paths: list the
+    # pool. Every other action -- and status WITH paths -- still requires them.
+    if [ "$action" = "status" ] && [ "${#PATHS[@]}" -eq 0 ]; then
+      do_status_pool
+      exit 0
     fi
     require_paths
     failures=0

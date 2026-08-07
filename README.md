@@ -35,7 +35,10 @@ Three tiers, named by what they protect:
   into a frozen parent (atomic-save editors).
 - `sudo locked revert <file>` -- save current to `.attic`, restore
   snapshot, re-seal.
-- `sudo locked status <path>` -- verify and print the full chain.
+- `sudo locked status [<path>]` -- verify and print the full chain for each
+  path. With no path, lists every node in your pool (tier, flag, and any
+  drift) so you can see at a glance what is currently locked; reporting
+  only, so it exits 0 even on drift and never touches the alert file.
 - `sudo locked verify` -- re-check every locked node against its meta;
   exit 5 on drift; raises/clears the `locked--drift` statusline alert. A
   launchd timer (installed by setup) runs this every 15 minutes.

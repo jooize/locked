@@ -185,6 +185,13 @@ ok   "control: write after noschg"       as_user /bin/sh -c "echo x >> '$SC'"
 
 # ---- 2. CLI end-to-end -----------------------------------------------------
 
+note "== cli: no-arg status on an empty pool =="
+# Runs before the first lock, so the pool genuinely has no metas yet.
+POOL="$SCRATCH/pool.txt"
+ok   "empty pool status succeeds"        locked status
+locked status >"$POOL" 2>&1
+ok   "empty pool listing says so"        grep -qF "pool for $INV is empty" "$POOL"
+
 note "== cli: content-tier file lock provisions the chain =="
 as_user mkdir -- "$FAKE_HOME/sub"
 # 777 so the invoker keeps write on the placement parent via the OTHER bits:
@@ -384,6 +391,18 @@ EOF
 else
   note "  skip  interactive chain seal (no expect on this machine)"
 fi
+
+note "== cli: no-arg status lists the populated pool =="
+# Same fixtures as above, still in the pool: the content leaf, the home
+# anchor, and the content dir (unlocked here only to render that state).
+ok   "status lists the pool"             locked status
+locked status >"$POOL" 2>&1
+ok   "listing names the locked leaf"     grep -qF "✓  $CFG (content uchg)" "$POOL"
+ok   "listing names the home anchor"     grep -qF "✓  $FAKE_HOME (anchor sappnd)" "$POOL"
+ok   "unlock dir to expose its state"    locked unlock "$CD"
+locked status >"$POOL" 2>&1
+ok   "listing marks the unlocked node"   grep -qF "○  $CD (content, unlocked)" "$POOL"
+ok   "relock dir after the listing"      locked lock --yes "$CD"
 
 # ---- 3. nix deploy guards --------------------------------------------------
 #
