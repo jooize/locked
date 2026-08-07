@@ -35,10 +35,16 @@ Three tiers, named by what they protect:
   into a frozen parent (atomic-save editors).
 - `sudo locked revert <file>` -- save current to `.attic`, restore
   snapshot, re-seal.
-- `sudo locked status [<path>]` -- verify and print the full chain for each
+- `locked status [<path>]` -- verify and print the full chain for each
   path. With no path, lists every node in your pool (tier, flag, and any
   drift) so you can see at a glance what is currently locked; reporting
   only, so it exits 0 even on drift and never touches the alert file.
+  The one action that needs no `sudo`: it is read-only, and it shows your
+  own pool only -- another user's pool is unreadable to you. One caveat,
+  printed by the tool itself: without root the recursive interior of a
+  content-tier directory may not be fully readable, so unprivileged
+  status gives leaf checks only there; `sudo locked status` is the
+  authoritative view.
 - `sudo locked verify` -- re-check every locked node against its meta;
   exit 5 on drift; raises/clears the `locked--drift` statusline alert. A
   launchd timer (installed by setup) runs this every 15 minutes.
@@ -173,12 +179,21 @@ baseline snapshot, and provisions the ancestor chain.
 
 ## Snapshot layout
 ```
-/var/db/locked-snapshots/             mode 700  root:wheel
-└── jooize/                            mode 700  _jooize-lock
+/var/db/locked-snapshots/             mode 711  root:wheel
+└── jooize/                            mode 750  _jooize-lock
     ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.snap   mode 600  _jooize-lock
-    ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.attic
-    └── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.meta
+    ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.attic  mode 600
+    └── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.meta   mode 640
 ```
+The root dir is execute-only (711): you can reach the one pool whose name
+you already know, but the user list is not enumerable. Your own pool dir is
+group-readable (750) by `_jooize-lock`, which you are a member of, so
+`locked status` works without `sudo`; another user's pool belongs to a
+different lock group and the kernel refuses it. Only `.meta` follows -- it
+records identity and lock state, not content -- while `.snap`, `.attic` and
+`.staging` keep their 600/700 shapes. Every root invocation re-applies these
+modes, so an older 700 deployment converges on its own.
+
 - `.snap` -- pre-edit baseline, overwritten on each unlock (`.snapdir` for
   content-tier directories).
 - `.attic` -- discarded post-edit content, overwritten on each revert.

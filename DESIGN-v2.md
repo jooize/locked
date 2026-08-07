@@ -90,9 +90,11 @@ EndpointSecurity/eslogger EPERM-monitoring is explicitly later.
 - Snapshot / diff / revert flow and the `.snap`/`.attic`/`.meta` layout;
   meta gains `tier`, `flag`, the exact post-lock flag word, and dev/ino.
   v1 metas are not migrated -- v1 was never provisioned.
-- Root-sudo invocation model. The two-tier draft's no-root runas
-  (`(_<user>-lock)`) multiuser path is deferred: the anchor tier needs
-  root regardless, and one elevation path is simpler to audit.
+- Root-sudo invocation model for every mutating action. The two-tier
+  draft's no-root runas (`(_<user>-lock)`) multiuser path is deferred:
+  the anchor tier needs root regardless, and one elevation path is
+  simpler to audit. `status` alone runs unprivileged (read-only; the
+  pool's own permissions gate what each user sees).
 - `atomic_replace` staging (now flag-aware: clears/restores flags on dst
   and temporarily lifts `uappnd` on the destination parent around the
   rename, restoring it even on failure).

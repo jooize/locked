@@ -95,6 +95,20 @@ check() { # check <desc> <expected> <actual>
     FAIL=$((FAIL + 1)); note "  FAIL  $desc (want '$want', got '$got')"
   fi
 }
+refuse() { # <desc> <needle> <cmd...>: expect failure WITH the named message,
+           # so a denial can be attributed to the check under test.
+  local desc="$1" needle="$2"; shift 2
+  local out
+  if out="$("$@" 2>&1)"; then
+    FAIL=$((FAIL + 1)); note "  FAIL  $desc (expected refusal)"
+    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/        | /'
+  elif printf '%s\n' "$out" | grep -qF "$needle"; then
+    PASS=$((PASS + 1)); note "  ok    $desc"
+  else
+    FAIL=$((FAIL + 1)); note "  FAIL  $desc (refused, but not with '$needle')"
+    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/        | /'
+  fi
+}
 
 flags_of() {
   # Same normalization as locked: "-" (no flags) becomes "".
@@ -404,6 +418,64 @@ locked status >"$POOL" 2>&1
 ok   "listing marks the unlocked node"   grep -qF "○  $CD (content, unlocked)" "$POOL"
 ok   "relock dir after the listing"      locked lock --yes "$CD"
 
+note "== cli: pool permissions =="
+# Root re-applies these on every invocation (which is also how an older 700
+# deployment migrates itself). They are what makes unprivileged status
+# possible without exposing either the user list or any file content.
+check "snapshots root is 711"            "711" "$(stat -f '%OLp' "$SNAPROOT")"
+check "per-user pool dir is 750"         "750" "$(stat -f '%OLp' "$SNAPROOT/$INV")"
+POOL_METAS=("$SNAPROOT/$INV"/*.meta)
+POOL_SNAPS=("$SNAPROOT/$INV"/*.snap)
+if [ "${#POOL_METAS[@]}" -gt 0 ] && [ "${#POOL_SNAPS[@]}" -gt 0 ]; then
+  check "meta is group-readable 640"     "640" "$(stat -f '%OLp' "${POOL_METAS[0]}")"
+  check "snapshot content stays 600"     "600" "$(stat -f '%OLp' "${POOL_SNAPS[0]}")"
+else
+  FAIL=$((FAIL + 1)); note "  FAIL  pool has no meta/snap to check modes on"
+fi
+
+note "== cli: unprivileged status =="
+# The repo lives under the invoker's home, which no other account may
+# traverse, so the lock account runs the same bytes from a root-owned,
+# world-readable copy.
+SCRIPT_COPY="$SCRATCH/locked-copy"
+install -m 755 -o root -g wheel "$LOCKED" "$SCRIPT_COPY"
+
+locked_as() { # <user> <args...>: run locked unprivileged AS <user>.
+  # The seams ride the command line because sudo's env_reset drops inherited
+  # variables (the alert writer hands its data across the same way).
+  # SUDO_USER is deliberately not passed: sudo sets it to root here, and the
+  # non-root branch must ignore it and derive the invoker from the real uid.
+  local u="$1"; shift
+  sudo -u "$u" /usr/bin/env \
+      SNAPSHOTS_ROOT="$SNAPROOT" \
+      INSTALL_TARGET="$SCRATCH/not-installed" \
+      LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
+      LOCKED_USER_HOME="$FAKE_HOME" \
+      LOCKED_ALERT_DIR="$ALERTS" \
+      /bin/bash "$SCRIPT_COPY" "$@"
+}
+
+MARKER="$SCRATCH/unpriv-marker"
+: >"$MARKER"
+
+# The invoker is not in the daemon group, so the pool dir the stand-in lock
+# account owns is exactly the cross-user shape: reachable by name, entirely
+# unreadable. Fail closed with one line, not a cascade of glob noise.
+refuse "unprivileged status refuses an unreadable pool" "cannot read pool for $INV" \
+       locked_as "$INV" status
+refuse "same refusal for status with a path"            "cannot read pool for $INV" \
+       locked_as "$INV" status "$CFG"
+
+# As the lock account the derived pool is daemon's own, which does not
+# exist -- so this drives the whole non-root branch (uid-derived invoker,
+# provisioning skipped, nothing written) down to the empty-pool listing.
+ok   "unprivileged status as the lock account"  locked_as "$LOCK_ACCT" status
+locked_as "$LOCK_ACCT" status >"$POOL" 2>&1
+ok   "it lists the lock account's OWN pool"     grep -qF "pool for $LOCK_ACCT is empty" "$POOL"
+
+check "unprivileged status wrote nothing"       "" \
+      "$(/usr/bin/find "$SNAPROOT" -newer "$MARKER" -print)"
+
 # ---- 3. nix deploy guards --------------------------------------------------
 #
 # The store-ancestry acceptance and the setup refusal ride the same seams
@@ -424,21 +496,6 @@ locked_it() { # <install_target> <args...>: locked with a specific INSTALL_TARGE
       LOCKED_ALERT_DIR="$ALERTS" \
       SUDO_USER="$INV" \
       /bin/bash "$LOCKED" "$@"
-}
-
-refuse() { # <desc> <needle> <cmd...>: expect failure WITH the named message,
-           # so a denial can be attributed to the guard under test.
-  local desc="$1" needle="$2"; shift 2
-  local out
-  if out="$("$@" 2>&1)"; then
-    FAIL=$((FAIL + 1)); note "  FAIL  $desc (expected refusal)"
-    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/        | /'
-  elif printf '%s\n' "$out" | grep -qF "$needle"; then
-    PASS=$((PASS + 1)); note "  ok    $desc"
-  else
-    FAIL=$((FAIL + 1)); note "  FAIL  $desc (refused, but not with '$needle')"
-    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/        | /'
-  fi
 }
 
 # Accepted: strict root:wheel 755 chain (the /usr/local shape).

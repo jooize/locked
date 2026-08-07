@@ -18,7 +18,7 @@
 #   sudo locked lock   [--tier T] [--flag F] [--yes] [--dry-run] <path>...
 #   sudo locked unlock [--chain] [--dry-run] <path>...
 #   sudo locked revert [--dry-run] <path>...
-#   sudo locked status [<path>...]
+#   locked status [<path>...]        (read-only; no sudo needed)
 #   sudo locked verify [--quiet]
 #   sudo locked setup
 
@@ -30,7 +30,7 @@ set -euo pipefail
 IFS=$'\n\t'
 shopt -s nullglob
 
-VERSION=0.3.0
+VERSION=0.4.0
 
 # Override-friendly defaults (test seams; sudo's env_reset strips these on
 # real invocations, so they are only reachable when the script is executed
@@ -72,6 +72,7 @@ usage: sudo locked <action> [options] [args]
   status [<path>...]
       Verify and print the full chain for each path (no changes made).
       With no path, list every node in your pool instead.
+      Read-only: works without sudo for your own pool.
   verify [--quiet]
       Re-check every locked node against its meta. Exit 0 clean, 5 on
       drift. Raises/clears the locked--drift alert file per user.
@@ -134,13 +135,27 @@ case "$OPT_FLAG" in sappnd|schg) ;; *)
   echo "invalid --flag: $OPT_FLAG (sappnd|schg)" >&2; exit 1 ;;
 esac
 
-[ "$EUID" -eq 0 ] || { echo "locked must run as root (sudo locked ...)" >&2; exit 1; }
+# status is reporting only -- it changes nothing on disk -- so it is the one
+# action a plain user may run: the pool's permissions (see the ensure step
+# below) decide what they get to see. Everything else moves flags, ownership
+# or content and still needs root.
+if [ "$EUID" -ne 0 ] && [ "$action" != "status" ]; then
+  echo "locked must run as root (sudo locked ...)" >&2
+  exit 1
+fi
 
-# verify can run from launchd with no SUDO_USER; everything else needs the
-# invoking user to derive the lock account.
-inv="${SUDO_USER:-}"
-if [ "$action" != "verify" ]; then
-  [ -n "$inv" ] || { echo "must be invoked via sudo" >&2; exit 1; }
+# Root derives the invoking user from sudo; verify can run from launchd with
+# no SUDO_USER at all. Unprivileged status has no sudo hop, so the invoker is
+# whoever we are running as -- SUDO_USER is ignored there on purpose, or
+# `sudo -u other locked status` would name a pool the caller's own
+# credentials do not entitle them to.
+if [ "$EUID" -eq 0 ]; then
+  inv="${SUDO_USER:-}"
+  if [ "$action" != "verify" ]; then
+    [ -n "$inv" ] || { echo "must be invoked via sudo" >&2; exit 1; }
+  fi
+else
+  inv="$(id -un)"
 fi
 
 lock_account_for() { echo "_${1}-lock"; }
@@ -295,7 +310,11 @@ write_meta() {
   tmp="$(mktemp "${USER_SNAPSHOTS}/.meta.XXXXXX")" || return 1
   printf '%s\n' "$@" >"$tmp" || return 1
   chown "$lock_user:$lock_user" "$tmp" || return 1
-  chmod 600 "$tmp" || return 1
+  # 640, not 600: a meta records identity and lock state, never file
+  # content, and the lock group is exactly the invoking user -- that group
+  # read is what lets `locked status` run without sudo. Snapshots and attic
+  # copies, which DO hold content, stay 600.
+  chmod 640 "$tmp" || return 1
   mv -f -- "$tmp" "$meta" || return 1
 }
 
@@ -543,11 +562,45 @@ if [ -n "$lock_user" ]; then
   }
 fi
 
-install -d -m 700 -o root -g wheel "$SNAPSHOTS_ROOT"
 USER_SNAPSHOTS=""
 if [ -n "$inv" ]; then
   USER_SNAPSHOTS="$SNAPSHOTS_ROOT/$inv"
-  install -d -m 700 -o "$lock_user" -g "$lock_user" "$USER_SNAPSHOTS"
+fi
+
+if [ "$EUID" -eq 0 ]; then
+  # Root converges the pool's shape on every invocation, so a deployment
+  # made by an older version migrates itself with no separate command.
+  # 711 on the root dir is execute-only traversal: a user can reach the one
+  # subdir whose name they already know and cannot enumerate who else has a
+  # pool. 750 on the per-user dir hands read to the owning lock group --
+  # which the invoking user is a member of -- and to nobody else, so
+  # another user's pool is refused by the kernel, not by our checks.
+  install -d -m 711 -o root -g wheel "$SNAPSHOTS_ROOT"
+  if [ -n "$USER_SNAPSHOTS" ]; then
+    install -d -m 750 -o "$lock_user" -g "$lock_user" "$USER_SNAPSHOTS"
+    # Metas are the one class that goes group-readable (see write_meta);
+    # sweep the ones an older version wrote at 600. nullglob makes the
+    # array empty rather than literal when the pool has none yet.
+    pool_metas=("$USER_SNAPSHOTS"/*.meta)
+    if [ "${#pool_metas[@]}" -gt 0 ]; then
+      chmod 640 "${pool_metas[@]}" || exit 1
+    fi
+  fi
+elif [ -e "$SNAPSHOTS_ROOT" ] && [ ! -x "$SNAPSHOTS_ROOT" ]; then
+  # A deployment that predates the 711 root dir is not traversable for a
+  # plain user, and a nonexistent pool dir would then look identical to an
+  # empty pool. Say what is actually wrong; one sudo run fixes it.
+  echo "cannot read $SNAPSHOTS_ROOT (run 'sudo locked status' once to converge its mode)" >&2
+  exit 1
+elif [ -d "$USER_SNAPSHOTS" ] && { [ ! -r "$USER_SNAPSHOTS" ] || [ ! -x "$USER_SNAPSHOTS" ]; }; then
+  # Unprivileged status skips the provisioning above deliberately rather
+  # than letting a non-root `install -d -o` fail: nothing on this path may
+  # create or modify anything. An unreadable pool dir is the privacy wall
+  # working as designed (the caller is not in that lock group, or is
+  # probing someone else's pool) -- fail closed on one line instead of
+  # letting every later glob and stat fail separately.
+  echo "cannot read pool for $inv (not a member of $lock_user?)" >&2
+  exit 1
 fi
 
 # ---- snapshot / replace machinery ------------------------------------------
@@ -1374,6 +1427,15 @@ EOF
   return "$rc"
 }
 
+# Without root, verify_node's recursive stray-scan silently sees nothing
+# inside a tree whose captured modes deny the caller read, so a drifted
+# recursive dir can render clean. Say so once rather than letting the
+# checkmark overclaim; root output stays untouched.
+status_unpriv_note() {
+  [ "$EUID" -eq 0 ] && return 0
+  echo "note: without sudo, recursive trees get leaf checks only; sudo locked status is authoritative" >&2
+}
+
 # status with no path: list every node in the invoking user's pool, so the
 # whole locked surface is visible at a glance. Reporting only -- unlike
 # verify it never writes alert files and drift does not change the exit
@@ -1487,6 +1549,7 @@ case "$action" in
     # pool. Every other action -- and status WITH paths -- still requires them.
     if [ "$action" = "status" ] && [ "${#PATHS[@]}" -eq 0 ]; then
       do_status_pool
+      status_unpriv_note
       exit 0
     fi
     require_paths
@@ -1500,6 +1563,7 @@ case "$action" in
         status) do_status_one "$f" || failures=$((failures + 1)) ;;
       esac
     done
+    [ "$action" = "status" ] && status_unpriv_note
     if [ "$failures" -gt 0 ]; then
       [ "$action" = "status" ] && exit 5
       exit 3
