@@ -18,9 +18,17 @@
 #   sudo locked lock   [--tier T] [--flag F] [--yes] [--dry-run] <path>...
 #   sudo locked unlock [--chain] [--dry-run] <path>...
 #   sudo locked revert [--dry-run] <path>...
+#   sudo locked rm|trash [--recursive] [--yes] [--dry-run] <path>...
+#   sudo locked mv|rekey [--recursive] <old> <new>
+#   sudo locked tombstone [--yes] <path>...
 #   locked status [<path>...]        (read-only; no sudo needed)
+#   locked why <path>...             (read-only; no sudo needed)
 #   sudo locked verify [--quiet]
 #   sudo locked setup
+#
+# rm/trash/mv perform the one syscall a sealed parent blocks, inside a
+# bounded root-held window opened by the compiled helper (see LOCKED_HELPER
+# below) on an open parent fd. The bash trap here is a backstop only.
 
 # Pin PATH so bare command names (dscl, awk, install, chflags, ...) can't be
 # hijacked even if sudoers env_keep ever leaks PATH from the invoker.
@@ -36,6 +44,13 @@ VERSION=0.4.0
 # real invocations, so they are only reachable when the script is executed
 # directly as root -- i.e. by the test harness).
 : "${INSTALL_TARGET:=/usr/local/sbin/locked}"
+# The compiled window helper. Trust is positional, not by digest: the nix
+# module rewrites this default to the store path at eval (keep the exact
+# `: "${VAR:=...}"` shape so its anchor assertion still matches), and
+# verify_helper re-checks root ownership, mode and the whole ancestry on
+# every call. As a test seam it behaves like the others -- settable when
+# the script is run directly as root, dead under sudo's env_reset.
+: "${LOCKED_HELPER:=/usr/local/sbin/locked-helper}"
 : "${SNAPSHOTS_ROOT:=/var/db/locked-snapshots}"
 : "${LOCKED_LOCK_ACCOUNT:=}"
 : "${LOCKED_USER_HOME:=}"
@@ -69,6 +84,32 @@ usage: sudo locked <action> [options] [args]
   revert [--dry-run] <path>...
       Files only: save current to .attic, restore snapshot, re-seal if
       the file was locked.
+  rm [--recursive] [--yes] [--dry-run] <path>...
+      Remove a path a sealed parent will not let go of. The helper
+      releases the parent's flag on an open fd, unlinks, and restores
+      it; nothing else in the parent may change meanwhile. Pool records
+      at or under the path are retired, with locked named as the actor.
+      --recursive is required for a non-empty directory and for any
+      subtree that holds records of its own.
+  trash [--recursive] [--yes] [--dry-run] <path>...
+      As rm, but the node goes to the system trash service as you, so
+      Put Back keeps working. Records are suspended rather than retired
+      and carry the bin location until the bin entry is gone.
+  mv [--recursive] [--dry-run] <old> <new>
+      Rename through the same window and re-key the records. Never
+      clobbers an existing <new>; never crosses filesystems (a copy
+      would drop flags and xattrs).
+  rekey [--recursive] <old> <new>
+      Record-only repair, for a node something else already moved.
+      Refuses unless <new> is the very node the record describes.
+  tombstone [--yes] <path>...
+      Assert that a recorded path is gone: state retired, provenance
+      "assertion". Refused while the path still exists.
+  why <path>...
+      Report what, if anything, stops this path from being changed,
+      renamed or removed: flags on it and on every ancestor, who owns
+      them, and whether locked is the one that set them.
+      Read-only: works without sudo.
   status [<path>...]
       Verify and print the full chain for each path (no changes made).
       With no path, list every node in your pool instead.
@@ -81,8 +122,10 @@ usage: sudo locked <action> [options] [args]
       self-install to \$INSTALL_TARGET. Refused on nix-managed installs
       (the nix module declares all of this; rebuild instead).
 
-  --help     this text
-  --version  print version
+  --recursive  rm/trash/mv/rekey: act on a whole subtree, applying the
+               record side-effect to every node beneath the named one
+  --help       this text
+  --version    print version
 
 Exit codes:  0 ok  1 input/validation error  2 user abort
              3 partial failure  5 verify found drift
@@ -108,6 +151,7 @@ OPT_YES=0
 OPT_DRY=0
 OPT_CHAIN=0
 OPT_QUIET=0
+OPT_RECURSIVE=0
 PATHS=()
 
 while [ $# -gt 0 ]; do
@@ -122,6 +166,7 @@ while [ $# -gt 0 ]; do
     --dry-run) OPT_DRY=1; shift ;;
     --chain)   OPT_CHAIN=1; shift ;;
     --quiet)   OPT_QUIET=1; shift ;;
+    --recursive) OPT_RECURSIVE=1; shift ;;
     --)        shift; while [ $# -gt 0 ]; do PATHS+=("$1"); shift; done ;;
     -*)        echo "unknown option: $1" >&2; usage >&2; exit 1 ;;
     *)         PATHS+=("$1"); shift ;;
@@ -135,11 +180,21 @@ case "$OPT_FLAG" in sappnd|schg) ;; *)
   echo "invalid --flag: $OPT_FLAG (sappnd|schg)" >&2; exit 1 ;;
 esac
 
-# status is reporting only -- it changes nothing on disk -- so it is the one
-# action a plain user may run: the pool's permissions (see the ensure step
-# below) decide what they get to see. Everything else moves flags, ownership
-# or content and still needs root.
-if [ "$EUID" -ne 0 ] && [ "$action" != "status" ]; then
+# --recursive widens the blast radius of exactly four verbs. Accepting it
+# silently anywhere else would let a typo read as approval on the run where
+# it finally lands on one of them.
+if [ "$OPT_RECURSIVE" -eq 1 ]; then
+  case "$action" in
+    rm|trash|mv|rekey) ;;
+    *) echo "--recursive applies to rm, trash, mv and rekey only" >&2; exit 1 ;;
+  esac
+fi
+
+# status and why are reporting only -- they change nothing on disk -- so
+# they are the actions a plain user may run: the pool's permissions (see the
+# ensure step below) decide what they get to see. Everything else moves
+# flags, ownership or content and still needs root.
+if [ "$EUID" -ne 0 ] && [ "$action" != "status" ] && [ "$action" != "why" ]; then
   echo "locked must run as root (sudo locked ...)" >&2
   exit 1
 fi
@@ -257,6 +312,34 @@ verify_root_owned_path() {
   esac
 }
 
+# The file-mode counterpart of verify_root_owned_path: a program root runs
+# must be root-owned and unwritable by group or other. Directory modes have
+# a small closed set worth accepting; an executable's does not (555, 700,
+# 750, 755 are all legitimate), so the rule is stated as the bits that must
+# be OFF. %OLp drops leading zeros (0044 prints as "44") and a setuid/
+# setgid/sticky bit ADDS a fourth digit (4755) -- pad, then keep only the
+# last three, so the permission digits sit at fixed positions either way.
+verify_root_owned_file() {
+  local path="$1" owner mode
+  owner="$(stat -f '%Su' "$path")"
+  if [ "$owner" != "root" ]; then
+    echo "ERROR: $path is owned by $owner, expected root owner" >&2
+    return 1
+  fi
+  mode="$(printf '%03d' "$(stat -f '%OLp' "$path")")"
+  mode="${mode#"${mode%???}"}"
+  case "${mode:1:1}${mode:2:1}" in
+    *[2367]*)
+      echo "ERROR: $path has mode $mode; group/other write must be off" >&2
+      return 1
+      ;;
+  esac
+}
+
+now_utc() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
 # URL-encode % and / so a path becomes an unambiguous flat filename.
 # Order matters: % first, then /, otherwise %2F gets re-encoded.
 encode() {
@@ -299,6 +382,20 @@ meta_field() {
 }
 
 # write_meta <metafile> key=value...
+#
+# Known keys: owner, group, mode, lockmode, tier, flag, flagsym, id,
+# recursive, state, plus the provenance fields the retired/suspended states
+# add -- via, by, at, bin. Nothing here validates the set; the caller emits
+# the full record, because this replaces the file rather than patching it.
+# No key stores the node's own PATH: the path lives only in the encoded
+# filename, which is what makes rekey_record a rename and nothing more.
+#
+# Staging is keyed to the destination's OWN pool dir, not to the invoker's:
+# verify walks every user's pool, so USER_SNAPSHOTS and $lock_user are the
+# wrong answer there. The pool dir is installed owner and group = that
+# user's lock account, so reading it back is exactly the identity the
+# metas already carry.
+#
 # NOTE on error handling below: every per-file entry point runs in a || or
 # if context, which suspends errexit for the whole call tree -- so every
 # mutating step in this file carries an explicit || return 1. Do not rely
@@ -306,16 +403,40 @@ meta_field() {
 write_meta() {
   local meta="$1"
   shift
-  local tmp
-  tmp="$(mktemp "${USER_SNAPSHOTS}/.meta.XXXXXX")" || return 1
+  local dir owngrp tmp
+  dir="$(dirname "$meta")"
+  owngrp="$(stat -f '%Su:%Sg' "$dir")" || return 1
+  tmp="$(mktemp "${dir}/.meta.XXXXXX")" || return 1
   printf '%s\n' "$@" >"$tmp" || return 1
-  chown "$lock_user:$lock_user" "$tmp" || return 1
+  chown "$owngrp" "$tmp" || return 1
   # 640, not 600: a meta records identity and lock state, never file
   # content, and the lock group is exactly the invoking user -- that group
   # read is what lets `locked status` run without sudo. Snapshots and attic
   # copies, which DO hold content, stay 600.
   chmod 640 "$tmp" || return 1
   mv -f -- "$tmp" "$meta" || return 1
+}
+
+# rewrite_meta_state <metafile> <state> [key=value]...
+# State transitions that keep the node's identity (locked -> retired,
+# suspended -> retired) still have to re-emit every field, since write_meta
+# replaces the file. The trailing pairs carry the provenance of the
+# transition: via/by/at, and bin for a suspension.
+rewrite_meta_state() {
+  local meta="$1" state="$2"
+  shift 2
+  write_meta "$meta" \
+    "owner=$(meta_field "$meta" owner)" \
+    "group=$(meta_field "$meta" group)" \
+    "mode=$(meta_field "$meta" mode)" \
+    "lockmode=$(meta_field "$meta" lockmode)" \
+    "tier=$(meta_field "$meta" tier)" \
+    "flag=$(meta_field "$meta" flag)" \
+    "flagsym=$(meta_field "$meta" flagsym)" \
+    "id=$(meta_field "$meta" id)" \
+    "recursive=$(meta_field "$meta" recursive)" \
+    "state=$state" \
+    "$@" || return 1
 }
 
 # ---- setup -----------------------------------------------------------------
@@ -541,19 +662,48 @@ verify_ancestors() { # <path>: check every ancestor dir of <path>
   done
 }
 
-verify_install_ancestry() {
-  [ -f "$INSTALL_TARGET" ] || return 0   # pre-install; let other checks handle.
-  verify_ancestors "$INSTALL_TARGET" || return 1
-  # A symlinked install path (the nix profile) textually walks mostly
-  # symlinks; the bytes live elsewhere. Walk the REAL location too --
-  # both chains must hold.
-  local real
-  real="$(readlink -f "$INSTALL_TARGET")" || return 1
-  if [ "$real" != "$INSTALL_TARGET" ]; then
+# Both chains of a program path must hold. A symlinked install path (the
+# nix profile) textually walks mostly symlinks; the bytes live elsewhere,
+# so the REAL location is walked too. Shared by the self-check below and
+# by verify_helper -- the helper runs as root off an absolute path exactly
+# the way this script does, and gets exactly the same walk.
+verify_program_ancestry() { # <program path>
+  local target="$1" real
+  verify_ancestors "$target" || return 1
+  real="$(readlink -f "$target")" || return 1
+  if [ "$real" != "$target" ]; then
     verify_ancestors "$real" || return 1
   fi
 }
+
+verify_install_ancestry() {
+  [ -f "$INSTALL_TARGET" ] || return 0   # pre-install; let other checks handle.
+  verify_program_ancestry "$INSTALL_TARGET"
+}
 verify_install_ancestry || exit 1
+
+# The helper is trusted positionally: root-owned, unwritable by anyone
+# else, reached through an ancestry no non-root process can redirect. It
+# carries no digest pin -- sudoers pins THIS script, the nix module bakes
+# the store path into it, and a digest here would only move the question to
+# who may edit the digest. Re-checked before every exec, never cached: the
+# window it opens is root-held, so a stale answer is the whole exposure.
+verify_helper() {
+  if [ ! -f "$LOCKED_HELPER" ]; then
+    echo "ERROR: window helper not found: $LOCKED_HELPER" >&2
+    echo "       rm, trash and mv need it (nix: rebuild; standalone: build" >&2
+    echo "       helper/locked-helper.m and install it root-owned 755)" >&2
+    return 1
+  fi
+  [ -x "$LOCKED_HELPER" ] || { echo "ERROR: $LOCKED_HELPER is not executable" >&2; return 1; }
+  verify_root_owned_file "$LOCKED_HELPER" || return 1
+  verify_program_ancestry "$LOCKED_HELPER" || return 1
+  local real
+  real="$(readlink -f "$LOCKED_HELPER")" || return 1
+  if [ "$real" != "$LOCKED_HELPER" ]; then
+    verify_root_owned_file "$real" || return 1
+  fi
+}
 
 if [ -n "$lock_user" ]; then
   id -u "$lock_user" >/dev/null 2>&1 || {
@@ -611,22 +761,31 @@ fi
 # to a non-atomic copy. If the destination's parent carries uappnd/sappnd,
 # lift the flag around the rename and restore it even on failure.
 #
-# Residuals unchanged from v1 (see REVIEW.md): TODO(toctou) source-side swap
-# during cp's open; TODO(parent-swap) between resolution and mv; TODO(xattrs)
-# cp does not carry xattrs/ACLs. BSD flags ARE now handled by the callers.
+# The staging copy goes through the window helper's `copy` verb: it opens
+# the source O_NOFOLLOW, verifies the dev/ino handed to it here, and reads
+# from the verified fd -- closing the old TODO(toctou) source-swap residual
+# -- while COPYFILE_XATTR|COPYFILE_ACL carries what cp left behind, closing
+# TODO(xattrs) for files. File FLAGS deliberately do not travel (the cp -p
+# hazard that bit live in 66b5055: a copy of a sealed source arrived
+# immutable and even root's chown got EPERM); the dest is created fresh,
+# and meta owns flag state -- sealing re-applies it. TODO(parent-swap) on
+# the dst side was already closed by same-fs staging + atomic rename under
+# a chain-sealed parent. Directory trees (snapshot_tree) still copy with
+# cp -Rp and keep the per-file residuals; that is the one TODO left open.
 atomic_replace() {
   local src="$1" dst="$2" owner="$3" mode="$4"
   local stage_dir="$USER_SNAPSHOTS/.staging"
   install -d -m 700 -o "$lock_user" -g "$lock_user" "$stage_dir" || return 1
-  local tmp
+  local src_id tmp
+  src_id="$(node_id "$src")" || return 1
+  verify_helper || return 1
+  # The helper insists on creating the dest itself (O_EXCL), so hand it a
+  # fresh name: mktemp reserves one, the unlink frees it, and nothing else
+  # can take it in between -- the staging dir is root-provisioned mode 700.
   tmp="$(mktemp "${stage_dir}/replace.XXXXXX")" || return 1
-  cp -p -- "$src" "$tmp" || { rm -f -- "$tmp"; return 1; }
-  # BSD cp -p preserves FILE FLAGS: a copy of a sealed (uchg/schg) source
-  # arrives immutable and even root's chown then gets EPERM (bit live in
-  # the first harness run, via locked edit -- the only caller whose source
-  # is still sealed). Staged copies and snapshots must never carry flags;
-  # meta owns flag state and sealing re-applies it.
-  chflags -- 0 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  rm -f -- "$tmp" || return 1
+  "$LOCKED_HELPER" copy --src "$src" --src-id "${src_id/./:}" --dest "$tmp" \
+    || { rm -f -- "$tmp" 2>/dev/null; return 1; }
   chown "$owner" "$tmp" || { rm -f -- "$tmp"; return 1; }
   chmod "$mode" "$tmp" || { rm -f -- "$tmp"; return 1; }
   local stage_dev dst_dev dst_parent
@@ -695,7 +854,7 @@ snap_paths() { # sets ENC SNAP SNAPDIR ATTIC META for path $1
 # Prints drift descriptions; returns 0 clean/open, 1 drift.
 verify_node() {
   local f="$1" meta="$2" lu="$3"
-  local tier state flag flagsym mode lockmode owner group id recursive
+  local tier state flag flagsym mode lockmode owner group id recursive bin
   tier="$(meta_field "$meta" tier)"
   state="$(meta_field "$meta" state)"
   flag="$(meta_field "$meta" flag)"
@@ -705,6 +864,41 @@ verify_node() {
   group="$(meta_field "$meta" group)"
   id="$(meta_field "$meta" id)"
   recursive="$(meta_field "$meta" recursive)"
+
+  # Retired and suspended are checked before the existence test: for both,
+  # the path being absent is the recorded expectation, not drift.
+  if [ "$state" = "retired" ]; then
+    # locked removed it, or a human asserted it was gone. The record stays
+    # as the audit trail; the path is deliberately not stat'ed.
+    return 0
+  fi
+  if [ "$state" = "suspended" ]; then
+    bin="$(meta_field "$meta" bin)"
+    if [ -e "$f" ] || [ -L "$f" ]; then
+      echo "  DRIFT $f: back from the trash and unsealed (bin was ${bin:-unknown});"
+      echo "        re-lock it with: sudo locked lock $f"
+      return 1
+    fi
+    if [ -n "$bin" ] && [ ! -e "$bin" ] && [ ! -L "$bin" ]; then
+      # The bin entry is gone, so Put Back can no longer resurrect an
+      # unsealed copy: the suspension has become a retirement. Root only --
+      # unprivileged status must never try to write a pool it can read.
+      if [ "$EUID" -ne 0 ]; then
+        return 0
+      fi
+      if rewrite_meta_state "$meta" retired \
+           "via=trash-finalized" \
+           "by=$(meta_field "$meta" by)" \
+           "at=$(now_utc)" \
+           "bin=$bin"; then
+        echo "  info  $f: trashed item no longer in the bin; record retired"
+        return 0
+      fi
+      echo "  DRIFT $f: suspended, and its record could not be finalized ($meta)"
+      return 1
+    fi
+    return 0
+  fi
 
   if [ ! -e "$f" ]; then
     echo "  DRIFT $f: missing"
@@ -1057,7 +1251,16 @@ seal_anchor() {
 release_node() {
   local f="$1"
   snap_paths "$f"
-  [ -f "$META" ] || { echo "skip $f: not in pool" >&2; log_action unlock "$f" skip-no-meta; return 0; }
+  if [ ! -f "$META" ]; then
+    # "not in pool" is true and unhelpful on its own: what usually blocks
+    # this path is an ancestor, not the leaf. Say which one.
+    echo "skip $f: not in pool" >&2
+    chain_diagnosis "$f" \
+      "sudo locked unlock --chain $f" "releases the chain above it" \
+      "sudo locked rm $f" "removes it through a bounded window" >&2
+    log_action unlock "$f" skip-no-meta
+    return 0
+  fi
 
   local tier flag recursive owner group mode
   tier="$(meta_field "$META" tier)"
@@ -1131,6 +1334,529 @@ release_node() {
       ;;
   esac
   log_action unlock "$f" ok
+}
+
+# ---- mediated window -------------------------------------------------------
+
+# Absolute path with the PARENT canonicalized and the leaf name left as
+# typed. rm, trash and mv act on a directory ENTRY: resolving the leaf
+# through a symlink would name the target instead of the link, and remove
+# the wrong thing. The parent still gets readlink -f, so the entry is
+# named relative to a real directory.
+abs_leaf() { # <path>
+  local p="$1" d b
+  d="$(dirname "$p")"
+  b="$(basename "$p")"
+  case "$b" in
+    .|..|/)
+      echo "refusing $p: names a directory, not an entry inside one" >&2
+      return 1
+      ;;
+  esac
+  # The helper's stdout grammar is tab-separated lines, so it refuses a
+  # name carrying a tab or a newline rather than let a filename forge one.
+  # Say that here instead of surfacing a bare usage error from inside it.
+  case "$b" in
+    *$'\t'*|*$'\n'*)
+      echo "refusing $p: the entry name contains a tab or newline" >&2
+      echo "  the window helper refuses those; rename it first" >&2
+      return 1
+      ;;
+  esac
+  # Parents are opened O_NOFOLLOW, so a symlinked parent dir is refused
+  # outright -- readlink -f here is what makes the call land on a real
+  # directory, and it is also what pins the entry to one parent inode.
+  d="$(readlink -f "$d")" || { echo "skip: cannot resolve $(dirname "$p")" >&2; return 1; }
+  if [ "$d" = "/" ]; then
+    printf '%s\n' "/$b"
+  else
+    printf '%s\n' "$d/$b"
+  fi
+}
+
+# The record stores dev/ino in stat's "%d.%i" spelling; the helper's argv
+# grammar spells the same pair dev:ino, and accepts either separator on
+# input while always EMITTING the colon form in its own output. Translate
+# here anyway, so what goes over the wire matches the grammar the helper
+# documents and the ids in its error prose read the same as ours.
+# The --*-id options are all mandatory: "-" is how a call says it has no
+# expectation, and omitting one is a usage error, not a default.
+helper_id_for() { # <path>
+  local p="$1" id=""
+  snap_paths "$p"
+  if [ -f "$META" ]; then
+    id="$(meta_field "$META" id)"
+  fi
+  # TODO(toctou): for a node with no record this stat and the helper's
+  # openat are separated by a process spawn. The residual is a stale
+  # refusal, never a wrong target: the helper compares what it opened
+  # against this value and exits 2 rather than acting on a mismatch.
+  if [ -z "$id" ]; then
+    id="$(node_id "$p" 2>/dev/null)" || id=""
+  fi
+  [ -n "$id" ] || { printf '%s' '-'; return 0; }
+  printf '%s' "${id/./:}"
+}
+
+# The window backstop. The helper holds the parent by fd and restores its
+# flag word on every exit path of its own; what it cannot cover is being
+# killed mid-window, or failing the restore itself (its exit 5). So the
+# flag word is captured HERE before the call, and re-applied here if the
+# parent comes back wearing anything else -- including for a parent locked
+# never sealed, whose word no meta records.
+WINDOW_PATHS=()
+WINDOW_FLAGS=()
+WINDOW_ALARM=0
+
+# window_add <path> <flagword>: register one restore target. The flag word
+# is passed in rather than read here, because mv has to capture a node's
+# flags at its OLD path and restore them at whichever path it ended up at.
+window_add() {
+  local p="$1" fl="$2" j
+  [ -n "$p" ] || return 0
+  j=0
+  while [ "$j" -lt "${#WINDOW_PATHS[@]}" ]; do
+    if [ "${WINDOW_PATHS[$j]}" = "$p" ]; then
+      return 0
+    fi
+    j=$((j + 1))
+  done
+  WINDOW_PATHS+=("$p")
+  WINDOW_FLAGS+=("$fl")
+}
+
+window_begin() { # <parent>...
+  WINDOW_PATHS=()
+  WINDOW_FLAGS=()
+  WINDOW_ALARM=0
+  local p
+  for p in "$@"; do
+    [ -n "$p" ] || continue
+    window_add "$p" "$(flags_of "$p")"
+  done
+  # INT/TERM re-seal and then leave; the EXIT trap fires after that too,
+  # finds the flags already right, and stays quiet.
+  trap 'reseal_after_window; exit 3' INT TERM
+  trap 'reseal_after_window' EXIT
+}
+
+reseal_after_window() {
+  local i n want cur
+  i=0
+  while [ "$i" -lt "${#WINDOW_PATHS[@]}" ]; do
+    n="${WINDOW_PATHS[$i]}"
+    want="${WINDOW_FLAGS[$i]}"
+    i=$((i + 1))
+    # An unflagged node had no window to leave open.
+    [ -n "$want" ] || continue
+    # -L as well as -e: a registered node can be a symlink, including a
+    # dangling one, and that is still a node whose own flags must go back.
+    [ -e "$n" ] || [ -L "$n" ] || continue
+    cur="$(flags_of "$n" 2>/dev/null)" || cur=""
+    [ "$cur" = "$want" ] && continue
+    WINDOW_ALARM=1
+    # An alarm can fire anywhere, so it owns one leading blank line.
+    echo >&2
+    echo "!!! $n came back with flags '${cur:-none}', expected '$want' !!!" >&2
+    # -h always: on a symlink it flags the link rather than whatever it
+    # points at, and on anything else it changes nothing.
+    if chflags -h -- "$want" "$n" 2>/dev/null; then
+      echo "    re-sealed by the backstop: $n ($want)" >&2
+      log_action reseal "$n" reseal-backstop
+    else
+      echo "    could not re-seal it. Restore by hand:" >&2
+      echo "    sudo chflags -h $want $n" >&2
+      log_action reseal "$n" reseal-failed
+    fi
+  done
+}
+
+window_end() {
+  reseal_after_window
+  trap - EXIT INT TERM
+  WINDOW_PATHS=()
+  WINDOW_FLAGS=()
+}
+
+# helper_call <argv>...: run the window helper, capturing its stdout.
+# Always returns 0 -- the outcome is HELPER_RC, which helper_outcome reads.
+# stderr is passed straight through: the helper writes one prose line.
+HELPER_OUT=""
+HELPER_RC=0
+HELPER_ANOMALY=0
+helper_call() {
+  HELPER_OUT=""
+  HELPER_RC=0
+  if [ "$OPT_DRY" -eq 1 ]; then
+    printf 'DRY-RUN: '
+    printf '%q ' "$LOCKED_HELPER" "$@"
+    printf '\n'
+    return 0
+  fi
+  # Re-verified per call, never cached: see verify_helper.
+  if ! verify_helper; then
+    HELPER_RC=3   # nothing ran, so nothing changed
+    return 0
+  fi
+  HELPER_OUT="$("$LOCKED_HELPER" "$@")" || HELPER_RC=$?
+  return 0
+}
+
+# First value of a tab-separated stdout line the helper tagged with $1.
+helper_line_value() { # <key>
+  printf '%s\n' "$HELPER_OUT" | awk -F'\t' -v k="$1" '$1==k{print $2; exit}'
+}
+
+# Translate HELPER_RC into operator-facing output. Returns 0 when the
+# operation HAPPENED and the records must follow it, 1 when it did not.
+# Sets HELPER_ANOMALY=1 for exit 6, where it happened but the parent's
+# entry diff had leftovers the caller must surface as a partial failure.
+helper_outcome() { # <verb> <path>
+  local verb="$1" f="$2"
+  HELPER_ANOMALY=0
+  case "$HELPER_RC" in
+    0)
+      return 0
+      ;;
+    2)
+      echo "refused $f: the node the helper opened is not the one recorded" >&2
+      echo "  nothing was changed. Check it, then re-run:  sudo locked status $f" >&2
+      log_action "$verb" "$f" refuse-identity
+      return 1
+      ;;
+    3)
+      echo "failed $f: the operation did not happen" >&2
+      log_action "$verb" "$f" fail
+      return 1
+      ;;
+    4)
+      echo "ERROR: the window helper refused the request as malformed, or is" >&2
+      echo "       not running as root: $LOCKED_HELPER" >&2
+      log_action "$verb" "$f" fail-helper
+      return 1
+      ;;
+    5)
+      # The helper could not put the flag word back. window_end has already
+      # run by the time this prints, so the backstop's own lines are above
+      # and say whether re-sealing from the captured word worked.
+      echo >&2
+      echo "!!! $f: the helper could not restore the flags it lifted !!!" >&2
+      echo "    window left open on: $(helper_line_value window-open)" >&2
+      echo "    locked's backstop has already re-applied the flag word it" >&2
+      echo "    captured before the call; anything it could not fix is above." >&2
+      echo "    The record is deliberately NOT updated -- whether the operation" >&2
+      echo "    itself completed cannot be told from here:" >&2
+      echo "    sudo locked verify" >&2
+      log_action "$verb" "$f" alarm-window-open
+      return 1
+      ;;
+    6)
+      HELPER_ANOMALY=1
+      echo >&2
+      echo "!!! $f: entries other than the target changed inside the window !!!" >&2
+      # The name field arrives backslash-escaped by the helper, precisely so
+      # a hostile filename cannot forge one of these lines. Printed as it
+      # came: un-escaping here would hand that forgery back.
+      printf '%s\n' "$HELPER_OUT" \
+        | awk -F'\t' '$1=="anomaly"{printf "    %s  %s  (%s)\n", $2, $3, $4}' >&2
+      echo "    The operation itself completed and the records follow it." >&2
+      echo "    Nothing here can undo a race; it can only refuse to hide one." >&2
+      log_action "$verb" "$f" anomaly
+      return 0
+      ;;
+    *)
+      echo "ERROR: the window helper exited $HELPER_RC, which locked does not" >&2
+      echo "       know how to read. Treating $f as unchanged." >&2
+      log_action "$verb" "$f" fail-unknown
+      return 1
+      ;;
+  esac
+}
+
+# ---- record layer ----------------------------------------------------------
+
+# Retire: the node is gone for good. `via` carries the provenance the plan
+# insists on keeping apart -- rm and trash-finalized are observations by
+# the tool, assertion is a human's claim about a fact found afterwards.
+# The meta and its snapshots stay as the audit trail.
+retire_record() { # <path> <via>
+  local f="$1" via="$2"
+  snap_paths "$f"
+  [ -f "$META" ] || return 0
+  if [ "$OPT_DRY" -eq 1 ]; then
+    echo "DRY-RUN: retire record for $f (via=$via)"
+    return 0
+  fi
+  rewrite_meta_state "$META" retired "via=$via" "by=$inv" "at=$(now_utc)" || return 1
+  echo "  record retired: $f"
+}
+
+# Suspend: trashing is reversible, so retiring here would let a Put Back
+# quietly restore a previously sealed node UNSEALED. The record keeps the
+# bin location instead and verify watches both ends of it.
+suspend_record() { # <path> <bin>
+  local f="$1" bin="$2"
+  snap_paths "$f"
+  [ -f "$META" ] || return 0
+  if [ "$OPT_DRY" -eq 1 ]; then
+    echo "DRY-RUN: suspend record for $f"
+    return 0
+  fi
+  rewrite_meta_state "$META" suspended "by=$inv" "at=$(now_utc)" "bin=$bin" || return 1
+  echo "  record suspended: $f"
+  [ -n "$bin" ] && echo "    bin: $bin"
+  return 0
+}
+
+# Re-key: the record's path lives only in its encoded filename (see the
+# field list in write_meta), so a move is a rename of the pool files and
+# nothing else. Identity, tier, flags and state all still describe the same
+# inode. Refuses rather than merging into an existing key.
+rekey_record() { # <oldpath> <newpath>
+  local old="$1" new="$2" oldenc newenc suffix src dst
+  oldenc="$(encode "$old")"
+  newenc="$(encode "$new")"
+  [ "$oldenc" != "$newenc" ] || return 0
+  for suffix in meta snap snapdir attic; do
+    if [ -e "$USER_SNAPSHOTS/$newenc.$suffix" ]; then
+      echo "ERROR: a record already exists for $new; refusing to merge into it" >&2
+      return 1
+    fi
+  done
+  if [ "$OPT_DRY" -eq 1 ]; then
+    echo "DRY-RUN: re-key record $old -> $new"
+    return 0
+  fi
+  for suffix in meta snap snapdir attic; do
+    src="$USER_SNAPSHOTS/$oldenc.$suffix"
+    dst="$USER_SNAPSHOTS/$newenc.$suffix"
+    if [ -e "$src" ]; then
+      mv -f -- "$src" "$dst" || return 1
+    fi
+  done
+  echo "  record re-keyed: $old -> $new"
+}
+
+# ---- subtree scan ----------------------------------------------------------
+
+# Decoded paths in <pooldir> that are <target> or lie under it. The case
+# patterns quote $target, so it is matched LITERALLY even if it holds glob
+# characters, and the "/" in the second pattern is the trailing-slash guard
+# that keeps /foo/barbaz out of a scan of /foo/bar.
+pool_records_under() { # <pooldir> <target>
+  local dir="${1%/}" target="$2" meta dpath
+  for meta in "$dir"/*.meta; do
+    dpath="$(decode "$(basename "$meta" .meta)")"
+    case "$dpath" in
+      "$target"|"$target"/*) printf '%s\n' "$dpath" ;;
+    esac
+  done
+}
+
+# The gate every placement verb passes BEFORE a window opens: nothing is
+# released until the full set of affected records is known and accepted.
+# Records of ANOTHER user refuse outright -- locked does not retire someone
+# else's record on their behalf. Own records below the named node need
+# --recursive, so the blast radius is seen before the decision instead of
+# discovered after it.
+#
+# Sets SUBTREE_NODES to every own-pool path at or under the target, deepest
+# first. Returns 1 on refusal.
+SUBTREE_NODES=()
+subtree_gate() { # <verb> <target>
+  local verb="$1" target="$2" udir uname own other descendants="" p foreign=0
+  SUBTREE_NODES=()
+
+  for udir in "$SNAPSHOTS_ROOT"/*/; do
+    uname="$(basename "$udir")"
+    case "$uname" in .*) continue ;; esac
+    [ "$uname" = "$inv" ] && continue
+    other="$(pool_records_under "$udir" "$target")"
+    [ -n "$other" ] || continue
+    if [ "$foreign" -eq 0 ]; then
+      echo "refusing $verb $target: it holds locked records that are not yours" >&2
+      foreign=1
+    fi
+    echo "  pool of $uname:" >&2
+    printf '%s\n' "$other" | sed 's/^/    /' >&2
+  done
+  if [ "$foreign" -eq 1 ]; then
+    echo >&2
+    echo "note: locked will not rewrite another user's record on their behalf," >&2
+    echo "      and --recursive does not widen that. They release theirs first." >&2
+    log_action "$verb" "$target" refuse-foreign-records
+    return 1
+  fi
+
+  own="$(pool_records_under "$USER_SNAPSHOTS" "$target" | sort -r)"
+  [ -n "$own" ] || return 0
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    SUBTREE_NODES+=("$p")
+    [ "$p" = "$target" ] && continue
+    descendants="$descendants$p"$'\n'
+  done <<EOF
+$own
+EOF
+
+  # The named node's own record is the ordinary case; records BELOW it are
+  # the ones a plain `rm` would silently orphan.
+  [ -n "$descendants" ] || return 0
+  if [ "$OPT_RECURSIVE" -eq 1 ]; then
+    return 0
+  fi
+  {
+    echo "refusing $verb $target: locked records live under it"
+    echo
+    echo "records under $target:"
+    while IFS= read -r p; do
+      [ -n "$p" ] || continue
+      status_row "$p" brief || true
+    done <<EOF
+$descendants
+EOF
+    echo
+    echo "note: acting on it takes those paths with it, so their records"
+    echo "      change too."
+    cmd_rows "      " \
+      "sudo locked $verb --recursive $target" "proceeds and updates them"
+  } >&2
+  log_action "$verb" "$target" refuse-subtree
+  return 1
+}
+
+# Apply the per-node record side-effect to everything the gate collected.
+# <bin> is the top-level bin location and only used by trash: a child of a
+# trashed directory sits at that location plus its path relative to the
+# node that was trashed.
+apply_subtree_effect() { # <verb> <target> [<bin>]
+  local verb="$1" target="$2" bin="${3:-}" i n rel rc=0
+  i=0
+  while [ "$i" -lt "${#SUBTREE_NODES[@]}" ]; do
+    n="${SUBTREE_NODES[$i]}"
+    i=$((i + 1))
+    case "$verb" in
+      rm)
+        retire_record "$n" rm || rc=1
+        ;;
+      trash)
+        rel="${n#"$target"}"
+        suspend_record "$n" "${bin}${rel}" || rc=1
+        ;;
+    esac
+  done
+  return "$rc"
+}
+
+# mv and rekey share this: every collected record moves by prefix rewrite.
+rekey_subtree() { # <oldtarget> <newtarget>
+  local old="$1" new="$2" i n rel rc=0
+  i=0
+  while [ "$i" -lt "${#SUBTREE_NODES[@]}" ]; do
+    n="${SUBTREE_NODES[$i]}"
+    i=$((i + 1))
+    rel="${n#"$old"}"
+    rekey_record "$n" "${new}${rel}" || rc=1
+  done
+  return "$rc"
+}
+
+# ---- chain diagnosis -------------------------------------------------------
+
+# The nearest ancestor whose flags stop an entry under it from being
+# removed or renamed. Reports what is OBSERVED; whether locked set the
+# flag is a separate question, asked of the record by explain_blocker.
+# Sets BLOCK_PATH and BLOCK_FLAG; returns 1 when nothing blocks.
+BLOCK_PATH=""
+BLOCK_FLAG=""
+blocking_ancestor() { # <path>
+  local p fl
+  BLOCK_PATH=""
+  BLOCK_FLAG=""
+  p="$(dirname "$1")"
+  while :; do
+    fl="$(flags_of "$p" 2>/dev/null)" || fl=""
+    case ",$fl," in
+      *,sappnd,*) BLOCK_PATH="$p"; BLOCK_FLAG=sappnd; return 0 ;;
+      *,schg,*)   BLOCK_PATH="$p"; BLOCK_FLAG=schg;   return 0 ;;
+      *,uappnd,*) BLOCK_PATH="$p"; BLOCK_FLAG=uappnd; return 0 ;;
+      *,uchg,*)   BLOCK_PATH="$p"; BLOCK_FLAG=uchg;   return 0 ;;
+    esac
+    [ "$p" = "/" ] && return 1
+    p="$(dirname "$p")"
+  done
+}
+
+# Aligned command/description rows: the gutter is the longest command plus
+# two spaces, the same docopt convention the usage text follows. Paths make
+# these commands variable-length, so the width is computed, not guessed --
+# and when the widest row would not fit 80 columns the description drops to
+# its own continuation line instead of running off the screen. That is also
+# docopt: a pattern too long to align takes its description below it.
+# Args alternate <command> <description>; bash 3.2 has no stride loop, so
+# the positional list is walked by index.
+cmd_rows() { # <indent> [<command> <description>]...
+  local indent="$1" w=0 dw=0 i j c d
+  shift
+  i=1
+  while [ "$i" -le "$#" ]; do
+    j=$((i + 1))
+    c="${!i}"
+    d="${!j}"
+    if [ "${#c}" -gt "$w" ]; then w="${#c}"; fi
+    if [ "${#d}" -gt "$dw" ]; then dw="${#d}"; fi
+    i=$((i + 2))
+  done
+  local wrap=0
+  if [ $(( ${#indent} + w + 2 + dw )) -gt 80 ]; then wrap=1; fi
+  i=1
+  while [ "$i" -le "$#" ]; do
+    j=$((i + 1))
+    c="${!i}"
+    d="${!j}"
+    if [ "$wrap" -eq 1 ]; then
+      printf '%s%s\n%s    %s\n' "$indent" "$c" "$indent" "$d"
+    else
+      printf '%s%-*s  %s\n' "$indent" "$w" "$c" "$d"
+    fi
+    i=$((i + 2))
+  done
+}
+
+# Name the constraint and the remedy for it. Which remedy depends on WHO
+# set the flag: a sealed pool node is locked's to move, so the mediated
+# verb applies; a flag locked never recorded is the operator's own chflags,
+# and offering a locked verb there emits a command that cannot work.
+# $3.. are command/description pairs. Clobbers the snap_paths globals.
+explain_blocker() { # <node> <flag> [<command> <description>]...
+  local n="$1" fl="$2"
+  shift 2
+  echo "note: $n is flagged $fl, so entries under it cannot be removed"
+  echo "      or renamed while it is sealed."
+  snap_paths "$n"
+  if [ -f "$META" ] && [ "$(meta_field "$META" state)" = "locked" ]; then
+    if [ "$#" -gt 0 ]; then
+      cmd_rows "      " "$@"
+    fi
+  else
+    echo "      locked has no record of that flag -- it was set outside the"
+    echo "      pool, so no locked verb releases it."
+    cmd_rows "      " "sudo chflags no$fl $n" "releases it (re-apply it yourself after)"
+  fi
+}
+
+# The motivating case: a named path is not a pool node, and the answer
+# "not in pool" is accurate and useless because the constraint is one
+# level up. Print the chain in the status layout, then the constraint.
+# $2.. are command/description pairs to offer.
+chain_diagnosis() { # <path> [<command> <description>]...
+  local f="$1"
+  shift
+  blocking_ancestor "$f" || return 0
+  echo
+  print_chain "$f" brief
+  echo
+  explain_blocker "$BLOCK_PATH" "$BLOCK_FLAG" "$@"
 }
 
 # ---- actions ---------------------------------------------------------------
@@ -1379,14 +2105,464 @@ do_revert_one() {
   log_action revert "$f" ok
 }
 
-do_status_one() {
-  local f="$1"
-  f="$(readlink -f "$f")" || { echo "cannot resolve $1" >&2; return 1; }
-  snap_paths "$f"
-  local leaf_meta="$META"
+# ---- mediated placement verbs ----------------------------------------------
+#
+# The three below are one syscall each, performed by the helper inside a
+# window it holds by fd. They work whether or not the named path is a pool
+# node: the motivating case is a plain file under a sealed parent, where
+# there is no record at all and only the syscall is needed.
 
+do_rm_one() {
+  local f
+  f="$(abs_leaf "$1")" || return 1
+  if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+    echo "skip $f: does not exist" >&2
+    log_action rm "$f" skip-noent
+    return 1
+  fi
+
+  # A directory with entries needs --recursive. The helper double-checks,
+  # but refusing here means the window never opens at all.
+  if [ -d "$f" ] && [ ! -L "$f" ] && [ "$OPT_RECURSIVE" -eq 0 ]; then
+    if [ -n "$(ls -A -- "$f" 2>/dev/null)" ]; then
+      echo "skip $f: directory is not empty" >&2
+      cmd_rows "  " \
+        "sudo locked rm --recursive $f" "removes it and everything under it" >&2
+      log_action rm "$f" skip-nonempty
+      return 1
+    fi
+  fi
+
+  subtree_gate rm "$f" || return 1
+
+  local what="entry"
+  if [ -d "$f" ] && [ ! -L "$f" ]; then
+    what="directory"
+    if [ "$OPT_RECURSIVE" -eq 1 ]; then
+      what="directory and everything under it"
+    fi
+  fi
+  confirm "Remove $f ($what; this is not the trash)?" || {
+    echo "aborted: $f" >&2; return 2
+  }
+
+  local parent args=()
+  parent="$(dirname "$f")"
+  args=(rm --parent "$parent" --parent-id "$(helper_id_for "$parent")" \
+           --name "$(basename "$f")" --target-id "$(helper_id_for "$f")")
+  if [ "$OPT_RECURSIVE" -eq 1 ]; then
+    args+=(--recursive)
+  fi
+
+  window_begin "$parent"
+  helper_call "${args[@]}"
+  window_end
+  helper_outcome rm "$f" || return 1
+
+  local rc=0
+  echo "removed: $f"
+  apply_subtree_effect rm "$f" || rc=1
+  if [ "$HELPER_ANOMALY" -eq 1 ]; then
+    rc=3
+  else
+    log_action rm "$f" ok
+  fi
+  return "$rc"
+}
+
+# Whether <user> would have write AND search on <dir> by ordinary UNIX
+# permissions. The trash child runs as the invoker, so the rename out of
+# the parent needs the invoker's own rights on it; clearing the parent's
+# BSD flag does not grant any. Owner match wins, then group membership,
+# then other -- the same order the kernel applies. Both bits must be on:
+# write to unlink the entry, search to reach it (3 and 7 are the two octal
+# digits carrying w|x). stat is lstat here, so a symlink is judged on the
+# link's own mode and fails closed; callers hand over an already
+# canonicalized parent, so that case does not arise in practice.
+user_can_write_dir() { # <user> <dir>
+  local u="$1" d="$2" owner group mode bits
+  owner="$(stat -f '%Su' "$d")" || return 1
+  group="$(stat -f '%Sg' "$d")" || return 1
+  # Pad, then keep the last three digits: a setgid or sticky bit prepends
+  # a fourth (2775, 1777) that would shift every index below.
+  mode="$(printf '%03d' "$(stat -f '%OLp' "$d")")"
+  mode="${mode#"${mode%???}"}"
+  if [ "$owner" = "$u" ]; then
+    bits="${mode:0:1}"
+  elif id -Gn "$u" 2>/dev/null | tr ' ' '\n' | grep -qxF -- "$group"; then
+    bits="${mode:1:1}"
+  else
+    bits="${mode:2:1}"
+  fi
+  case "$bits" in
+    3|7) return 0 ;;
+    *)   return 1 ;;
+  esac
+}
+
+do_trash_one() {
+  local f
+  f="$(abs_leaf "$1")" || return 1
+  if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+    echo "skip $f: does not exist" >&2
+    log_action trash "$f" skip-noent
+    return 1
+  fi
+  # The trash is a per-user destination. With no invoking user there is no
+  # bin to put anything in, and root's own would be the wrong answer.
+  if [ -z "$inv" ]; then
+    echo "refusing trash: no invoking user, so there is no bin to trash into" >&2
+    echo "  use rm if the node really should be removed outright" >&2
+    return 1
+  fi
+  local uid gid
+  uid="$(id -u "$inv")"
+  gid="$(id -g "$inv")"
+  if [ "$uid" = "0" ]; then
+    echo "refusing trash: the invoker is root, whose bin is not where you" >&2
+    echo "  meant this to go. Run it as yourself, or use rm." >&2
+    return 1
+  fi
+  # No non-empty-directory rule here: the trash service moves a whole tree
+  # in one operation, so --recursive governs records only.
+
+  local parent
+  parent="$(dirname "$f")"
+  # Pre-check, before any window opens: a content-tier parent is
+  # lock-account-owned 700, so the dropped-privilege child could not
+  # perform the rename and the helper would fail from inside the window.
+  # Placement-tier parents are group-writable and the invoker is in that
+  # group, so the ordinary pool cases pass this.
+  if ! user_can_write_dir "$inv" "$parent"; then
+    echo "refusing trash $f: $inv cannot write $parent" >&2
+    echo "  The trash service runs as you, not as root, so the move out of" >&2
+    echo "  that directory needs your own rights on it -- releasing the flag" >&2
+    echo "  does not grant them." >&2
+    cmd_rows "  " "sudo locked rm $f" "removes it outright instead" >&2
+    log_action trash "$f" refuse-parent-perm
+    return 1
+  fi
+
+  subtree_gate trash "$f" || return 1
+
+  local args=()
+  args=(trash --parent "$parent" --parent-id "$(helper_id_for "$parent")" \
+              --name "$(basename "$f")" --target-id "$(helper_id_for "$f")" \
+              --uid "$uid" --gid "$gid" --home "$user_home")
+
+  window_begin "$parent"
+  helper_call "${args[@]}"
+  window_end
+  helper_outcome trash "$f" || return 1
+
+  local bin rc=0
+  bin="$(helper_line_value binurl)"
+  echo "trashed: $f"
+  if [ -n "$bin" ]; then
+    echo "  bin: $bin"
+  elif [ "$OPT_DRY" -eq 0 ]; then
+    # Without the destination the suspension cannot be finalized later,
+    # and Put Back would resurrect an unsealed node with nothing watching.
+    echo >&2
+    echo "!!! $f: the helper reported no bin location !!!" >&2
+    echo "    The record is suspended without one, so verify cannot finalize" >&2
+    echo "    it. Find where it went and re-key or tombstone the record." >&2
+    rc=3
+  fi
+  apply_subtree_effect trash "$f" "$bin" || rc=1
+  if [ "$HELPER_ANOMALY" -eq 1 ]; then
+    rc=3
+  elif [ "$rc" -eq 0 ]; then
+    log_action trash "$f" ok
+  fi
+  return "$rc"
+}
+
+do_mv() { # <old> <new>
+  local old new
+  old="$(abs_leaf "$1")" || return 1
+  new="$(abs_leaf "$2")" || return 1
+  if [ ! -e "$old" ] && [ ! -L "$old" ]; then
+    echo "skip $old: does not exist" >&2
+    log_action mv "$old" skip-noent
+    return 1
+  fi
+  if [ -e "$new" ] || [ -L "$new" ]; then
+    echo "refusing: $new already exists; locked mv never clobbers" >&2
+    log_action mv "$old" refuse-exists
+    return 1
+  fi
+  local oldparent newparent
+  oldparent="$(dirname "$old")"
+  newparent="$(dirname "$new")"
+  if [ ! -d "$newparent" ]; then
+    echo "refusing: $newparent is not a directory" >&2
+    return 1
+  fi
+  # Rename cannot cross filesystems, and a copy+delete would drop the BSD
+  # flags and xattrs this tool exists to keep. Say so here rather than
+  # letting an EXDEV from inside the window explain it later.
+  if [ "$(stat -f '%d' "$oldparent")" != "$(stat -f '%d' "$newparent")" ]; then
+    echo "refusing: $old and $new are on different filesystems" >&2
+    echo "  a copy would drop flags and xattrs, so locked will not do it" >&2
+    log_action mv "$old" refuse-xdev
+    return 1
+  fi
+
+  subtree_gate mv "$old" || return 1
+
+  local args=()
+  args=(mv --parent "$oldparent" --parent-id "$(helper_id_for "$oldparent")" \
+           --name "$(basename "$old")" --target-id "$(helper_id_for "$old")" \
+           --dest-parent "$newparent" \
+           --dest-parent-id "$(helper_id_for "$newparent")" \
+           --dest-name "$(basename "$new")")
+
+  window_begin "$oldparent" "$newparent"
+  # mv is the one verb that lifts flags on the MOVED node too, and restores
+  # them through the same fd afterwards. If that restore is what fails, the
+  # node is at $new; if the rename never happened, it is still at $old.
+  # Register both against the one flag word captured now: whichever path
+  # does not exist afterwards is skipped, so exactly the right one is
+  # checked without the backstop having to know which way it went.
+  local target_flags
+  target_flags="$(flags_of "$old")"
+  window_add "$old" "$target_flags"
+  window_add "$new" "$target_flags"
+  helper_call "${args[@]}"
+  window_end
+  helper_outcome mv "$old" || return 1
+
+  local rc=0
+  echo "moved: $old -> $new"
+  # A rename keeps the inode, so no recorded field changes -- only the key.
+  rekey_subtree "$old" "$new" || rc=1
+  if [ "$HELPER_ANOMALY" -eq 1 ]; then
+    rc=3
+  elif [ "$rc" -eq 0 ]; then
+    log_action mv "$old" ok
+  fi
+  return "$rc"
+}
+
+# Record-only repair, for a node something else already moved. The identity
+# check is the whole point: re-keying onto a node the record does not
+# describe would hand a stranger's file a snapshot and a flag history.
+do_rekey() { # <old> <new>
+  local old new want cur
+  old="$(abs_leaf "$1")" || return 1
+  new="$(abs_leaf "$2")" || return 1
+  snap_paths "$old"
+  if [ ! -f "$META" ]; then
+    echo "skip $old: not in pool (nothing to re-key)" >&2
+    return 1
+  fi
+  want="$(meta_field "$META" id)"
+  if [ ! -e "$new" ] && [ ! -L "$new" ]; then
+    echo "refusing: $new does not exist" >&2
+    cmd_rows "  " "sudo locked tombstone $old" "records it as gone instead" >&2
+    return 1
+  fi
+  cur="$(node_id "$new")"
+  if [ "$cur" != "$want" ]; then
+    echo "refusing: $new is dev/ino $cur, but the record for $old holds $want" >&2
+    echo "  The node at $new is not the one that record describes, so re-keying" >&2
+    echo "  would attach its snapshot and flag history to a different file." >&2
+    cmd_rows "  " "sudo locked tombstone $old" "if the recorded node is really gone" >&2
+    log_action rekey "$old" refuse-identity
+    return 1
+  fi
+
+  subtree_gate rekey "$old" || return 1
+  rekey_subtree "$old" "$new" || return 1
+  log_action rekey "$old" ok
+}
+
+# Human assertion: a fact discovered after the event. Kept apart from the
+# tool's own observation (via=rm) on purpose -- the audit trail has to say
+# which of the two it was.
+do_tombstone_one() {
+  local f state
+  f="$(abs_leaf "$1")" || return 1
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    echo "skip $f: present on disk; use rm or trash, or unlock if you want it back" >&2
+    log_action tombstone "$f" skip-present
+    return 1
+  fi
+  snap_paths "$f"
+  if [ ! -f "$META" ]; then
+    echo "skip $f: not in pool (nothing to tombstone)" >&2
+    log_action tombstone "$f" skip-no-meta
+    return 1
+  fi
+  state="$(meta_field "$META" state)"
+  if [ "$state" = "retired" ]; then
+    echo "already retired: $f (via $(meta_field "$META" via))"
+    return 0
+  fi
+  if [ "$state" = "suspended" ]; then
+    echo "note: $f is suspended, trashed to $(meta_field "$META" bin)."
+    echo "      Tombstoning asserts it is gone for good, so verify stops"
+    echo "      watching for a Put Back."
+  fi
+  confirm "Record $f as gone (retired, asserted by $inv)?" || {
+    echo "aborted: $f" >&2; return 2
+  }
+  retire_record "$f" assertion || return 1
+  echo "tombstoned: $f"
+  log_action tombstone "$f" ok
+}
+
+# "What, if anything, stops this path from being modified?" -- a question
+# independent of the pool, so it answers for foreign flags too, and runs
+# without sudo on whatever the invoker can stat.
+do_why_one() {
+  local f
+  f="$(abs_leaf "$1")" || return 1
+
+  local nodes=() n
+  n="$f"
+  while :; do
+    nodes=("$n" ${nodes[@]+"${nodes[@]}"})
+    [ "$n" = "/" ] && break
+    n="$(dirname "$n")"
+  done
+
+  echo "why $f:"
+  local fl marker owner record parts
+  for n in "${nodes[@]}"; do
+    if [ ! -e "$n" ] && [ ! -L "$n" ]; then
+      echo "    -  $n (does not exist)"
+      continue
+    fi
+    fl="$(flags_of "$n" 2>/dev/null)" || fl=""
+    # The marker answers one question: does this node constrain what is
+    # under it? ! blocks removal and rename, ~ carries some other flag,
+    # - carries none. What the record says goes in the parenthetical.
+    case ",$fl," in
+      *,sappnd,*|*,schg,*|*,uappnd,*|*,uchg,*) marker="!" ;;
+      ,,) marker="-" ;;
+      *) marker="~" ;;
+    esac
+    owner="$(stat -f '%Su:%Sg' "$n" 2>/dev/null)" || owner="unreadable"
+    record=""
+    snap_paths "$n"
+    if [ -f "$META" ]; then
+      record="pool $(meta_field "$META" tier) $(meta_field "$META" state)"
+    elif [ -n "$fl" ]; then
+      record="no record"
+    fi
+    parts="$owner"
+    [ -n "$fl" ] && parts="$parts, $fl"
+    [ -n "$record" ] && parts="$parts; $record"
+    echo "    $marker  $n ($parts)"
+  done
+
+  # Two constraints, reported separately because their remedies differ: an
+  # immutable node cannot be changed at all, and a sealed parent will not
+  # let the entry be removed or renamed.
+  local blocked=0 self_fl self_block=""
+  self_fl="$(flags_of "$f" 2>/dev/null)" || self_fl=""
+  case ",$self_fl," in
+    *,schg,*) self_block=schg ;;
+    *,uchg,*) self_block=uchg ;;
+  esac
+  if [ -n "$self_block" ]; then
+    blocked=1
+    echo
+    snap_paths "$f"
+    if [ -f "$META" ] && [ "$(meta_field "$META" state)" = "locked" ]; then
+      echo "note: $f is immutable ($self_block); its contents cannot change"
+      echo "      while it is sealed."
+      cmd_rows "      " \
+        "sudo locked edit $f" "edits it without ever leaving it unlocked" \
+        "sudo locked unlock $f" "releases it until the next lock"
+    else
+      echo "note: $f is immutable ($self_block), and locked has no record of"
+      echo "      that flag -- it was set outside the pool."
+      cmd_rows "      " \
+        "sudo chflags no$self_block $f" "releases it (re-apply it yourself after)"
+    fi
+  fi
+  if blocking_ancestor "$f"; then
+    blocked=1
+    echo
+    if [ -e "$f" ] || [ -L "$f" ]; then
+      explain_blocker "$BLOCK_PATH" "$BLOCK_FLAG" \
+        "sudo locked rm $f" "removes it through a bounded window" \
+        "sudo locked trash $f" "moves it to your trash instead" \
+        "sudo locked mv $f <new>" "renames it through the same window"
+    else
+      # There is nothing there to remove or rename, so offering the verbs
+      # that do those would only produce commands that refuse.
+      explain_blocker "$BLOCK_PATH" "$BLOCK_FLAG"
+    fi
+  fi
+  if [ "$blocked" -eq 0 ]; then
+    echo
+    # Precisely what was measured, and no more: this walk reads file flags,
+    # so ordinary permissions are still free to say no.
+    echo "note: no file flag on this chain stops $f from being"
+    echo "      changed, renamed or removed. Ordinary permissions still"
+    echo "      apply -- the owners are listed above."
+  fi
+}
+
+# One node, one row, in the layout every listing in this script shares:
+# four spaces, a verdict glyph, the path, then the record in parentheses.
+# Markers: ✓ sealed and clean, ✗ drifted, ○ deliberately unlocked,
+# ~ recorded but no longer enforced (retired, suspended), - not in pool.
+# `brief` collapses drift detail to a pointer, for the pool listing.
+# Sets STATUS_ROW_POOL so a caller can tell "clean" from "no record".
+# Returns 1 on drift. Clobbers the snap_paths globals.
+STATUS_ROW_POOL=0
+status_row() { # <path> [brief]
+  local n="$1" brief="${2:-}" tier state
+  STATUS_ROW_POOL=0
+  snap_paths "$n"
+  if [ ! -f "$META" ]; then
+    echo "    -  $n (not in pool)"
+    return 0
+  fi
+  STATUS_ROW_POOL=1
+  tier="$(meta_field "$META" tier)"
+  state="$(meta_field "$META" state)"
+  case "$state" in
+    unlocked)
+      echo "    ○  $n ($tier, unlocked)"
+      return 0
+      ;;
+    retired)
+      echo "    ~  $n ($tier, retired via $(meta_field "$META" via) $(meta_field "$META" at))"
+      return 0
+      ;;
+    suspended)
+      echo "    ~  $n ($tier, suspended $(meta_field "$META" at))"
+      echo "         bin: $(meta_field "$META" bin)"
+      return 0
+      ;;
+  esac
+  if verify_node "$n" "$META" "$lock_user" >/dev/null 2>&1; then
+    echo "    ✓  $n ($tier $(meta_field "$META" flag))"
+    return 0
+  fi
+  if [ "$brief" = "brief" ]; then
+    echo "    ✗  $n ($tier $(meta_field "$META" flag)) DRIFT -- details: sudo locked status $n"
+  else
+    echo "    ✗  $n ($tier) DRIFT:"
+    verify_node "$n" "$META" "$lock_user" | sed 's/^/      /' || true
+  fi
+  return 1
+}
+
+# The `chain for` block: ancestors root-first, then the leaf, one
+# status_row each. Sets CHAIN_ANY=1 when any node on it holds a record.
+# Returns 1 if any node drifted.
+CHAIN_ANY=0
+print_chain() { # <path> [brief]
+  local f="$1" brief="${2:-}" chain nodes=() a rc=0
+  CHAIN_ANY=0
   echo "chain for $f:"
-  local chain nodes=() a
   if chain="$(chain_for "$f" 2>/dev/null)"; then
     :
   else
@@ -1400,30 +2576,22 @@ do_status_one() {
 $chain
 EOF
   nodes=(${nodes[@]+"${nodes[@]}"} "$f")
-
-  local any=0 rc=0 n tier state
-  for n in "${nodes[@]}"; do
-    snap_paths "$n"
-    if [ ! -f "$META" ]; then
-      echo "    -  $n (not in pool)"
-      continue
-    fi
-    any=1
-    tier="$(meta_field "$META" tier)"
-    state="$(meta_field "$META" state)"
-    if [ "$state" = "unlocked" ]; then
-      echo "    ○  $n ($tier, unlocked)"
-      continue
-    fi
-    if verify_node "$n" "$META" "$lock_user" >/dev/null 2>&1; then
-      echo "    ✓  $n ($tier $(meta_field "$META" flag))"
-    else
-      echo "    ✗  $n ($tier) DRIFT:"
-      verify_node "$n" "$META" "$lock_user" | sed 's/^/      /' || true
-      rc=1
+  for a in "${nodes[@]}"; do
+    status_row "$a" "$brief" || rc=1
+    if [ "$STATUS_ROW_POOL" -eq 1 ]; then
+      CHAIN_ANY=1
     fi
   done
-  [ "$any" -eq 1 ] || { echo "  not in pool: $leaf_meta absent"; }
+  return "$rc"
+}
+
+do_status_one() {
+  local f="$1"
+  f="$(readlink -f "$f")" || { echo "cannot resolve $1" >&2; return 1; }
+  snap_paths "$f"
+  local leaf_meta="$META" rc=0
+  print_chain "$f" || rc=1
+  [ "$CHAIN_ANY" -eq 1 ] || echo "  not in pool: $leaf_meta absent"
   return "$rc"
 }
 
@@ -1441,7 +2609,7 @@ status_unpriv_note() {
 # verify it never writes alert files and drift does not change the exit
 # code, so looking never turns into an enforcement action.
 do_status_pool() {
-  local listing meta n tier state flag
+  local listing meta n
   # Sorted by DECODED path, so the listing reads in filesystem order rather
   # than in the encoding's order (%2F sorts nothing like /).
   listing="$(
@@ -1456,17 +2624,9 @@ do_status_pool() {
   echo "pool for $inv:"
   while IFS= read -r n; do
     [ -n "$n" ] || continue
-    snap_paths "$n"
-    tier="$(meta_field "$META" tier)"
-    state="$(meta_field "$META" state)"
-    flag="$(meta_field "$META" flag)"
-    if [ "$state" = "unlocked" ]; then
-      echo "    ○  $n ($tier, unlocked)"
-    elif verify_node "$n" "$META" "$lock_user" >/dev/null 2>&1; then
-      echo "    ✓  $n ($tier $flag)"
-    else
-      echo "    ✗  $n ($tier $flag) DRIFT -- details: sudo locked status $n"
-    fi
+    # Looking is never an enforcement action: drift shows in the row but
+    # does not change the exit code here.
+    status_row "$n" brief || true
   done <<EOF
 $listing
 EOF
@@ -1540,7 +2700,7 @@ require_paths() {
 }
 
 case "$action" in
-  lock|unlock|revert|status|edit)
+  lock|unlock|revert|status|edit|rm|trash|tombstone|why)
     if [ "$action" = "edit" ] && [ "$OPT_DRY" -eq 1 ]; then
       echo "edit does not support --dry-run (the diff+confirm IS the preview)" >&2
       exit 1
@@ -1561,12 +2721,34 @@ case "$action" in
         revert) do_revert_one "$f" || { failures=$((failures + 1)); echo "error processing $f (continuing)" >&2; } ;;
         edit)   do_edit_one "$f"   || { rc=$?; [ "$rc" -eq 2 ] && exit 2; failures=$((failures + 1)); echo "error processing $f (continuing)" >&2; } ;;
         status) do_status_one "$f" || failures=$((failures + 1)) ;;
+        why)    do_why_one "$f"    || failures=$((failures + 1)) ;;
+        # rc 3 from a placement verb means the operation DID happen and the
+        # records followed it, but the parent's entry diff had leftovers.
+        # It still counts as a failure, so the overall exit is 3 -- it just
+        # does not get the "error processing" line, which would be false.
+        rm)    do_rm_one "$f"    || { rc=$?; [ "$rc" -eq 2 ] && exit 2; failures=$((failures + 1)); [ "$rc" -eq 3 ] || echo "error processing $f (continuing)" >&2; } ;;
+        trash) do_trash_one "$f" || { rc=$?; [ "$rc" -eq 2 ] && exit 2; failures=$((failures + 1)); [ "$rc" -eq 3 ] || echo "error processing $f (continuing)" >&2; } ;;
+        tombstone) do_tombstone_one "$f" || { rc=$?; [ "$rc" -eq 2 ] && exit 2; failures=$((failures + 1)); echo "error processing $f (continuing)" >&2; } ;;
       esac
     done
     [ "$action" = "status" ] && status_unpriv_note
     if [ "$failures" -gt 0 ]; then
       [ "$action" = "status" ] && exit 5
       exit 3
+    fi
+    ;;
+  mv|rekey)
+    # Two paths, positionally, and no batching: a move has an <old> and a
+    # <new>, and a loop over pairs would make a typo unreadable.
+    if [ "${#PATHS[@]}" -ne 2 ]; then
+      echo "$action needs exactly two paths: <old> <new>" >&2
+      usage >&2
+      exit 1
+    fi
+    if [ "$action" = "mv" ]; then
+      do_mv "${PATHS[0]}" "${PATHS[1]}" || { rc=$?; [ "$rc" -eq 2 ] && exit 2; exit 3; }
+    else
+      do_rekey "${PATHS[0]}" "${PATHS[1]}" || exit 3
     fi
     ;;
   verify)
