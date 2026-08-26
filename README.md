@@ -35,6 +35,28 @@ Three tiers, named by what they protect:
   into a frozen parent (atomic-save editors).
 - `sudo locked revert <file>` -- save current to `.attic`, restore
   snapshot, re-seal.
+- `sudo locked rm|trash|mv` -- mediated placement: remove, trash, or
+  rename something a sealed parent will not let go of. A compiled helper
+  holds the parent by file descriptor, verifies its identity, lifts the
+  flag, performs the one syscall, restores the flag, and diffs the
+  parent's entries across the window -- anything but the expected change
+  raises an alarm instead of being sealed over. `trash` calls the real
+  macOS trash service as you (so the bin entry is yours and Put Back
+  works), and suspends the record rather than retiring it: a Put Back of
+  a previously sealed node is flagged by `verify` instead of silently
+  coming back unprotected. `rm --recursive` takes a whole tree, sealed
+  nodes included. Pool records follow every operation -- retired with
+  provenance for a removal, re-keyed for a move -- so `verify` stays
+  honest without training you to ignore it.
+- `sudo locked rekey <old> <new>` -- record-only repair when something
+  else already moved a pool node; refuses unless `<new>` is the very
+  inode the record describes.
+- `sudo locked tombstone <path>` -- assert a recorded path is gone for
+  good (retired, provenance "assertion"). Refused while it still exists.
+- `locked why <path>` -- what, if anything, stops this path from being
+  changed, renamed, or removed: flags on it and every ancestor, who owns
+  them, whether locked set them, and the command that goes through the
+  constraint. No `sudo` needed.
 - `locked status [<path>]` -- verify and print the full chain for each
   path. With no path, lists every node in your pool (tier, flag, and any
   drift) so you can see at a glance what is currently locked; reporting
@@ -61,7 +83,10 @@ imperatively -- binary in the system profile, hidden lock account and
 group, verify LaunchDaemon -- and generates `/etc/sudoers.d/locked` at
 build time from the same string the installed script is built from, so
 the sudoers sha256 digest can never drift from the deployed bytes; a
-rebuild moves both atomically with the generation.
+rebuild moves both atomically with the generation. The module also
+compiles the window helper (`helper/locked-helper.m`) and bakes its store
+path into the script, so the digest transitively commits to which helper
+binary runs; nothing extra to configure.
 
 ```nix
 # flake input (no inputs of its own), then:
@@ -121,6 +146,15 @@ Then install:
 ```sh
 sudo install -d -m 755 -o root -g wheel /usr/local/sbin
 sudo install -m 755 -o root -g wheel ./locked /usr/local/sbin/locked
+```
+
+Build and install the window helper alongside (needs the Xcode command
+line tools; the mediated verbs and every snapshot copy go through it,
+and `locked` verifies its ownership and ancestry on each use):
+```sh
+clang -O2 -Wall -Wextra -framework Foundation \
+  -o /tmp/locked-helper helper/locked-helper.m
+sudo install -m 755 -o root -g wheel /tmp/locked-helper /usr/local/sbin/locked-helper
 ```
 
 ### 2. Lock account `_jooize-lock`
@@ -200,8 +234,13 @@ modes, so an older 700 deployment converges on its own.
 - `.meta` -- captured identity plus lock state, one `key=value` per line:
   `owner`, `group`, `mode` (restore targets), `lockmode` (expected mode
   while locked), `tier`, `flag`, `flagsym` (exact post-seal flag word),
-  `id` (dev.ino), `recursive`, `state` (`locked`/`unlocked`). `verify`
-  compares reality against this.
+  `id` (dev.ino), `recursive`, `state` (`locked`/`unlocked`/`retired`/
+  `suspended`). `verify` compares reality against this. Retired and
+  suspended records carry provenance -- `via` (`rm`, `trash-finalized`,
+  or `assertion` for a human tombstone), `by`, `at`, and for a suspension
+  `bin`, the trash destination: `verify` flags the original path
+  reappearing (a Put Back of a formerly sealed node) and finalizes the
+  suspension to a retirement once the bin entry is gone.
 
 ## Mode and ownership preservation
 
@@ -214,7 +253,8 @@ The `owner`/`group`/`mode` restore targets are captured on the first `lock` of a
 - First lock assumes file is currently owned by you. To bring a file owned by someone else into the pool: `sudo chown -h <you>:staff <file>` first, then `sudo locked lock <file>` captures meta and locks. Or hand-write the meta file before unlocking once.
 - Other admins on the same machine can read snapshots via `sudo` (root reads all). Only encryption fixes that; not in scope here.
 - `readlink -f` requires macOS 12+. On older macOS, replace with `realpath` or a Python one-liner.
-- **Extended attributes and ACLs are not preserved across snapshot/restore.** `cp`/`install` don't carry xattrs by default; quarantine, code-signature, and custom-ACL metadata are lost on a `revert`. BSD flags ARE handled in v2 (meta records the exact word; revert re-seals). Designed for textual config files (authorized_keys, ssh config, settings.json), not binaries or files with critical attached metadata. **Future work** (deferred): round-trip xattrs via `xattr -p`/`-w`, ACLs via `/bin/chmod +a/-a` capture. Search for `TODO(xattrs)` in the script.
+- **Extended attributes and ACLs travel on file snapshots; directory trees still lose them.** File staging copies go through the helper with `COPYFILE_XATTR|COPYFILE_ACL`, so quarantine and custom-ACL metadata survive a snapshot/revert cycle. Content-tier *directories* (`.snapdir`) still copy with `cp -Rp`, which keeps the old limitation per file inside the tree -- search for `TODO(xattrs)` at `snapshot_tree`. BSD flags never travel by design (meta records the exact word; sealing re-applies it).
+- **`locked trash` is gated by macOS privacy (TCC) through the app that invoked it.** The trash service checks the responsible app's Files-and-Folders grant even under `sudo`; from an unblessed automation context it fails cleanly (afpAccessDenied) with the window restored, from your own granted terminal it works. Nothing to configure in `locked` -- grant the terminal, or use `rm`.
 - Default install path is `/usr/local/sbin/locked`. **Why not `/usr/libexec/`** (the natural spot for system helpers): `/usr/libexec` is on the sealed system volume since macOS 11; even root can't write there without booting to recovery and tearing down SSV. **Why not `/usr/local/bin/`**: same writable space but with the legacy Intel-Homebrew "chown -R \$USER /usr/local" footgun more common there. **Why `/usr/local/sbin/`**: less commonly tampered, semantically right for "needs sudo" admin tools, and in PATH by default.
 - Setup verifies the entire ancestry up to `/` is root-owned with no group/other write -- mode `755` or stricter -- and refuses to install otherwise. The same verification runs on **every** subsequent invocation -- if `/usr/local` ever gets chowned to a user after setup (e.g., a later Homebrew permission-fix recipe), the next `sudo locked ...` refuses with a clear error. This closes the "post-setup escalation" wedge: a swapped binary at a writable ancestor would otherwise inherit root after the next Touch ID approval.
 - Override default install path via `INSTALL_TARGET=/path sudo -E ./locked setup`. If you go this route, you'll need to re-run setup any time you want to change the path -- the sudoers entry references the path, not a binary identity.
@@ -222,18 +262,16 @@ The `owner`/`group`/`mode` restore targets are captured on the first `lock` of a
 ## Atomicity and TOCTOU
 
 Snapshot/attic/restore writes go through `atomic_replace`:
-1. Copy source into `/var/db/locked-snapshots/<user>/.staging/replace.XXXXXX` (lock-account-owned, mode 700 -- invisible to user UID).
+1. The helper copies the source into `/var/db/locked-snapshots/<user>/.staging/replace.XXXXXX` (lock-account-owned, mode 700 -- invisible to user UID) from a file descriptor it opened `O_NOFOLLOW` and identity-checked against the dev/ino `locked` expected -- a source swapped between resolution and open is refused, not copied.
 2. `chown` and `chmod` the staged temp file.
 3. Verify staging and destination are on the same filesystem (`stat -f '%d'`).
 4. `mv -f` -- atomic same-filesystem rename.
 
-This eliminates partial-write windows on the destination side and keeps the temp file out of user-visible space throughout preparation.
+This eliminates partial-write windows on the destination side, closes the old source-side swap (`TODO(toctou)`, now retired for files), and keeps the temp file out of user-visible space throughout. The destination's parent is covered by the chain itself: every user-writable ancestor of a locked leaf is sealed, and the mediated window holds parents by fd, which is what retired `TODO(parent-swap)`.
 
-**Residual TOCTOU** (not fixable in pure bash, marked `TODO(toctou)` and `TODO(parent-swap)` in source):
-- Source-side: an attacker who can write to the source's parent directory could swap the source file between `readlink -f` and `cp`'s `open(2)`. Closing this requires `O_NOFOLLOW` open + `fchmod`/`fchown` on a held fd -- needs a Swift/Python/C helper.
-- Parent-dir swap: same threat applied to the destination's parent directory between path resolution and the final `mv`.
-
-Both residuals exist in the original `install`-based implementation too -- `atomic_replace` doesn't make them worse, but doesn't close them either. They become real defenses only when the locked file's parent directory is itself protected (e.g., `~/.ssh/` chowned to the lock account, which requires a separate setup step).
+**Honest residuals:**
+- Directory-tree snapshots (`snapshot_tree`) still copy by path with `cp -Rp`; the per-file guarantees above do not apply inside a content-tier directory.
+- Inside a mediated window there is a nanosecond gap between the helper's identity check of the named entry and the syscall on its name (macOS has no unlink-by-fd). The cross-window entry diff catches every shape that leaves the parent changed; a race that wins that gap *and* has somewhere unsealed to hide the original is the remaining theoretical escape.
 
 ## Audit log
 
@@ -244,9 +282,19 @@ log show --predicate 'eventMessage CONTAINS "locked: user="' --last 1h
 Useful for spotting unexpected lock/unlock cycles. The log records `user=`, `action=`, `file=`, and `result=` (ok / skip-* / error) for each per-file operation.
 
 ## Removing a file from the lock pool
+
+To delete the file itself, use the mediated verb -- it does the removal
+through the window and retires the record in one step:
 ```sh
-sudo locked unlock <file>
-# (file is now owned by you, with restored meta mode)
-# delete sidecar files:
+sudo locked rm <file>        # or: sudo locked trash <file>
+```
+To keep the file but stop tracking it: `sudo locked unlock <file>` (file
+is now owned by you, with restored meta mode), then delete the sidecar
+files by hand if you want the record gone rather than showing as
+unlocked:
+```sh
 sudo rm /var/db/locked-snapshots/jooize/<encoded>.{snap,attic,meta}
 ```
+If something else already deleted the file and `verify` is flagging it:
+`sudo locked tombstone <file>` records it as gone, with you as the
+asserter.
