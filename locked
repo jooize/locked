@@ -2139,14 +2139,16 @@ do_rm_one() {
     fi
   fi
 
-  local what="entry"
-  if [ -d "$f" ] && [ ! -L "$f" ]; then
-    what="directory"
+  local what="file"
+  if [ -L "$f" ]; then
+    what="symlink"
+  elif [ -d "$f" ]; then
+    what="empty directory"
     if [ "$OPT_RECURSIVE" -eq 1 ]; then
       what="directory and everything under it"
     fi
   fi
-  confirm "Remove $f ($what; this is not the trash)?" || {
+  confirm "Permanently remove $f ($what)?" || {
     echo "aborted: $f" >&2; return 2
   }
 
