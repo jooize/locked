@@ -18,10 +18,28 @@ let
 
   srcText = builtins.readFile ../locked;
 
-  # One anchor-line rewrite, failing the eval loudly if the anchor ever
+  # The compiled fd-window helper (mediated placement ops). Built from one
+  # translation unit with the stdenv clang; -Werror because a warning in a
+  # root-executing helper is a finding, not noise. Its store path is baked
+  # into scriptText below, which does two jobs at once: the sudoers digest
+  # of the script transitively commits to WHICH helper binary runs (the
+  # path names the input-addressed build), and the string context makes the
+  # helper part of the system closure with no systemPackages entry -- it
+  # stays off PATH on purpose, it is locked's to invoke, not the user's.
+  # Content trust at run time is the script's own ancestry/ownership walk,
+  # the same check it applies to itself; a content hash cannot live here
+  # because the binary's bytes only exist after the build.
+  helper = pkgs.runCommandCC "locked-helper" { } ''
+    mkdir -p $out/bin
+    $CC -O2 -Wall -Wextra -Werror -framework Foundation \
+      -o $out/bin/locked-helper ${../helper/locked-helper.m}
+  '';
+
+  # Anchor-line rewrites, failing the eval loudly if an anchor ever
   # changes shape in the script: INSTALL_TARGET's default becomes the
   # system-profile path (stable across generations, always resolving to
-  # the current build).
+  # the current build), and LOCKED_HELPER's default becomes the store
+  # path of the helper built above.
   #
   # Deliberate non-rewrites, unlike pinned's module: the shebang is
   # already /bin/bash in the repo (see the script's own header -- sudo
@@ -34,6 +52,10 @@ let
     {
       from = '': "''${INSTALL_TARGET:=/usr/local/sbin/locked}"'';
       to = '': "''${INSTALL_TARGET:=${cfg.installPath}}"'';
+    }
+    {
+      from = '': "''${LOCKED_HELPER:=/usr/local/sbin/locked-helper}"'';
+      to = '': "''${LOCKED_HELPER:=${helper}/bin/locked-helper}"'';
     }
   ];
   scriptText =
