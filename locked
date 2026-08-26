@@ -18,7 +18,7 @@
 #   sudo locked lock   [--tier T] [--flag F] [--yes] [--dry-run] <path>...
 #   sudo locked unlock [--chain] [--dry-run] <path>...
 #   sudo locked revert [--dry-run] <path>...
-#   sudo locked rm|trash [--recursive] [--yes] [--dry-run] <path>...
+#   sudo locked rm|trash [--recursive] [--dry-run] <path>...
 #   sudo locked mv|rekey [--recursive] <old> <new>
 #   sudo locked tombstone [--yes] <path>...
 #   locked status [<path>...]        (read-only; no sudo needed)
@@ -91,7 +91,7 @@ usage: sudo locked <action> [options] [args]
       at or under the path are retired, with locked named as the actor.
       --recursive is required for a non-empty directory and for any
       subtree that holds records of its own.
-  trash [--recursive] [--yes] [--dry-run] <path>...
+  trash [--recursive] [--dry-run] <path>...
       As rm, but the node goes to the system trash service as you, so
       Put Back keeps working. Records are suspended rather than retired
       and carry the bin location until the bin entry is gone.
@@ -2121,6 +2121,12 @@ do_rm_one() {
     return 1
   fi
 
+  # The gate runs FIRST: when records live under a non-empty directory,
+  # the refusal that matters is the one listing them, not the bare
+  # "directory is not empty" -- otherwise the operator reaches for
+  # --recursive having never seen the blast radius.
+  subtree_gate rm "$f" || return 1
+
   # A directory with entries needs --recursive. The helper double-checks,
   # but refusing here means the window never opens at all.
   if [ -d "$f" ] && [ ! -L "$f" ] && [ "$OPT_RECURSIVE" -eq 0 ]; then
@@ -2132,8 +2138,6 @@ do_rm_one() {
       return 1
     fi
   fi
-
-  subtree_gate rm "$f" || return 1
 
   local what="entry"
   if [ -d "$f" ] && [ ! -L "$f" ]; then
@@ -2586,8 +2590,20 @@ EOF
 }
 
 do_status_one() {
-  local f="$1"
-  f="$(readlink -f "$f")" || { echo "cannot resolve $1" >&2; return 1; }
+  local f="$1" resolved
+  # readlink -f fails on a path that no longer exists -- which is exactly
+  # the expected condition of a retired or suspended record. Fall back to
+  # the path as typed (absolute only) so those records stay reachable by
+  # name; records are keyed by the canonical path captured at lock time,
+  # so the typed absolute path is the same key in the ordinary case.
+  if resolved="$(readlink -f "$f" 2>/dev/null)"; then
+    f="$resolved"
+  else
+    case "$f" in
+      /*) ;;
+      *) echo "cannot resolve $1" >&2; return 1 ;;
+    esac
+  fi
   snap_paths "$f"
   local leaf_meta="$META" rc=0
   print_chain "$f" || rc=1
