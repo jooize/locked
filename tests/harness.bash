@@ -476,7 +476,7 @@ ok   "listing names the locked leaf"     grep -qF "✓  $CFG (content uchg)" "$P
 ok   "listing names the home anchor"     grep -qF "✓  $FAKE_HOME (anchor sappnd)" "$POOL"
 ok   "unlock dir to expose its state"    locked unlock "$CD"
 locked status >"$POOL" 2>&1
-ok   "listing marks the unlocked node"   grep -qF "○  $CD (content, unlocked)" "$POOL"
+ok   "listing marks the unlocked node"   grep -qF "!  $CD (content, unlocked)" "$POOL"
 ok   "relock dir after the listing"      locked lock --yes "$CD"
 
 note "== cli: pool permissions =="
@@ -699,6 +699,31 @@ deny "raw delete blocked by an sappnd parent"  as_user rm -f -- "$RMD/victim2.tx
 ok   "locked rm works under sappnd too"        locked rm --yes "$RMD/victim2.txt"
 check "sappnd restored after rm"               "sappnd" "$(flags_of "$RMD")"
 chflags -- nosappnd "$RMD"
+
+note "== batch grammar: [n/N] counters, summary tail, per-item failure =="
+# terminal-output batch rules: a counter per item, one summary tail, and a
+# failed (or declined) item affects only itself -- the rest still run.
+as_user /bin/sh -c "echo b1 > '$RMD/b1.txt'; echo b3 > '$RMD/b3.txt'"
+chflags -- uappnd "$RMD"
+BRC=0
+locked rm --yes "$RMD/b1.txt" "$RMD/missing.txt" "$RMD/b3.txt" >"$OUTF" 2>&1 || BRC=$?
+check "mixed batch exits 3 (partial failure)"  "3" "$BRC"
+deny "batch item 1 removed"                    test -e "$RMD/b1.txt"
+deny "batch item 3 removed after the failure"  test -e "$RMD/b3.txt"
+ok   "batch prints [1/3] counter"              grep -qF "[1/3] $RMD/b1.txt" "$OUTF"
+ok   "batch prints [3/3] counter"              grep -qF "[3/3] $RMD/b3.txt" "$OUTF"
+ok   "batch summary tail names the counts"     grep -qxF "2 removed, 0 declined, 1 failed" "$OUTF"
+as_user /bin/sh -c "echo b4 > '$RMD/b4.txt'; echo b5 > '$RMD/b5.txt'"
+BRC=0
+locked rm --yes "$RMD/b4.txt" "$RMD/b5.txt" >"$OUTF" 2>&1 || BRC=$?
+check "clean batch exits 0"                    "0" "$BRC"
+ok   "clean batch summary"                     grep -qxF "2 removed, 0 declined, 0 failed" "$OUTF"
+BRC=0
+locked rm --yes "$RMD/single-missing.txt" >"$OUTF" 2>&1 || BRC=$?
+check "single-path failure still exits 3"      "3" "$BRC"
+deny "single-path invocation has no counter"   grep -q '^\[1/1\]' "$OUTF"
+deny "single-path invocation has no summary"   grep -q 'declined, .* failed' "$OUTF"
+chflags -- nouappnd "$RMD"
 
 note "== mediated rm: --recursive =="
 TREE="$RMD/tree"

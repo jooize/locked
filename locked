@@ -58,6 +58,56 @@ VERSION=0.5.0
 : "${LOCKED_VERIFY_PLIST:=/Library/LaunchDaemons/locked.verify.plist}"
 : "${LOCKED_VERIFY_INTERVAL:=900}"
 
+# ---- palette ---------------------------------------------------------------
+#
+# Semantic color roles (terminal-output framework): bold magenta = the one
+# subject the y/N is about, cyan = identifiers and commands, yellow =
+# attention (notes, drift, aborts), green/red = verdict glyphs and
+# refusals, dim = meta, bold = the decision sentence and structure.
+#
+# Gated PER STREAM: C_* follows stdout, E_* follows stderr, so a piped
+# stdout stays byte-identical for anything parsing it while an alarm on the
+# tty keeps its color -- and the other way around. NO_COLOR
+# (https://no-color.org) disables both. Disabled color degrades to empty
+# strings, never garbage.
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_OFF=$'\033[0m' C_B=$'\033[1m' C_DIM=$'\033[2m'
+  C_RED=$'\033[31m' C_GRN=$'\033[32m' C_YEL=$'\033[33m'
+  C_CYN=$'\033[36m' C_MAG=$'\033[35m' C_BLU=$'\033[1;34m'
+  DIFF_COLOR=always
+else
+  C_OFF='' C_B='' C_DIM='' C_RED='' C_GRN='' C_YEL='' C_CYN='' C_MAG='' C_BLU=''
+  DIFF_COLOR=never
+fi
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  E_OFF=$'\033[0m' E_B=$'\033[1m' E_DIM=$'\033[2m'
+  E_RED=$'\033[31m' E_GRN=$'\033[32m' E_YEL=$'\033[33m'
+  E_CYN=$'\033[36m' E_MAG=$'\033[35m' E_BLU=$'\033[1;34m'
+else
+  E_OFF='' E_B='' E_DIM='' E_RED='' E_YEL='' E_GRN='' E_CYN='' E_MAG='' E_BLU=''
+fi
+
+# Palette for a function whose stdout the CALL SITE may redirect
+# (status_row inside a block piped to stderr, cmd_rows ... >&2): testing
+# fd 1 here, inside the function, sees the real destination, so one
+# function serves both streams without knowing which one it is on.
+set_pal() {
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    P_OFF=$'\033[0m' P_B=$'\033[1m' P_DIM=$'\033[2m'
+    P_RED=$'\033[31m' P_GRN=$'\033[32m' P_YEL=$'\033[33m'
+    P_CYN=$'\033[36m' P_MAG=$'\033[35m' P_BLU=$'\033[1;34m'
+  else
+    P_OFF='' P_B='' P_DIM='' P_RED='' P_GRN='' P_YEL='' P_CYN='' P_MAG='' P_BLU=''
+  fi
+}
+set_pal   # initialize for set -u; callers on a redirected fd re-run it
+
+# The one bold-magenta token per decision screen -- the subject the y/N is
+# about. Emits a re-bold after its own reset so it can sit inside the bold
+# prompt sentence without turning the tail plain. Stderr palette: prompts
+# live there.
+subj() { printf '%s%s%s%s' "$E_B$E_MAG" "$1" "$E_OFF" "$E_B"; }
+
 usage() {
   cat <<EOF
 usage: sudo locked <action> [options] [args]
@@ -251,7 +301,9 @@ confirm() {
     return 1
   fi
   local reply
-  printf '%s [y/N] ' "$1" >&2
+  # Bold carries the decision (terminal-output): the whole sentence,
+  # `[y/N]` included, is the authoritative register of this screen.
+  printf '%s%s [y/N]%s ' "$E_B" "$1" "$E_OFF" >&2
   IFS= read -r reply
   case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
@@ -264,7 +316,7 @@ confirm_hard() {
     return 1
   fi
   local reply
-  printf '%s [y/N] ' "$1" >&2
+  printf '%s%s [y/N]%s ' "$E_B" "$1" "$E_OFF" >&2
   IFS= read -r reply
   case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
 }
@@ -277,11 +329,14 @@ check_reseal_identity() { # <path> <metafile>
   prev_id="$(meta_field "$meta" id)"
   cur_id="$(node_id "$n")"
   [ "$cur_id" = "$prev_id" ] && return 0
-  echo "WARNING: $n was REPLACED while unlocked (dev/ino $prev_id -> $cur_id)." >&2
-  echo "         If you did not swap this node yourself, STOP and investigate" >&2
-  echo "         (compare against the snapshot; check: log show --predicate" >&2
-  echo "         'eventMessage CONTAINS \"locked:\"' --last 1h)." >&2
-  confirm_hard "Re-seal the replaced node $n anyway?"
+  # An alarm can fire anywhere, so it owns one leading blank line.
+  echo >&2
+  echo "${E_RED}${E_B}!!! $n was REPLACED while unlocked !!!${E_OFF}" >&2
+  echo "    dev/ino $prev_id -> $cur_id" >&2
+  echo "    If you did not swap this node yourself, STOP and investigate" >&2
+  echo "    (compare against the snapshot; check: ${E_CYN}log show --predicate" >&2
+  echo "    'eventMessage CONTAINS \"locked:\"' --last 1h${E_OFF})." >&2
+  confirm_hard "Re-seal the replaced node $(subj "$n") anyway?"
 }
 
 # ---- shared helpers --------------------------------------------------------
@@ -300,13 +355,13 @@ verify_root_owned_path() {
   owner="$(stat -f '%Su:%Sg' "$path")"
   mode="$(stat -f '%OLp' "$path")"
   if [ "${owner%%:*}" != "root" ]; then
-    echo "ERROR: $path is owned $owner, expected root owner" >&2
+    echo "${E_RED}${E_B}ERROR:${E_OFF} $path is owned $owner, expected root owner" >&2
     return 1
   fi
   case "$mode" in
     755|750|700|555|550|500) ;;
     *)
-      echo "ERROR: $path has mode $mode, expected 755 or stricter" >&2
+      echo "${E_RED}${E_B}ERROR:${E_OFF} $path has mode $mode, expected 755 or stricter" >&2
       return 1
       ;;
   esac
@@ -323,14 +378,14 @@ verify_root_owned_file() {
   local path="$1" owner mode
   owner="$(stat -f '%Su' "$path")"
   if [ "$owner" != "root" ]; then
-    echo "ERROR: $path is owned by $owner, expected root owner" >&2
+    echo "${E_RED}${E_B}ERROR:${E_OFF} $path is owned by $owner, expected root owner" >&2
     return 1
   fi
   mode="$(printf '%03d' "$(stat -f '%OLp' "$path")")"
   mode="${mode#"${mode%???}"}"
   case "${mode:1:1}${mode:2:1}" in
     *[2367]*)
-      echo "ERROR: $path has mode $mode; group/other write must be off" >&2
+      echo "${E_RED}${E_B}ERROR:${E_OFF} $path has mode $mode; group/other write must be off" >&2
       return 1
       ;;
   esac
@@ -484,7 +539,7 @@ do_setup() {
   # and group, digest-pinned sudoers, verify daemon. Refuse rather than
   # fight the declarative config; a rebuild is the whole setup there.
   if nix_managed; then
-    echo "ERROR: this locked is nix-managed; setup here is declarative." >&2
+    echo "${E_RED}${E_B}ERROR:${E_OFF} this locked is nix-managed; setup here is declarative." >&2
     echo "       Change the nix module config (security.locked) and rebuild" >&2
     echo "       instead. Standalone setup remains available by running" >&2
     echo "       ./locked setup from a repo checkout." >&2
@@ -639,7 +694,7 @@ verify_ancestor() {
     local owner
     owner="$(stat -f '%Su' "$p")"
     [ "$owner" = "root" ] && return 0
-    echo "ERROR: $p is a symlink owned by $owner, expected root" >&2
+    echo "${E_RED}${E_B}ERROR:${E_OFF} $p is a symlink owned by $owner, expected root" >&2
     return 1
   fi
   if [ "$p" = "/nix/store" ]; then
@@ -647,7 +702,7 @@ verify_ancestor() {
     owner="$(stat -f '%Su' "$p")"
     mode="$(stat -f '%OMp%OLp' "$p")"
     [ "$owner" = "root" ] && [ "$mode" = "1775" ] && return 0
-    echo "ERROR: /nix/store is owned $owner mode $mode, expected root-owned 1775" >&2
+    echo "${E_RED}${E_B}ERROR:${E_OFF} /nix/store is owned $owner mode $mode, expected root-owned 1775" >&2
     return 1
   fi
   verify_root_owned_path "$p"
@@ -690,12 +745,12 @@ verify_install_ancestry || exit 1
 # window it opens is root-held, so a stale answer is the whole exposure.
 verify_helper() {
   if [ ! -f "$LOCKED_HELPER" ]; then
-    echo "ERROR: window helper not found: $LOCKED_HELPER" >&2
+    echo "${E_RED}${E_B}ERROR:${E_OFF} window helper not found: $LOCKED_HELPER" >&2
     echo "       rm, trash and mv need it (nix: rebuild; standalone: build" >&2
     echo "       helper/locked-helper.m and install it root-owned 755)" >&2
     return 1
   fi
-  [ -x "$LOCKED_HELPER" ] || { echo "ERROR: $LOCKED_HELPER is not executable" >&2; return 1; }
+  [ -x "$LOCKED_HELPER" ] || { echo "${E_RED}${E_B}ERROR:${E_OFF} $LOCKED_HELPER is not executable" >&2; return 1; }
   verify_root_owned_file "$LOCKED_HELPER" || return 1
   verify_program_ancestry "$LOCKED_HELPER" || return 1
   local real
@@ -794,7 +849,7 @@ atomic_replace() {
   dst_dev="$(stat -f '%d' "$dst_parent")"
   if [ "$stage_dev" != "$dst_dev" ]; then
     rm -f -- "$tmp"
-    echo "ERROR: $dst is on a different filesystem from $stage_dir; refusing non-atomic mv" >&2
+    echo "${E_RED}${E_B}ERROR:${E_OFF} $dst is on a different filesystem from $stage_dir; refusing non-atomic mv" >&2
     return 1
   fi
   local pflags lifted=""
@@ -810,7 +865,7 @@ atomic_replace() {
   mv -f -- "$tmp" "$dst" || rc=1
   if [ -n "$lifted" ]; then
     chflags -- "$lifted" "$dst_parent" || {
-      echo "ERROR: failed to restore $lifted on $dst_parent -- restore by hand" >&2
+      echo "${E_RED}${E_B}ERROR:${E_OFF} failed to restore $lifted on $dst_parent -- restore by hand" >&2
       rc=1
     }
   fi
@@ -952,7 +1007,7 @@ chain_for() {
       p="$(dirname "$p")"
     else
       verify_root_owned_path "$p" || {
-        echo "ERROR: chain stop node $p is not a trustworthy anchor; refusing" >&2
+        echo "${E_RED}${E_B}ERROR:${E_OFF} chain stop node $p is not a trustworthy anchor; refusing" >&2
         return 1
       }
       break
@@ -972,6 +1027,45 @@ tier_for_ancestor() {
 }
 
 # ---- seal / release primitives ---------------------------------------------
+
+# Diff-witness display, shared by the three diff sites (content relock,
+# anchor relock, edit). Capture FIRST: a diff that fails must abort before
+# its content is presented as reviewable -- exit 1 is "differs", anything
+# above is trouble. Into a temp file, not a variable: a tree diff can be
+# large and hold NULs. Short output prints inline; long output on a tty is
+# announced by a next: gate and paged (less -RF; an early pager quit is not
+# an error), plain cat off-tty. The header starts FLUSH -- the caller owns
+# any blank line before this block -- and the block ends with the diff's
+# own final newline.
+show_diff() { # <label> <path> <diff-cmd>...
+  local label="$1" path="$2" tmp rc=0 lines
+  shift 2
+  tmp="$(mktemp "${TMPDIR:-/tmp}/locked-diff.XXXXXX")" || return 1
+  "$@" >"$tmp" 2>&1 || rc=$?
+  if [ "$rc" -gt 1 ]; then
+    echo "${E_RED}${E_B}ERROR:${E_OFF} diff failed for $path:" >&2
+    cat -- "$tmp" >&2
+    rm -f -- "$tmp"
+    return 1
+  fi
+  set_pal
+  printf -- '%s--- %s: %s ---%s\n' "$P_B" "$label" "$path" "$P_OFF"
+  if [ "$rc" -eq 0 ]; then
+    echo "(no changes)"
+    rm -f -- "$tmp"
+    return 0
+  fi
+  lines="$(wc -l <"$tmp" | tr -d ' ')"
+  if [ -t 0 ] && [ -t 1 ] && [ "$lines" -gt 24 ]; then
+    printf '%snext:%s diff (%s lines); Enter opens it ' "$P_B" "$P_OFF" "$lines"
+    IFS= read -r _ || true
+    /usr/bin/less -RF -- "$tmp" || true
+  else
+    cat -- "$tmp"
+  fi
+  rm -f -- "$tmp"
+  return 0
+}
 
 # seal_content <path>: adopt or relock a content-tier node (file or dir).
 seal_content() {
@@ -998,7 +1092,7 @@ seal_content() {
         log_action lock "$f" skip-already-locked
         return 0
       fi
-      echo "ERROR: $f is marked locked but drifted -- investigate before relocking:" >&2
+      echo "${E_RED}${E_B}ERROR:${E_OFF} $f is marked locked but drifted -- investigate before relocking:" >&2
       verify_node "$f" "$META" "$lock_user" >&2 || true
       return 1
     fi
@@ -1023,24 +1117,26 @@ seal_content() {
     local stray
     stray="$(find "$f" \( ! -user "$target_owner" ! -user "$lock_user" \) -o \( ! -group "$target_group" ! -group "$lock_user" \) 2>/dev/null | head -3)"
     if [ -n "$stray" ]; then
-      echo "ERROR: $f tree has mixed ownership; content tier needs a uniform tree:" >&2
+      echo "${E_RED}${E_B}ERROR:${E_OFF} $f tree has mixed ownership; content tier needs a uniform tree:" >&2
       printf '%s\n' "$stray" | sed 's/^/    /' >&2
       return 1
     fi
   fi
 
   # Diff-witness: snapshot (unlock-time state) vs current, then confirm.
+  # The trailing blank is the composer's: it separates the diff block from
+  # the prompt that decides on it.
   if [ "$is_dir" -eq 0 ] && [ -f "$SNAP" ]; then
     if cmp -s "$SNAP" "$f"; then
       echo "no changes since unlock: $f"
     else
-      printf -- '\n--- diff snapshot -> current: %s ---\n' "$f"
-      diff -u "$SNAP" "$f" || true
+      show_diff 'diff snapshot -> current' "$f" \
+        diff "--color=$DIFF_COLOR" -u "$SNAP" "$f" || return 1
       echo
     fi
   elif [ "$is_dir" -eq 1 ] && [ -d "$SNAPDIR" ]; then
-    printf -- '\n--- diff snapshot -> current: %s ---\n' "$f"
-    diff -ru "$SNAPDIR" "$f" && echo "(no changes)" || true
+    show_diff 'diff snapshot -> current' "$f" \
+      diff "--color=$DIFF_COLOR" -ru "$SNAPDIR" "$f" || return 1
     echo
   else
     echo "adopting into pool (no prior snapshot): $f"
@@ -1051,7 +1147,9 @@ seal_content() {
   if [ "$is_dir" -eq 1 ]; then
     seal_note="uchg recursive"
   fi
-  confirm "Seal $f (tier content, $seal_note)?" || { echo "aborted: $f" >&2; return 2; }
+  confirm "Seal $(subj "$f") (tier content, $seal_note)?" || {
+    echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
+  }
 
   # Baseline snapshot on first adoption so revert always has one.
   if [ "$is_dir" -eq 0 ] && [ ! -f "$SNAP" ]; then
@@ -1084,7 +1182,7 @@ seal_content() {
       "recursive=$is_dir" \
       "state=locked" || return 1
   fi
-  echo "locked: $f (content)"
+  echo "${C_GRN}✓${C_OFF} locked: $f (content)"
   log_action lock "$f" ok
 }
 
@@ -1092,7 +1190,7 @@ seal_content() {
 seal_placement() {
   local d="$1"
   snap_paths "$d"
-  [ -d "$d" ] || { echo "ERROR: placement tier needs a directory: $d" >&2; return 1; }
+  [ -d "$d" ] || { echo "${E_RED}${E_B}ERROR:${E_OFF} placement tier needs a directory: $d" >&2; return 1; }
 
   local owner_now group_now mode_now
   owner_now="$(stat -f '%Su' "$d")"
@@ -1106,13 +1204,15 @@ seal_placement() {
       if verify_node "$d" "$META" "$lock_user" >/dev/null 2>&1; then
         return 0   # chain ancestor already good; stay quiet.
       fi
-      echo "ERROR: $d is marked locked but drifted -- investigate:" >&2
+      echo "${E_RED}${E_B}ERROR:${E_OFF} $d is marked locked but drifted -- investigate:" >&2
       verify_node "$d" "$META" "$lock_user" >&2 || true
       return 1
     fi
     # Re-seal after an unlock ceremony: reapply flag only -- but never
     # silently bless a node that was swapped during the window.
-    check_reseal_identity "$d" "$META" || { echo "aborted: $d" >&2; return 2; }
+    check_reseal_identity "$d" "$META" || {
+      echo "${E_YEL}aborted: $d${E_OFF}" >&2; return 2
+    }
     fset uappnd "$d" || return 1
     if [ "$OPT_DRY" -eq 0 ]; then
       write_meta "$META" \
@@ -1127,17 +1227,17 @@ seal_placement() {
         "recursive=0" \
         "state=locked" || return 1
     fi
-    echo "relocked: $d (placement)"
+    echo "${C_GRN}✓${C_OFF} relocked: $d (placement)"
     log_action lock "$d" ok
     return 0
   fi
 
   if [ "$owner_now" != "$inv" ]; then
-    echo "ERROR: $d owned by $owner_now; placement adoption needs your ownership" >&2
+    echo "${E_RED}${E_B}ERROR:${E_OFF} $d owned by $owner_now; placement adoption needs your ownership" >&2
     return 1
   fi
-  confirm "Provision $d (tier placement: owner ${lock_user}, group-write, uappnd)?" || {
-    echo "aborted: $d" >&2; return 2
+  confirm "Provision $(subj "$d") (tier placement: owner ${lock_user}, group-write, uappnd)?" || {
+    echo "${E_YEL}aborted: $d${E_OFF}" >&2; return 2
   }
   # Ownership to the lock account; the invoker keeps add-rights via the lock
   # group. Flag last.
@@ -1157,7 +1257,7 @@ seal_placement() {
       "recursive=0" \
       "state=locked" || return 1
   fi
-  echo "locked: $d (placement)"
+  echo "${C_GRN}✓${C_OFF} locked: $d (placement)"
   log_action lock "$d" ok
 }
 
@@ -1184,7 +1284,7 @@ seal_anchor() {
       if verify_node "$f" "$META" "$lock_user" >/dev/null 2>&1; then
         return 0
       fi
-      echo "ERROR: $f is marked locked but drifted -- investigate:" >&2
+      echo "${E_RED}${E_B}ERROR:${E_OFF} $f is marked locked but drifted -- investigate:" >&2
       verify_node "$f" "$META" "$lock_user" >&2 || true
       return 1
     fi
@@ -1195,8 +1295,8 @@ seal_anchor() {
       if cmp -s "$SNAP" "$f"; then
         echo "no changes since unlock: $f"
       else
-        printf -- '\n--- diff snapshot -> current: %s ---\n' "$f"
-        diff -u "$SNAP" "$f" || true
+        show_diff 'diff snapshot -> current' "$f" \
+          diff "--color=$DIFF_COLOR" -u "$SNAP" "$f" || return 1
         echo
       fi
     else
@@ -1208,19 +1308,21 @@ seal_anchor() {
   # except by identity -- check it. (Files are covered by the diff above,
   # and atomic-save legitimately changes a file's inode.)
   if [ -f "$META" ] && [ "$is_file" -eq 0 ]; then
-    check_reseal_identity "$f" "$META" || { echo "aborted: $f" >&2; return 2; }
+    check_reseal_identity "$f" "$META" || {
+      echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
+    }
   fi
 
   if [ "$state" = "locked" ] && [ "$prev_flag" != "$flagword" ]; then
     # Tier-internal escalation (sappnd <-> schg) is a normal relock: clear
     # the previous system flag before applying the new one.
-    confirm "Change anchor flag on $f: $prev_flag -> $flagword?" || {
-      echo "aborted: $f" >&2; return 2
+    confirm "Change anchor flag on $(subj "$f"): $prev_flag -> $flagword?" || {
+      echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
     }
     fclear "$prev_flag" "$f" || return 1
   else
-    confirm "Anchor $f ($flagword; ownership unchanged)?" || {
-      echo "aborted: $f" >&2; return 2
+    confirm "Anchor $(subj "$f") ($flagword; ownership unchanged)?" || {
+      echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
     }
   fi
 
@@ -1242,7 +1344,7 @@ seal_anchor() {
       "recursive=0" \
       "state=locked" || return 1
   fi
-  echo "locked: $f (anchor $flagword)"
+  echo "${C_GRN}✓${C_OFF} locked: $f (anchor $flagword)"
   log_action lock "$f" ok
 }
 
@@ -1301,7 +1403,7 @@ release_node() {
       fi
       ;;
     *)
-      echo "ERROR: $f meta has unknown tier '$tier'" >&2
+      echo "${E_RED}${E_B}ERROR:${E_OFF} $f meta has unknown tier '$tier'" >&2
       return 1
       ;;
   esac
@@ -1319,7 +1421,7 @@ release_node() {
       "recursive=$recursive" \
       "state=unlocked" || return 1
   fi
-  echo "unlocked: $f ($tier)"
+  echo "${C_GRN}✓${C_OFF} unlocked: $f ($tier)"
   [ "$tier" = "content" ] && [ "$recursive" != "1" ] && echo "  snapshot: $SNAP"
 
   # Atomic-save hint: if the parent still carries an append/immutable flag,
@@ -1328,9 +1430,9 @@ release_node() {
   pflags="$(flags_of "$(dirname "$f")")"
   case ",$pflags," in
     *,uappnd,*|*,sappnd,*|*,uchg,*|*,schg,*)
-      echo "  note: parent $(dirname "$f") is flagged ($pflags); atomic-save editors"
+      echo "  ${C_YEL}note:${C_OFF} parent $(dirname "$f") is flagged ($pflags); atomic-save editors"
       echo "        (write-then-rename) will fail. In-place edits work, or use:"
-      echo "        sudo locked unlock --chain $f"
+      echo "        ${C_CYN}sudo locked unlock --chain $f${C_OFF}"
       ;;
   esac
   log_action unlock "$f" ok
@@ -1349,7 +1451,7 @@ abs_leaf() { # <path>
   b="$(basename "$p")"
   case "$b" in
     .|..|/)
-      echo "refusing $p: names a directory, not an entry inside one" >&2
+      echo "${E_RED}${E_B}refusing $p:${E_OFF} names a directory, not an entry inside one" >&2
       return 1
       ;;
   esac
@@ -1358,7 +1460,7 @@ abs_leaf() { # <path>
   # Say that here instead of surfacing a bare usage error from inside it.
   case "$b" in
     *$'\t'*|*$'\n'*)
-      echo "refusing $p: the entry name contains a tab or newline" >&2
+      echo "${E_RED}${E_B}refusing $p:${E_OFF} the entry name contains a tab or newline" >&2
       echo "  the window helper refuses those; rename it first" >&2
       return 1
       ;;
@@ -1457,7 +1559,7 @@ reseal_after_window() {
     WINDOW_ALARM=1
     # An alarm can fire anywhere, so it owns one leading blank line.
     echo >&2
-    echo "!!! $n came back with flags '${cur:-none}', expected '$want' !!!" >&2
+    echo "${E_RED}${E_B}!!! $n came back with flags '${cur:-none}', expected '$want' !!!${E_OFF}" >&2
     # -h always: on a symlink it flags the link rather than whatever it
     # points at, and on anything else it changes nothing.
     if chflags -h -- "$want" "$n" 2>/dev/null; then
@@ -1519,18 +1621,18 @@ helper_outcome() { # <verb> <path>
       return 0
       ;;
     2)
-      echo "refused $f: the node the helper opened is not the one recorded" >&2
-      echo "  nothing was changed. Check it, then re-run:  sudo locked status $f" >&2
+      echo "${E_RED}${E_B}refused $f:${E_OFF} the node the helper opened is not the one recorded" >&2
+      echo "  nothing was changed. Check it, then re-run:  ${E_CYN}sudo locked status $f${E_OFF}" >&2
       log_action "$verb" "$f" refuse-identity
       return 1
       ;;
     3)
-      echo "failed $f: the operation did not happen" >&2
+      echo "${E_RED}${E_B}failed $f:${E_OFF} the operation did not happen" >&2
       log_action "$verb" "$f" fail
       return 1
       ;;
     4)
-      echo "ERROR: the window helper refused the request as malformed, or is" >&2
+      echo "${E_RED}${E_B}ERROR:${E_OFF} the window helper refused the request as malformed, or is" >&2
       echo "       not running as root: $LOCKED_HELPER" >&2
       log_action "$verb" "$f" fail-helper
       return 1
@@ -1540,7 +1642,7 @@ helper_outcome() { # <verb> <path>
       # run by the time this prints, so the backstop's own lines are above
       # and say whether re-sealing from the captured word worked.
       echo >&2
-      echo "!!! $f: the helper could not restore the flags it lifted !!!" >&2
+      echo "${E_RED}${E_B}!!! $f: the helper could not restore the flags it lifted !!!${E_OFF}" >&2
       echo "    window left open on: $(helper_line_value window-open)" >&2
       echo "    locked's backstop has already re-applied the flag word it" >&2
       echo "    captured before the call; anything it could not fix is above." >&2
@@ -1553,7 +1655,7 @@ helper_outcome() { # <verb> <path>
     6)
       HELPER_ANOMALY=1
       echo >&2
-      echo "!!! $f: entries other than the target changed inside the window !!!" >&2
+      echo "${E_RED}${E_B}!!! $f: entries other than the target changed inside the window !!!${E_OFF}" >&2
       # The name field arrives backslash-escaped by the helper, precisely so
       # a hostile filename cannot forge one of these lines. Printed as it
       # came: un-escaping here would hand that forgery back.
@@ -1565,7 +1667,7 @@ helper_outcome() { # <verb> <path>
       return 0
       ;;
     *)
-      echo "ERROR: the window helper exited $HELPER_RC, which locked does not" >&2
+      echo "${E_RED}${E_B}ERROR:${E_OFF} the window helper exited $HELPER_RC, which locked does not" >&2
       echo "       know how to read. Treating $f as unchanged." >&2
       log_action "$verb" "$f" fail-unknown
       return 1
@@ -1619,7 +1721,7 @@ rekey_record() { # <oldpath> <newpath>
   [ "$oldenc" != "$newenc" ] || return 0
   for suffix in meta snap snapdir attic; do
     if [ -e "$USER_SNAPSHOTS/$newenc.$suffix" ]; then
-      echo "ERROR: a record already exists for $new; refusing to merge into it" >&2
+      echo "${E_RED}${E_B}ERROR:${E_OFF} a record already exists for $new; refusing to merge into it" >&2
       return 1
     fi
   done
@@ -1674,7 +1776,7 @@ subtree_gate() { # <verb> <target>
     other="$(pool_records_under "$udir" "$target")"
     [ -n "$other" ] || continue
     if [ "$foreign" -eq 0 ]; then
-      echo "refusing $verb $target: it holds locked records that are not yours" >&2
+      echo "${E_RED}${E_B}refusing $verb $target:${E_OFF} it holds locked records that are not yours" >&2
       foreign=1
     fi
     echo "  pool of $uname:" >&2
@@ -1682,7 +1784,7 @@ subtree_gate() { # <verb> <target>
   done
   if [ "$foreign" -eq 1 ]; then
     echo >&2
-    echo "note: locked will not rewrite another user's record on their behalf," >&2
+    echo "${E_YEL}note:${E_OFF} locked will not rewrite another user's record on their behalf," >&2
     echo "      and --recursive does not widen that. They release theirs first." >&2
     log_action "$verb" "$target" refuse-foreign-records
     return 1
@@ -1706,9 +1808,10 @@ EOF
     return 0
   fi
   {
-    echo "refusing $verb $target: locked records live under it"
+    set_pal
+    echo "${P_RED}${P_B}refusing $verb $target:${P_OFF} locked records live under it"
     echo
-    echo "records under $target:"
+    echo "${P_B}records under $target:${P_OFF}"
     while IFS= read -r p; do
       [ -n "$p" ] || continue
       status_row "$p" brief || true
@@ -1716,7 +1819,7 @@ EOF
 $descendants
 EOF
     echo
-    echo "note: acting on it takes those paths with it, so their records"
+    echo "${P_YEL}note:${P_OFF} acting on it takes those paths with it, so their records"
     echo "      change too."
     cmd_rows "      " \
       "sudo locked $verb --recursive $target" "proceeds and updates them"
@@ -1787,16 +1890,49 @@ blocking_ancestor() { # <path>
   done
 }
 
+# Role-color one command string (terminal-output command-line sub-grammar):
+# `sudo` bold, the program token bold cyan (a dir part, were one ever
+# shown, plain cyan around a bold basename), option flags bold blue --
+# marked LEXICALLY, the token starts with `-` -- paths cyan, a <placeholder>
+# dim, everything else plain. Tokens come from splitting on the single
+# spaces the call sites composed the string with; a spaced path would
+# merely split its color, never its bytes -- the displayed text is exactly
+# the input. Uses the P_* palette: callers run set_pal first.
+cmd_disp() { # <command-string>
+  local IFS=' ' out="" sep="" tok prog_pending=1
+  for tok in $1; do
+    case "$tok" in
+      sudo)  out="$out$sep$P_B$tok$P_OFF" ;;
+      -*)    out="$out$sep$P_BLU$tok$P_OFF" ;;
+      '<'*'>') out="$out$sep$P_DIM$tok$P_OFF" ;;
+      */*)   out="$out$sep$P_CYN$tok$P_OFF" ;;
+      *)
+        if [ "$prog_pending" -eq 1 ]; then
+          out="$out$sep$P_B$P_CYN$tok$P_OFF"
+          prog_pending=0
+        else
+          out="$out$sep$tok"
+        fi
+        ;;
+    esac
+    sep=' '
+  done
+  printf '%s' "$out"
+}
+
 # Aligned command/description rows: the gutter is the longest command plus
 # two spaces, the same docopt convention the usage text follows. Paths make
 # these commands variable-length, so the width is computed, not guessed --
 # and when the widest row would not fit 80 columns the description drops to
 # its own continuation line instead of running off the screen. That is also
 # docopt: a pattern too long to align takes its description below it.
-# Args alternate <command> <description>; bash 3.2 has no stride loop, so
-# the positional list is walked by index.
+# Width math runs on the PLAIN string before color is wrapped around it
+# (escape bytes would count against %-*s); descriptions render dim -- they
+# are explanation, not command. Args alternate <command> <description>;
+# bash 3.2 has no stride loop, so the positional list is walked by index.
 cmd_rows() { # <indent> [<command> <description>]...
   local indent="$1" w=0 dw=0 i j c d
+  set_pal
   shift
   i=1
   while [ "$i" -le "$#" ]; do
@@ -1815,9 +1951,11 @@ cmd_rows() { # <indent> [<command> <description>]...
     c="${!i}"
     d="${!j}"
     if [ "$wrap" -eq 1 ]; then
-      printf '%s%s\n%s    %s\n' "$indent" "$c" "$indent" "$d"
+      printf '%s%s\n%s    %s%s%s\n' "$indent" "$(cmd_disp "$c")" \
+        "$indent" "$P_DIM" "$d" "$P_OFF"
     else
-      printf '%s%-*s  %s\n' "$indent" "$w" "$c" "$d"
+      printf '%s%s%*s%s%s%s\n' "$indent" "$(cmd_disp "$c")" \
+        $(( w - ${#c} + 2 )) '' "$P_DIM" "$d" "$P_OFF"
     fi
     i=$((i + 2))
   done
@@ -1831,7 +1969,8 @@ cmd_rows() { # <indent> [<command> <description>]...
 explain_blocker() { # <node> <flag> [<command> <description>]...
   local n="$1" fl="$2"
   shift 2
-  echo "note: $n is flagged $fl, so entries under it cannot be removed"
+  set_pal
+  echo "${P_YEL}note:${P_OFF} $n is flagged $fl, so entries under it cannot be removed"
   echo "      or renamed while it is sealed."
   snap_paths "$n"
   if [ -f "$META" ] && [ "$(meta_field "$META" state)" = "locked" ]; then
@@ -1883,7 +2022,7 @@ do_lock_one() {
     fi
   fi
   if [ "$under_ssh" -eq 1 ] && [ "$leaf_tier" != "anchor" ]; then
-    echo "ERROR: $f: ~/.ssh and its files take the anchor tier only -- sshd" >&2
+    echo "${E_RED}${E_B}ERROR:${E_OFF} $f: ~/.ssh and its files take the anchor tier only -- sshd" >&2
     echo "       StrictModes and the ssh client's config check require" >&2
     echo "       user-or-root ownership, which content/placement would flip" >&2
     return 1
@@ -1943,7 +2082,7 @@ do_unlock_one() {
     done 3<<EOF
 $chain
 EOF
-    echo "chain released; relock with: sudo locked lock $f"
+    echo "chain released; relock with: ${C_CYN}sudo locked lock $f${C_OFF}"
   fi
 }
 
@@ -2008,11 +2147,11 @@ do_edit_one() {
   cp -- "$copy" "$stage" || { rm -f -- "$stage"; rm -rf -- "$editdir"; return 1; }
   rm -rf -- "$editdir"
 
-  printf -- '\n--- diff current -> edited: %s ---\n' "$f"
-  diff -u "$f" "$stage" || true
+  show_diff 'diff current -> edited' "$f" \
+    diff "--color=$DIFF_COLOR" -u "$f" "$stage" || { rm -f -- "$stage"; return 1; }
   echo
-  confirm "Install and reseal $f?" || {
-    echo "aborted: $f (edit discarded)" >&2
+  confirm "Install and reseal $(subj "$f")?" || {
+    echo "${E_YEL}aborted: $f (edit discarded)${E_OFF}" >&2
     rm -f -- "$stage"
     return 2
   }
@@ -2037,7 +2176,7 @@ do_edit_one() {
     "id=$(node_id "$f")" \
     "recursive=0" \
     "state=locked" || return 1
-  echo "edited and resealed: $f"
+  echo "${C_GRN}✓${C_OFF} edited and resealed: $f"
   log_action edit "$f" ok
 }
 
@@ -2100,7 +2239,7 @@ do_revert_one() {
   else
     run atomic_replace "$SNAP" "$f" "${owner:-$inv}:${group:-staff}" "$mode" || return 1
   fi
-  echo "reverted: $f from snapshot"
+  echo "${C_GRN}✓${C_OFF} reverted: $f from snapshot"
   echo "  discarded content saved to: $ATTIC"
   log_action revert "$f" ok
 }
@@ -2148,8 +2287,8 @@ do_rm_one() {
       what="directory and everything under it"
     fi
   fi
-  confirm "Permanently remove $f ($what)?" || {
-    echo "aborted: $f" >&2; return 2
+  confirm "Permanently remove $(subj "$f") ($what)?" || {
+    echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
   }
 
   local parent args=()
@@ -2166,7 +2305,7 @@ do_rm_one() {
   helper_outcome rm "$f" || return 1
 
   local rc=0
-  echo "removed: $f"
+  echo "${C_GRN}✓${C_OFF} removed: $f"
   apply_subtree_effect rm "$f" || rc=1
   if [ "$HELPER_ANOMALY" -eq 1 ]; then
     rc=3
@@ -2217,7 +2356,7 @@ do_trash_one() {
   # The trash is a per-user destination. With no invoking user there is no
   # bin to put anything in, and root's own would be the wrong answer.
   if [ -z "$inv" ]; then
-    echo "refusing trash: no invoking user, so there is no bin to trash into" >&2
+    echo "${E_RED}${E_B}refusing trash:${E_OFF} no invoking user, so there is no bin to trash into" >&2
     echo "  use rm if the node really should be removed outright" >&2
     return 1
   fi
@@ -2225,7 +2364,7 @@ do_trash_one() {
   uid="$(id -u "$inv")"
   gid="$(id -g "$inv")"
   if [ "$uid" = "0" ]; then
-    echo "refusing trash: the invoker is root, whose bin is not where you" >&2
+    echo "${E_RED}${E_B}refusing trash:${E_OFF} the invoker is root, whose bin is not where you" >&2
     echo "  meant this to go. Run it as yourself, or use rm." >&2
     return 1
   fi
@@ -2240,7 +2379,7 @@ do_trash_one() {
   # Placement-tier parents are group-writable and the invoker is in that
   # group, so the ordinary pool cases pass this.
   if ! user_can_write_dir "$inv" "$parent"; then
-    echo "refusing trash $f: $inv cannot write $parent" >&2
+    echo "${E_RED}${E_B}refusing trash $f:${E_OFF} $inv cannot write $parent" >&2
     echo "  The trash service runs as you, not as root, so the move out of" >&2
     echo "  that directory needs your own rights on it -- releasing the flag" >&2
     echo "  does not grant them." >&2
@@ -2263,14 +2402,14 @@ do_trash_one() {
 
   local bin rc=0
   bin="$(helper_line_value binurl)"
-  echo "trashed: $f"
+  echo "${C_GRN}✓${C_OFF} trashed: $f"
   if [ -n "$bin" ]; then
     echo "  bin: $bin"
   elif [ "$OPT_DRY" -eq 0 ]; then
     # Without the destination the suspension cannot be finalized later,
     # and Put Back would resurrect an unsealed node with nothing watching.
     echo >&2
-    echo "!!! $f: the helper reported no bin location !!!" >&2
+    echo "${E_RED}${E_B}!!! $f: the helper reported no bin location !!!${E_OFF}" >&2
     echo "    The record is suspended without one, so verify cannot finalize" >&2
     echo "    it. Find where it went and re-key or tombstone the record." >&2
     rc=3
@@ -2294,7 +2433,7 @@ do_mv() { # <old> <new>
     return 1
   fi
   if [ -e "$new" ] || [ -L "$new" ]; then
-    echo "refusing: $new already exists; locked mv never clobbers" >&2
+    echo "${E_RED}${E_B}refusing:${E_OFF} $new already exists; locked mv never clobbers" >&2
     log_action mv "$old" refuse-exists
     return 1
   fi
@@ -2302,14 +2441,14 @@ do_mv() { # <old> <new>
   oldparent="$(dirname "$old")"
   newparent="$(dirname "$new")"
   if [ ! -d "$newparent" ]; then
-    echo "refusing: $newparent is not a directory" >&2
+    echo "${E_RED}${E_B}refusing:${E_OFF} $newparent is not a directory" >&2
     return 1
   fi
   # Rename cannot cross filesystems, and a copy+delete would drop the BSD
   # flags and xattrs this tool exists to keep. Say so here rather than
   # letting an EXDEV from inside the window explain it later.
   if [ "$(stat -f '%d' "$oldparent")" != "$(stat -f '%d' "$newparent")" ]; then
-    echo "refusing: $old and $new are on different filesystems" >&2
+    echo "${E_RED}${E_B}refusing:${E_OFF} $old and $new are on different filesystems" >&2
     echo "  a copy would drop flags and xattrs, so locked will not do it" >&2
     log_action mv "$old" refuse-xdev
     return 1
@@ -2340,7 +2479,7 @@ do_mv() { # <old> <new>
   helper_outcome mv "$old" || return 1
 
   local rc=0
-  echo "moved: $old -> $new"
+  echo "${C_GRN}✓${C_OFF} moved: $old -> $new"
   # A rename keeps the inode, so no recorded field changes -- only the key.
   rekey_subtree "$old" "$new" || rc=1
   if [ "$HELPER_ANOMALY" -eq 1 ]; then
@@ -2365,13 +2504,13 @@ do_rekey() { # <old> <new>
   fi
   want="$(meta_field "$META" id)"
   if [ ! -e "$new" ] && [ ! -L "$new" ]; then
-    echo "refusing: $new does not exist" >&2
+    echo "${E_RED}${E_B}refusing:${E_OFF} $new does not exist" >&2
     cmd_rows "  " "sudo locked tombstone $old" "records it as gone instead" >&2
     return 1
   fi
   cur="$(node_id "$new")"
   if [ "$cur" != "$want" ]; then
-    echo "refusing: $new is dev/ino $cur, but the record for $old holds $want" >&2
+    echo "${E_RED}${E_B}refusing:${E_OFF} $new is dev/ino $cur, but the record for $old holds $want" >&2
     echo "  The node at $new is not the one that record describes, so re-keying" >&2
     echo "  would attach its snapshot and flag history to a different file." >&2
     cmd_rows "  " "sudo locked tombstone $old" "if the recorded node is really gone" >&2
@@ -2407,15 +2546,15 @@ do_tombstone_one() {
     return 0
   fi
   if [ "$state" = "suspended" ]; then
-    echo "note: $f is suspended, trashed to $(meta_field "$META" bin)."
+    echo "${C_YEL}note:${C_OFF} $f is suspended, trashed to $(meta_field "$META" bin)."
     echo "      Tombstoning asserts it is gone for good, so verify stops"
     echo "      watching for a Put Back."
   fi
-  confirm "Record $f as gone (retired, asserted by $inv)?" || {
-    echo "aborted: $f" >&2; return 2
+  confirm "Record $(subj "$f") as gone (retired, asserted by $inv)?" || {
+    echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
   }
   retire_record "$f" assertion || return 1
-  echo "tombstoned: $f"
+  echo "${C_GRN}✓${C_OFF} tombstoned: $f"
   log_action tombstone "$f" ok
 }
 
@@ -2434,21 +2573,23 @@ do_why_one() {
     n="$(dirname "$n")"
   done
 
-  echo "why $f:"
+  set_pal
+  echo "${P_B}why $f:${P_OFF}"
   local fl marker owner record parts
   for n in "${nodes[@]}"; do
     if [ ! -e "$n" ] && [ ! -L "$n" ]; then
-      echo "    -  $n (does not exist)"
+      echo "    ${P_DIM}-${P_OFF}  $n ${P_DIM}(does not exist)${P_OFF}"
       continue
     fi
     fl="$(flags_of "$n" 2>/dev/null)" || fl=""
     # The marker answers one question: does this node constrain what is
-    # under it? ! blocks removal and rename, ~ carries some other flag,
-    # - carries none. What the record says goes in the parenthetical.
+    # under it? ! blocks removal and rename (yellow: attention), ~ carries
+    # some other flag, - carries none (dim: absence). What the record says
+    # goes in the parenthetical.
     case ",$fl," in
-      *,sappnd,*|*,schg,*|*,uappnd,*|*,uchg,*) marker="!" ;;
-      ,,) marker="-" ;;
-      *) marker="~" ;;
+      *,sappnd,*|*,schg,*|*,uappnd,*|*,uchg,*) marker="${P_YEL}!${P_OFF}" ;;
+      ,,) marker="${P_DIM}-${P_OFF}" ;;
+      *) marker="${P_YEL}~${P_OFF}" ;;
     esac
     owner="$(stat -f '%Su:%Sg' "$n" 2>/dev/null)" || owner="unreadable"
     record=""
@@ -2461,7 +2602,7 @@ do_why_one() {
     parts="$owner"
     [ -n "$fl" ] && parts="$parts, $fl"
     [ -n "$record" ] && parts="$parts; $record"
-    echo "    $marker  $n ($parts)"
+    echo "    $marker  $n ${P_DIM}($parts)${P_OFF}"
   done
 
   # Two constraints, reported separately because their remedies differ: an
@@ -2478,13 +2619,13 @@ do_why_one() {
     echo
     snap_paths "$f"
     if [ -f "$META" ] && [ "$(meta_field "$META" state)" = "locked" ]; then
-      echo "note: $f is immutable ($self_block); its contents cannot change"
+      echo "${P_YEL}note:${P_OFF} $f is immutable ($self_block); its contents cannot change"
       echo "      while it is sealed."
       cmd_rows "      " \
         "sudo locked edit $f" "edits it without ever leaving it unlocked" \
         "sudo locked unlock $f" "releases it until the next lock"
     else
-      echo "note: $f is immutable ($self_block), and locked has no record of"
+      echo "${P_YEL}note:${P_OFF} $f is immutable ($self_block), and locked has no record of"
       echo "      that flag -- it was set outside the pool."
       cmd_rows "      " \
         "sudo chflags no$self_block $f" "releases it (re-apply it yourself after)"
@@ -2508,7 +2649,7 @@ do_why_one() {
     echo
     # Precisely what was measured, and no more: this walk reads file flags,
     # so ordinary permissions are still free to say no.
-    echo "note: no file flag on this chain stops $f from being"
+    echo "${P_YEL}note:${P_OFF} no file flag on this chain stops $f from being"
     echo "      changed, renamed or removed. Ordinary permissions still"
     echo "      apply -- the owners are listed above."
   fi
@@ -2516,18 +2657,20 @@ do_why_one() {
 
 # One node, one row, in the layout every listing in this script shares:
 # four spaces, a verdict glyph, the path, then the record in parentheses.
-# Markers: ✓ sealed and clean, ✗ drifted, ○ deliberately unlocked,
-# ~ recorded but no longer enforced (retired, suspended), - not in pool.
-# `brief` collapses drift detail to a pointer, for the pool listing.
-# Sets STATUS_ROW_POOL so a caller can tell "clean" from "no record".
-# Returns 1 on drift. Clobbers the snap_paths globals.
+# Markers (terminal-output verdict set): ✓ green sealed and clean, ✗ red
+# drifted, ! yellow deliberately unlocked (protection is OFF -- the row to
+# notice), ~ yellow recorded but no longer enforced (retired, suspended),
+# - dim not in pool. `brief` collapses drift detail to a pointer, for the
+# pool listing. Sets STATUS_ROW_POOL so a caller can tell "clean" from
+# "no record". Returns 1 on drift. Clobbers the snap_paths globals.
 STATUS_ROW_POOL=0
 status_row() { # <path> [brief]
   local n="$1" brief="${2:-}" tier state
   STATUS_ROW_POOL=0
+  set_pal
   snap_paths "$n"
   if [ ! -f "$META" ]; then
-    echo "    -  $n (not in pool)"
+    echo "    ${P_DIM}-${P_OFF}  $n ${P_DIM}(not in pool)${P_OFF}"
     return 0
   fi
   STATUS_ROW_POOL=1
@@ -2535,27 +2678,27 @@ status_row() { # <path> [brief]
   state="$(meta_field "$META" state)"
   case "$state" in
     unlocked)
-      echo "    ○  $n ($tier, unlocked)"
+      echo "    ${P_YEL}!${P_OFF}  $n ${P_DIM}($tier, unlocked)${P_OFF}"
       return 0
       ;;
     retired)
-      echo "    ~  $n ($tier, retired via $(meta_field "$META" via) $(meta_field "$META" at))"
+      echo "    ${P_YEL}~${P_OFF}  $n ${P_DIM}($tier, retired via $(meta_field "$META" via) $(meta_field "$META" at))${P_OFF}"
       return 0
       ;;
     suspended)
-      echo "    ~  $n ($tier, suspended $(meta_field "$META" at))"
+      echo "    ${P_YEL}~${P_OFF}  $n ${P_DIM}($tier, suspended $(meta_field "$META" at))${P_OFF}"
       echo "         bin: $(meta_field "$META" bin)"
       return 0
       ;;
   esac
   if verify_node "$n" "$META" "$lock_user" >/dev/null 2>&1; then
-    echo "    ✓  $n ($tier $(meta_field "$META" flag))"
+    echo "    ${P_GRN}✓${P_OFF}  $n ${P_DIM}($tier $(meta_field "$META" flag))${P_OFF}"
     return 0
   fi
   if [ "$brief" = "brief" ]; then
-    echo "    ✗  $n ($tier $(meta_field "$META" flag)) DRIFT -- details: sudo locked status $n"
+    echo "    ${P_RED}✗${P_OFF}  $n ${P_DIM}($tier $(meta_field "$META" flag))${P_OFF} ${P_YEL}DRIFT${P_OFF} -- details: ${P_CYN}sudo locked status $n${P_OFF}"
   else
-    echo "    ✗  $n ($tier) DRIFT:"
+    echo "    ${P_RED}✗${P_OFF}  $n ${P_DIM}($tier)${P_OFF} ${P_YEL}DRIFT:${P_OFF}"
     verify_node "$n" "$META" "$lock_user" | sed 's/^/      /' || true
   fi
   return 1
@@ -2568,11 +2711,12 @@ CHAIN_ANY=0
 print_chain() { # <path> [brief]
   local f="$1" brief="${2:-}" chain nodes=() a rc=0
   CHAIN_ANY=0
-  echo "chain for $f:"
+  set_pal
+  echo "${P_B}chain for $f:${P_OFF}"
   if chain="$(chain_for "$f" 2>/dev/null)"; then
     :
   else
-    echo "  ✗ chain stop node is not root-owned (see: sudo locked lock $f)"
+    echo "  ${P_RED}✗${P_OFF} chain stop node is not root-owned (see: ${P_CYN}sudo locked lock $f${P_OFF})"
     chain="$(dirname "$f")"
   fi
   # Root-first for readability.
@@ -2619,7 +2763,7 @@ do_status_one() {
 # checkmark overclaim; root output stays untouched.
 status_unpriv_note() {
   [ "$EUID" -eq 0 ] && return 0
-  echo "note: without sudo, recursive trees get leaf checks only; sudo locked status is authoritative" >&2
+  echo "${E_YEL}note:${E_OFF} without sudo, recursive trees get leaf checks only; sudo locked status is authoritative" >&2
 }
 
 # status with no path: list every node in the invoking user's pool, so the
@@ -2635,11 +2779,12 @@ do_status_pool() {
       printf '%s\n' "$(decode "$(basename "$meta" .meta)")"
     done | sort
   )"
+  set_pal
   if [ -z "$listing" ]; then
     echo "pool for $inv is empty"
     return 0
   fi
-  echo "pool for $inv:"
+  echo "${P_B}pool for $inv:${P_OFF}"
   while IFS= read -r n; do
     [ -n "$n" ] || continue
     # Looking is never an enforcement action: drift shows in the row but
@@ -2676,11 +2821,11 @@ do_verify() {
     total_drift=$((total_drift + drift_count))
   done
   if [ "$total_drift" -gt 0 ]; then
-    echo "verify: $total_drift node(s) drifted" >&2
+    echo "${E_RED}${E_B}verify: $total_drift node(s) drifted${E_OFF}" >&2
     log_action verify "" "drift-$total_drift"
     return 5
   fi
-  [ "$OPT_QUIET" -eq 1 ] || echo "verify: all locked nodes clean"
+  [ "$OPT_QUIET" -eq 1 ] || echo "${C_GRN}verify: all locked nodes clean${C_OFF}"
   log_action verify "" ok
   return 0
 }
@@ -2731,28 +2876,78 @@ case "$action" in
       exit 0
     fi
     require_paths
+    total="${#PATHS[@]}"
+    idx=0
     failures=0
+    declined=0
     for f in "${PATHS[@]}"; do
+      idx=$((idx + 1))
+      # Batch orientation (terminal-output): a [n/N] counter per item, and
+      # the composer -- this loop -- owns the one blank line between items.
+      # The reporting verbs keep their own per-item headers uncounted.
+      if [ "$total" -gt 1 ]; then
+        [ "$idx" -gt 1 ] && echo
+        case "$action" in
+          status|why) ;;
+          *) printf '%s[%d/%d]%s %s\n' "$C_DIM" "$idx" "$total" "$C_OFF" "$f" ;;
+        esac
+      fi
+      rc=0
       case "$action" in
-        lock)   do_lock_one "$f"   || { rc=$?; [ "$rc" -eq 2 ] && exit 2; failures=$((failures + 1)); echo "error processing $f (continuing)" >&2; } ;;
-        unlock) do_unlock_one "$f" || { failures=$((failures + 1)); echo "error processing $f (continuing)" >&2; } ;;
-        revert) do_revert_one "$f" || { failures=$((failures + 1)); echo "error processing $f (continuing)" >&2; } ;;
-        edit)   do_edit_one "$f"   || { rc=$?; [ "$rc" -eq 2 ] && exit 2; failures=$((failures + 1)); echo "error processing $f (continuing)" >&2; } ;;
-        status) do_status_one "$f" || failures=$((failures + 1)) ;;
-        why)    do_why_one "$f"    || failures=$((failures + 1)) ;;
+        lock)      do_lock_one "$f"      || rc=$? ;;
+        unlock)    do_unlock_one "$f"    || rc=$? ;;
+        revert)    do_revert_one "$f"    || rc=$? ;;
+        edit)      do_edit_one "$f"      || rc=$? ;;
+        status)    do_status_one "$f"    || rc=$? ;;
+        why)       do_why_one "$f"       || rc=$? ;;
+        rm)        do_rm_one "$f"        || rc=$? ;;
+        trash)     do_trash_one "$f"     || rc=$? ;;
+        tombstone) do_tombstone_one "$f" || rc=$? ;;
+      esac
+      if [ "$action" = "status" ] || [ "$action" = "why" ]; then
+        [ "$rc" -ne 0 ] && failures=$((failures + 1))
+        continue
+      fi
+      if [ "$rc" -eq 2 ]; then
+        # A decline affects only its own item (terminal-output): the rest
+        # of a batch still gets its decisions. A single-path invocation
+        # keeps the plain abort exit.
+        [ "$total" -eq 1 ] && exit 2
+        declined=$((declined + 1))
+      elif [ "$rc" -ne 0 ]; then
+        failures=$((failures + 1))
         # rc 3 from a placement verb means the operation DID happen and the
         # records followed it, but the parent's entry diff had leftovers.
         # It still counts as a failure, so the overall exit is 3 -- it just
         # does not get the "error processing" line, which would be false.
-        rm)    do_rm_one "$f"    || { rc=$?; [ "$rc" -eq 2 ] && exit 2; failures=$((failures + 1)); [ "$rc" -eq 3 ] || echo "error processing $f (continuing)" >&2; } ;;
-        trash) do_trash_one "$f" || { rc=$?; [ "$rc" -eq 2 ] && exit 2; failures=$((failures + 1)); [ "$rc" -eq 3 ] || echo "error processing $f (continuing)" >&2; } ;;
-        tombstone) do_tombstone_one "$f" || { rc=$?; [ "$rc" -eq 2 ] && exit 2; failures=$((failures + 1)); echo "error processing $f (continuing)" >&2; } ;;
-      esac
+        case "$action" in
+          rm|trash) [ "$rc" -eq 3 ] || echo "error processing $f (continuing)" >&2 ;;
+          *)        echo "error processing $f (continuing)" >&2 ;;
+        esac
+      fi
     done
     [ "$action" = "status" ] && status_unpriv_note
+    # One summary tail per batch: what happened, what was declined, what
+    # failed. Declines are a normal outcome, not an error.
+    if [ "$total" -gt 1 ] && [ "$action" != "status" ] && [ "$action" != "why" ]; then
+      case "$action" in
+        lock)      batch_noun=locked ;;
+        unlock)    batch_noun=unlocked ;;
+        revert)    batch_noun=reverted ;;
+        edit)      batch_noun=edited ;;
+        rm)        batch_noun=removed ;;
+        trash)     batch_noun=trashed ;;
+        tombstone) batch_noun=tombstoned ;;
+      esac
+      echo
+      echo "$((total - declined - failures)) $batch_noun, $declined declined, $failures failed"
+    fi
     if [ "$failures" -gt 0 ]; then
       [ "$action" = "status" ] && exit 5
       exit 3
+    fi
+    if [ "$declined" -gt 0 ]; then
+      exit 2
     fi
     ;;
   mv|rekey)
