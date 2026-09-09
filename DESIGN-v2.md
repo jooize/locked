@@ -20,7 +20,7 @@ node the user does not own binds every user-UID process.
 | Tier | Flag | Ownership | For | Effect |
 |---|---|---|---|---|
 | `content` | `uchg` | `_<user>-lock` | leaf files; leaf dirs (recursive) | total freeze: content, rename, delete. Edit = unlock, edit, lock. |
-| `placement` | `uappnd` | `_<user>-lock` + group-write | shared parent dirs (`~/.config`, `~/Library`, ...) | new entries allowed; rename/delete/replace of existing entries denied; dir itself immovable. Unlock only for uninstall/replace ceremonies. |
+| `placement` | `uappnd` | `_<user>-lock` + group-write; children inherit the lock group | shared parent dirs (`~/.config`, `~/Library`, ...) | new entries allowed; rename/delete/replace of existing entries denied; dir itself immovable. Unlock only for uninstall/replace ceremonies. |
 | `anchor` | `sappnd` (default) or `schg` | **unchanged** (stays the user) | nodes the OS identity-checks against the user's UID: `~`, `~/.ssh` and its files | system flags are root-only to set AND clear, so the flag binds all user processes while the user stays owner -- sshd StrictModes and every owner==user check keep passing. |
 
 Probed facts the tiers rest on:
@@ -39,6 +39,23 @@ Probed facts the tiers rest on:
 - ACLs were evaluated and rejected for the anchor problem: the owner can
   always rewrite their own node's ACL, so self-deny entries are advisory.
   Flags are primary.
+- `st_dev` is not a volume key: APFS assigns it at mount, in mount order.
+  It changed across a reboot on 2026-09-09, and `/` and `~` share one this
+  boot (firmlinks) while their volume UUIDs differ. Identity is volume UUID
+  plus inode; `getattrlist` with `ATTR_VOL_UUID` answers with the
+  containing volume for any path or descriptor, and devfs answers with
+  nothing, which is why the `st_dev` spelling survives as a fallback.
+
+## Group inheritance
+
+A new entry takes its parent directory's group on macOS, as on every BSD,
+so everything created under a placement seal carries the lock group. That
+is expected, not drift: the owner has to be the lock account (`uappnd` is
+a user flag its owner can clear), which leaves group `rwx` as the user's
+only way in. The mechanism, the rejected ACL alternative, and the access
+consequences are written out in the README section of the same name. On
+Linux the equivalent would need setgid on the directory or an explicit
+`chgrp`; `locked` is Darwin-only and does not handle it.
 
 ## Chain-walking
 
@@ -54,7 +71,7 @@ ceremony:
    group/other write (`/Users` on stock macOS) or the lock is refused.
 
 `locked status <leaf>` verifies the FULL chain: per level owner, group,
-mode, exact flag word vs meta, and dev/ino identity. `locked unlock`
+mode, exact flag word vs meta, and volume-uuid/inode identity. `locked unlock`
 releases only the named node (`--chain` additionally drops the flags on
 the chain's ancestors, for edits that need a rename into a frozen parent
 -- atomic-save editors); the next `lock` re-walks and re-seals the chain
@@ -88,7 +105,8 @@ EndpointSecurity/eslogger EPERM-monitoring is explicitly later.
   enforced by sudo before our code runs; a swapped binary gets a silent
   refusal, not a Touch ID prompt.
 - Snapshot / diff / revert flow and the `.snap`/`.attic`/`.meta` layout;
-  meta gains `tier`, `flag`, the exact post-lock flag word, and dev/ino.
+  meta gains `tier`, `flag`, the exact post-lock flag word, and the
+  volume-uuid/inode identity.
   v1 metas are not migrated -- v1 was never provisioned.
 - Root-sudo invocation model for every mutating action. The two-tier
   draft's no-root runas (`(_<user>-lock)`) multiuser path is deferred:
@@ -111,7 +129,7 @@ EndpointSecurity/eslogger EPERM-monitoring is explicitly later.
   (rename checks parent write only). Locked leaves keep their own flags
   throughout, and re-seal refuses to bless a swapped placement/anchor
   node without a human at a tty (`--yes` deliberately does not satisfy
-  that prompt); `verify` checks dev/ino against meta. Keep windows
+  that prompt); `verify` checks the identity against meta. Keep windows
   short; prefer `locked edit`.
 - **Parent-swap above the anchor is out of scope by construction**: the
   chain terminates at a root-owned dir, so there is no user-writable

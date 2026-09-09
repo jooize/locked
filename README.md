@@ -16,7 +16,9 @@ Three tiers, named by what they protect:
   recursively. Edit cycle: unlock, edit, lock.
 - `placement` (`uappnd`, lock-account-owned + group-write) -- shared parent
   dirs (`~/.config`, `~/Library`, ...): new entries fine, replacing or
-  removing existing ones denied.
+  removing existing ones denied. Entries created under the seal take the
+  lock group, by BSD directory inheritance -- see [Group inheritance under
+  a placement seal](#group-inheritance-under-a-placement-seal).
 - `anchor` (`sappnd` or `schg`, ownership unchanged) -- nodes the OS
   identity-checks against your UID (`~`, `~/.ssh`): the system flag binds
   every user process while sshd's owner checks keep passing.
@@ -234,7 +236,9 @@ modes, so an older 700 deployment converges on its own.
 - `.meta` -- captured identity plus lock state, one `key=value` per line:
   `owner`, `group`, `mode` (restore targets), `lockmode` (expected mode
   while locked), `tier`, `flag`, `flagsym` (exact post-seal flag word),
-  `id` (dev.ino), `recursive`, `state` (`locked`/`unlocked`/`retired`/
+  `id` (volume uuid plus inode; records written before 0.6.0 carry
+  `dev.ino` and are rewritten in place on the next root `status`, `lock`
+  or `unlock`), `recursive`, `state` (`locked`/`unlocked`/`retired`/
   `suspended`). `verify` compares reality against this. Retired and
   suspended records carry provenance -- `via` (`rm`, `trash-finalized`,
   or `assertion` for a human tombstone), `by`, `at`, and for a suspension
@@ -244,14 +248,41 @@ modes, so an older 700 deployment converges on its own.
 
 ## Mode and ownership preservation
 
-The `owner`/`group`/`mode` restore targets are captured on the first `lock` of a file and carried unchanged through every later meta rewrite (v2 rewrites the file on each state transition to track flags and state, but the captured identity persists). On every subsequent `unlock`, `lock`, and `revert`, the script chmods/chowns the file back to the meta values. So:
+The `owner`/`group`/`mode` restore targets are captured on the first `lock` of a node and carried unchanged through every later meta rewrite (v2 rewrites the file on each state transition to track flags and state, but the captured identity persists). What is done with them depends on the tier.
+
+**content.** `unlock`, `lock` and `revert` chown and chmod the node back to the recorded values. So:
 - Accidental `chmod 666 ~/.ssh/authorized_keys` while unlocked -- next lock restores the captured mode.
 - An attacker that gets a single chmod through (somehow) is undone the next cycle.
 - To intentionally change the captured mode/owner, edit `.meta` directly: `sudo -u _jooize-lock vi /var/db/locked-snapshots/jooize/<encoded>.meta`. (Or delete the meta and re-lock to recapture.)
 
+**placement.** `unlock` clears `uappnd` and nothing else. The directory stays lock-account owned at mode 770 for the whole window, on purpose: the owner has to be the lock account because `uappnd` is a user flag its owner could clear, and the lock group's `rwx` is the one way you still reach into it. The recorded `owner`/`group`/`mode` are the pre-adoption identity, kept for a future un-provision, not a restore target for an unlock. `lock` re-applies the flag; a relock keeps the tier the record names and never asks for a tier change (there is no un-provision verb yet).
+
+**anchor.** Ownership never changes, in either direction -- that is the tier's whole point. Only the system flag goes on and off.
+
+## Group inheritance under a placement seal
+
+Every entry created inside a placement-sealed directory carries the lock group, and so do their children. That is not `locked` doing anything: on macOS, as on every BSD, a new file or directory takes its group from the directory it is created in. (Linux does this only when the parent carries setgid.) A placement seal sets the directory to `_<user>-lock:_<user>-lock` mode 770, so everything born under it since is group `_<user>-lock`.
+
+Observed on one Mac's `~/Library/Application Support`: the 88 entries born before the seal are group `staff`, every entry born after it is group `_jooize-lock`, subdirectories included.
+
+**Why the lock group and not `staff`.** The owner must become the lock account, because `uappnd` is a *user* flag and its owner can clear it -- leaving the directory yours would hand any process running as you the ability to unseal it. That leaves you outside a directory owned by someone else, so mode 700 would lock you out of your own `~/Library`. Group `rwx` for a group you are a member of is the door back in. `staff` with 770 would be the wrong group for that door: every local user is in `staff`.
+
+**What it costs you.** Nothing, in practice. Under the usual umask 022 the group bits of a new entry are what other would have got anyway, and the lock account is not a login (`/usr/bin/false`, no home). A tool that creates group-writable entries (umask 002) would let the lock account write them, which only root can make use of.
+
+**The alternative, and why it is not taken.** Owner `_<user>-lock`, group `staff`, mode 700, plus a non-inherited ACL entry for you:
+
+```sh
+chmod +a "jooize allow list,search,add_file,add_subdirectory,readattr,readextattr,readsecurity" <dir>
+```
+
+Children then keep `staff`. The costs are worse than the benefit: `verify` would have to diff ACLs rather than compare one mode word, `ls -l` shows a `+` on the directory forever, and backup and sync tools disagree about what to do with ACLs. The group inheritance is documented instead of engineered around.
+
+On Linux the same design would need setgid on the directory, or an explicit `chgrp`, for the inheritance to happen at all. `locked` is Darwin-only and does not handle that case.
+
 ## Caveats
 - First lock assumes file is currently owned by you. To bring a file owned by someone else into the pool: `sudo chown -h <you>:staff <file>` first, then `sudo locked lock <file>` captures meta and locks. Or hand-write the meta file before unlocking once.
 - Other admins on the same machine can read snapshots via `sudo` (root reads all). Only encryption fixes that; not in scope here.
+- Records written before 0.6.0 identify their node by `dev.ino`. They still match (the inode is what proves the node), and the next root `status`, `lock` or `unlock` rewrites the field to the volume-uuid form with an `info` line. An unprivileged `status` says so and names the command that does it.
 - `readlink -f` requires macOS 12+. On older macOS, replace with `realpath` or a Python one-liner.
 - **Extended attributes and ACLs travel on file snapshots; directory trees still lose them.** File staging copies go through the helper with `COPYFILE_XATTR|COPYFILE_ACL`, so quarantine and custom-ACL metadata survive a snapshot/revert cycle. Content-tier *directories* (`.snapdir`) still copy with `cp -Rp`, which keeps the old limitation per file inside the tree -- search for `TODO(xattrs)` at `snapshot_tree`. BSD flags never travel by design (meta records the exact word; sealing re-applies it).
 - **`locked trash` is gated by macOS privacy (TCC) through the app that invoked it.** The trash service checks the responsible app's Files-and-Folders grant even under `sudo`; from an unblessed automation context it fails cleanly (afpAccessDenied) with the window restored, from your own granted terminal it works. Nothing to configure in `locked` -- grant the terminal, or use `rm`.
@@ -262,7 +293,7 @@ The `owner`/`group`/`mode` restore targets are captured on the first `lock` of a
 ## Atomicity and TOCTOU
 
 Snapshot/attic/restore writes go through `atomic_replace`:
-1. The helper copies the source into `/var/db/locked-snapshots/<user>/.staging/replace.XXXXXX` (lock-account-owned, mode 700 -- invisible to user UID) from a file descriptor it opened `O_NOFOLLOW` and identity-checked against the dev/ino `locked` expected -- a source swapped between resolution and open is refused, not copied.
+1. The helper copies the source into `/var/db/locked-snapshots/<user>/.staging/replace.XXXXXX` (lock-account-owned, mode 700 -- invisible to user UID) from a file descriptor it opened `O_NOFOLLOW` and identity-checked against the volume uuid and inode `locked` expected -- a source swapped between resolution and open is refused, not copied.
 2. `chown` and `chmod` the staged temp file.
 3. Verify staging and destination are on the same filesystem (`stat -f '%d'`).
 4. `mv -f` -- atomic same-filesystem rename.
