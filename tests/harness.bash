@@ -162,6 +162,33 @@ check "helper is 755"                         "755" "$(stat -f '%OLp' "$HELPER")
 check "helper's dir is root-owned"            "root" "$(owner_of "$HELPERDIR")"
 check "helper's dir is 755"                   "755" "$(stat -f '%OLp' "$HELPERDIR")"
 
+# The `id` verb is the whole of the script's node_id(): it runs without
+# root (unprivileged `status` needs it), reads nothing but attributes, and
+# is what makes the record and the helper's own compare agree by
+# construction.
+note "== helper: the id verb =="
+IDF="$SCRATCH/raw/idprobe.txt"
+IDOUT="$SCRATCH/id-out.txt"
+as_user /bin/sh -c "echo i > '$IDF'"
+ok   "id succeeds on a scratch file"          "$HELPER" id "$IDF"
+"$HELPER" id "$IDF" >"$IDOUT" 2>&1 || true
+ok   "id prints <uuid>:<ino>" \
+     grep -qE '^[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}:[0-9]+$' "$IDOUT"
+check "id reports the file's inode"           "$(stat -f '%i' "$IDF")" \
+      "$(sed 's/.*://' "$IDOUT")"
+ok   "id needs no root"                       as_user "$HELPER" id "$IDF"
+check "unprivileged id agrees with root's"    "$("$HELPER" id "$IDF")" \
+      "$(as_user "$HELPER" id "$IDF")"
+# devfs reports no volume uuid; the st_dev fallback is what keeps the
+# grammar total, and it must read the way stat(1) prints it.
+"$HELPER" id /dev/null >"$IDOUT" 2>&1 || true
+ok   "id falls back to <dev>:<ino> on devfs"  grep -qE '^[0-9]+:[0-9]+$' "$IDOUT"
+check "the fallback agrees with stat"         "$(stat -f '%d.%i' /dev/null)" \
+      "$(tr ':' '.' <"$IDOUT")"
+deny "id fails on a path that is not there"   "$HELPER" id "$SCRATCH/raw/no-such-file"
+refuse "id refuses a relative path"           "must be an absolute path" \
+       "$HELPER" id idprobe.txt
+
 # The trash service is TCC-gated by the responsible application: from a
 # terminal that has not been granted access, trashItemAtURL: comes back
 # afpAccessDenied and nothing locked does can change that. Probe once, so
@@ -670,6 +697,20 @@ meta_get() { # <path> <field>: empty when there is no record
   [ -f "$m" ] || return 0
   awk -F= -v f="$2" '$1==f{print substr($0, length(f)+2); exit}' "$m"
 }
+put_id() { # <path> <id>: rewrite just the id field of an existing record
+  local m
+  m="$(meta_path "$1")"
+  sed "s|^id=.*|id=$2|" "$m" >"$m.tmp"
+  mv -f "$m.tmp" "$m"
+  chown "$LOCK_ACCT:$LOCK_ACCT" "$m"
+  chmod 640 "$m"
+}
+id_form_of() { # <id> -> vol|dev, the same test the script makes
+  case "${1%%.*}" in
+    ????????-????-????-????-????????????) printf 'vol' ;;
+    *)                                    printf 'dev' ;;
+  esac
+}
 put_meta() { # <path> <key=value>...: craft a record write_meta would accept
   local m
   m="$(meta_path "$1")"
@@ -848,6 +889,18 @@ ok   "rekey accepts the very node the record describes" \
 deny "the old key is gone"                     test -e "$(meta_path "$RKD/k.txt")"
 check "the re-keyed record is still locked"    "locked" "$(meta_get "$RKD/moved.txt" state)"
 ok   "verify clean after the re-key"           locked verify --quiet
+
+# A pre-0.6.0 record still describes its node: the inode is what proves it,
+# so the repair rekey exists for must not fail over the id's spelling.
+put_id "$RKD/moved.txt" "999.$(stat -f '%i' "$RKD/moved.txt")"
+chflags -- nouappnd "$RKD"
+chflags -- nouchg "$RKD/moved.txt"
+mv -- "$RKD/moved.txt" "$RKD/moved2.txt"
+chflags -- uchg "$RKD/moved2.txt"
+chflags -- uappnd "$RKD"
+ok   "rekey accepts a legacy dev.ino record" \
+     locked rekey "$RKD/moved.txt" "$RKD/moved2.txt"
+ok   "verify clean after the legacy re-key"    locked verify --quiet
 
 RKT="$MED/rekeytree"
 RKT2="$MED/rekeytree2"
@@ -1174,6 +1227,80 @@ UNB="$SCRATCH/raw/unblocked.txt"
 as_user /bin/sh -c "echo u > '$UNB'"
 locked why "$UNB" >"$OUTF" 2>&1 || true
 ok   "why says nothing blocks an open path"    grep -qF "no file flag on this chain stops" "$OUTF"
+
+note "== identity: a legacy dev.ino record is upgraded, not reported =="
+# st_dev is not a volume key: APFS can hand the number to another volume at
+# the next mount, which is what made a re-seal read as a swap on 2026-09-09.
+# The inode is what proves the node, so a legacy record matches and gets
+# rewritten; a legacy record with the WRONG inode is still a replacement.
+IDL="$MED/identity-leaf.txt"
+as_user /bin/sh -c "echo i > '$IDL'"
+ok   "lock the identity fixture"               locked lock --yes "$IDL"
+IDINO="$(stat -f '%i' "$IDL")"
+check "the record is in volume form"           "vol" "$(id_form_of "$(meta_get "$IDL" id)")"
+put_id "$IDL" "999.$IDINO"
+locked status "$IDL" >"$OUTF" 2>&1 || true
+ok   "status reports the upgrade"              grep -qF "identity record upgraded" "$OUTF"
+deny "and does not call it drift"              grep -qF "DRIFT" "$OUTF"
+check "the record is in volume form again"     "vol" "$(id_form_of "$(meta_get "$IDL" id)")"
+check "and still names the same inode"         "$IDINO" "$(meta_get "$IDL" id | sed 's/.*\.//')"
+ok   "verify is clean after the upgrade"       locked verify --quiet
+put_id "$IDL" "999.$((IDINO + 1))"
+if locked verify >"$OUTF" 2>&1; then vrc=0; else vrc=$?; fi
+check "a legacy record with a wrong inode drifts" "5" "$vrc"
+ok   "the drift names the identity"            grep -qF "(node replaced)" "$OUTF"
+put_id "$IDL" "$("$HELPER" id "$IDL" | tr ':' '.')"
+ok   "verify clean once the record is right again" locked verify --quiet
+
+note "== lock: a relock keeps the tier the record names =="
+PLD="$MED/placearea"
+install -d -o "$INV" -g staff -m 750 "$PLD"
+PLL="$PLD/leaf.txt"
+as_user /bin/sh -c "echo p > '$PLL'"
+ok   "lock a leaf provisions its parent"       locked lock --yes "$PLL"
+check "the parent was adopted as placement"    "placement" "$(meta_get "$PLD" tier)"
+ok   "unlock the placement dir"                locked unlock "$PLD"
+check "the unlocked dir keeps the lock account" "$LOCK_ACCT" "$(owner_of "$PLD")"
+check "and keeps its placement mode"           "770" "$(stat -f '%OLp' "$PLD")"
+# An entry born under the seal carries the lock group by BSD inheritance,
+# and a content-tier relock would refuse the tree for exactly that. This is
+# the 2026-09-09 failure: unlock said placement, lock assumed content.
+mkdir -p -- "$PLD/sub"
+chgrp wheel "$PLD/sub"
+locked lock --yes "$PLD" >"$OUTF" 2>&1 || true
+ok   "the relock keeps the recorded tier"      grep -qF "relocked: $PLD (placement)" "$OUTF"
+deny "and never mentions mixed ownership"      grep -qF "mixed ownership" "$OUTF"
+deny "and never calls the placement mode drift" grep -qF "mode drifted" "$OUTF"
+check "the relocked dir is uappnd again"       "uappnd" "$(flags_of "$PLD")"
+refuse "a tier change on a recorded node is refused" "recorded as tier placement" \
+       locked lock --yes --tier content "$PLD"
+check "the refusal changed nothing"            "uappnd" "$(flags_of "$PLD")"
+check "the recorded tier still stands"          "placement" "$(meta_get "$PLD" tier)"
+
+note "== identity: a legacy record re-seals without an alarm =="
+ok   "unlock for the legacy re-seal"           locked unlock "$PLD"
+put_id "$PLD" "999.$(stat -f '%i' "$PLD")"
+locked lock --yes "$PLD" >"$OUTF" 2>&1 || true
+ok   "the re-seal says the record was upgraded" grep -qF "identity record upgraded" "$OUTF"
+deny "and raises no REPLACED alarm"            grep -qF "REPLACED" "$OUTF"
+check "the re-sealed record is in volume form" "vol" "$(id_form_of "$(meta_get "$PLD" id)")"
+ok   "verify clean after the legacy re-seal"   locked verify --quiet
+
+note "== helper: a volume-uuid mismatch refuses the window =="
+IDW="$MED/idwindow"
+install -d -o "$INV" -g staff -m 777 "$IDW"
+as_user /bin/sh -c "echo v > '$IDW/victim.txt'"
+chflags -- uappnd "$IDW"
+refuse "rm refuses a parent whose volume uuid differs" "changed identity" \
+       "$HELPER" rm --parent "$IDW" \
+       --parent-id "00000000-0000-0000-0000-000000000000:$(stat -f '%i' "$IDW")" \
+       --name victim.txt --target-id -
+ok   "the entry is untouched"                  test -e "$IDW/victim.txt"
+check "the parent is still sealed"             "uappnd" "$(flags_of "$IDW")"
+ok   "the same call with the real id works"    "$HELPER" rm --parent "$IDW" \
+       --parent-id "$("$HELPER" id "$IDW")" --name victim.txt --target-id -
+deny "and the entry is gone"                   test -e "$IDW/victim.txt"
+chflags -- nouappnd "$IDW"
 
 note "== mediated: the pool is left consistent =="
 # The reappearance fixture is deliberate drift; drop it so what this
