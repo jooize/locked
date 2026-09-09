@@ -28,7 +28,9 @@
 #
 # rm/trash/mv perform the one syscall a sealed parent blocks, inside a
 # bounded root-held window opened by the compiled helper (see LOCKED_HELPER
-# below) on an open parent fd. The bash trap here is a backstop only.
+# below) on an open parent fd. The bash trap here is a backstop only. The
+# same helper reads node identity (its `id` verb), so every verb needs it --
+# unprivileged `status` included.
 
 # Pin PATH so bare command names (dscl, awk, install, chflags, ...) can't be
 # hijacked even if sudoers env_keep ever leaks PATH from the invoker.
@@ -325,14 +327,23 @@ confirm_hard() {
 # with write on ITS parent (rename checks parent write only). Re-sealing
 # must not silently bless a replaced node.
 check_reseal_identity() { # <path> <metafile>
-  local n="$1" meta="$2" prev_id cur_id
+  local n="$1" meta="$2" prev_id cur_id sn=0
   prev_id="$(meta_field "$meta" id)"
-  cur_id="$(node_id "$n")"
-  [ "$cur_id" = "$prev_id" ] && return 0
+  cur_id="$(node_id "$n")" || return 1
+  same_node "$prev_id" "$cur_id" || sn=$?
+  if [ "$sn" -eq 0 ]; then
+    return 0
+  fi
+  if [ "$sn" -eq 2 ]; then
+    # Same inode, pre-0.6.0 spelling: the seal's own write_meta records the
+    # volume form a line later, so the note is all this owes.
+    echo "  note: identity record upgraded (dev.ino -> volume uuid)"
+    return 0
+  fi
   # An alarm can fire anywhere, so it owns one leading blank line.
   echo >&2
   echo "${E_RED}${E_B}!!! $n was REPLACED while unlocked !!!${E_OFF}" >&2
-  echo "    dev/ino $prev_id -> $cur_id" >&2
+  echo "    identity $prev_id -> $cur_id" >&2
   echo "    If you did not swap this node yourself, STOP and investigate" >&2
   echo "    (compare against the snapshot; check: ${E_CYN}log show --predicate" >&2
   echo "    'eventMessage CONTAINS \"locked:\"' --last 1h${E_OFF})." >&2
@@ -414,8 +425,53 @@ flags_of() {
   [ "$s" = "-" ] && s=""
   printf '%s' "$s"
 }
-node_id() {
-  stat -f '%d.%i' "$1"
+# Node identity: the volume's UUID plus the inode. st_dev is NOT a volume
+# key -- APFS assigns it at mount, in mount order, so a reboot can hand the
+# same number to another volume (live 2026-09-09: a record written with dev
+# 16777234 came back naming /System/Volumes/Update, and every re-seal read
+# as a swap). The volume UUID belongs to the volume itself and survives.
+#
+# The helper is what reads it, so the record and the helper's own compare
+# can never spell one node differently; a filesystem that reports no UUID
+# (devfs) falls back to st_dev exactly as stat(1) printed it. The record
+# separates the two halves with ".", the helper's wire grammar with ":".
+node_id() { # <path>
+  verify_helper || return 1
+  local out
+  out="$("$LOCKED_HELPER" id "$1")" || return 1
+  printf '%s' "${out/:/.}"
+}
+
+# id_form <id> -> vol|dev. Only the volume form has the UUID's shape.
+id_form() {
+  case "${1%%.*}" in
+    ????????-????-????-????-????????????) printf 'vol' ;;
+    *)                                    printf 'dev' ;;
+  esac
+}
+
+# same_node <recorded> <live>: 0 the same node, 2 the same node named by a
+# pre-0.6.0 record (dev.ino recorded, volume form live, inode equal), 1 a
+# different node.
+#
+# The inode carries the whole signal. Inside an unlock window a swap always
+# changes it: directories cannot be hard-linked, and a node renamed in from
+# elsewhere is a different inode, on this volume or any other. dev only ever
+# named the volume, which the UUID now names across boots too -- so a
+# recorded dev that no longer matches is a remount, not a replacement.
+same_node() { # <recorded> <live>
+  local rec="$1" live="$2"
+  if [ -z "$rec" ] || [ -z "$live" ]; then
+    return 1
+  fi
+  if [ "$rec" = "$live" ]; then
+    return 0
+  fi
+  if [ "$(id_form "$rec")" = "dev" ] && [ "$(id_form "$live")" = "vol" ] &&
+     [ "${rec#*.}" = "${live#*.}" ]; then
+    return 2
+  fi
+  return 1
 }
 
 # chflags gotcha (probed 2026-08-05): "--" must come BEFORE the flag word;
@@ -470,6 +526,26 @@ write_meta() {
   # copies, which DO hold content, stay 600.
   chmod 640 "$tmp" || return 1
   mv -f -- "$tmp" "$meta" || return 1
+}
+
+# rewrite_meta_id <metafile> <id>
+# The identity record's own migration: same node, newer spelling. Mirrors
+# rewrite_meta_state with the halves swapped -- the state is what is kept
+# and the id is what changes -- and no provenance pairs, because nothing
+# about the node itself moved.
+rewrite_meta_id() {
+  local meta="$1" id="$2"
+  write_meta "$meta" \
+    "owner=$(meta_field "$meta" owner)" \
+    "group=$(meta_field "$meta" group)" \
+    "mode=$(meta_field "$meta" mode)" \
+    "lockmode=$(meta_field "$meta" lockmode)" \
+    "tier=$(meta_field "$meta" tier)" \
+    "flag=$(meta_field "$meta" flag)" \
+    "flagsym=$(meta_field "$meta" flagsym)" \
+    "id=$id" \
+    "recursive=$(meta_field "$meta" recursive)" \
+    "state=$(meta_field "$meta" state)" || return 1
 }
 
 # rewrite_meta_state <metafile> <state> [key=value]...
@@ -741,12 +817,30 @@ verify_install_ancestry || exit 1
 # else, reached through an ancestry no non-root process can redirect. It
 # carries no digest pin -- sudoers pins THIS script, the nix module bakes
 # the store path into it, and a digest here would only move the question to
-# who may edit the digest. Re-checked before every exec, never cached: the
-# window it opens is root-held, so a stale answer is the whole exposure.
+# who may edit the digest.
+#
+# Checked once per process and then memoised. It used to run per exec, on
+# the reasoning that the window it opens is root-held; since node_id() the
+# helper answers one question per record and `verify` walks every record,
+# so a walk per call would be N full ancestry walks for an answer that
+# cannot honestly differ between them. What memoising gives up is a change
+# made to the helper's own ancestry mid-invocation -- a window measured in
+# the lifetime of one `locked` run, which an already-open root-held window
+# would not survive either.
+HELPER_VERDICT=""   # "" not asked yet, 0 verified, 1 refused
 verify_helper() {
+  if [ -n "$HELPER_VERDICT" ]; then
+    return "$HELPER_VERDICT"
+  fi
+  if verify_helper_now; then HELPER_VERDICT=0; else HELPER_VERDICT=1; fi
+  return "$HELPER_VERDICT"
+}
+
+verify_helper_now() {
   if [ ! -f "$LOCKED_HELPER" ]; then
     echo "${E_RED}${E_B}ERROR:${E_OFF} window helper not found: $LOCKED_HELPER" >&2
-    echo "       rm, trash and mv need it (nix: rebuild; standalone: build" >&2
+    echo "       every verb needs it -- it opens the mediated window and it" >&2
+    echo "       reads node identity (nix: rebuild; standalone: build" >&2
     echo "       helper/locked-helper.m and install it root-owned 755)" >&2
     return 1
   fi
@@ -817,7 +911,7 @@ fi
 # lift the flag around the rename and restore it even on failure.
 #
 # The staging copy goes through the window helper's `copy` verb: it opens
-# the source O_NOFOLLOW, verifies the dev/ino handed to it here, and reads
+# the source O_NOFOLLOW, verifies the identity handed to it here, and reads
 # from the verified fd -- closing the old TODO(toctou) source-swap residual
 # -- while COPYFILE_XATTR|COPYFILE_ACL carries what cp left behind, closing
 # TODO(xattrs) for files. File FLAGS deliberately do not travel (the cp -p
@@ -905,6 +999,25 @@ snap_paths() { # sets ENC SNAP SNAPDIR ATTIC META for path $1
   META="$USER_SNAPSHOTS/${ENC}.meta"
 }
 
+# A pre-0.6.0 record names its node by st_dev, a number the kernel may have
+# handed to another volume at the last mount. The inode proves it is the
+# same node, so the record is corrected rather than reported -- the drift a
+# reboot invents is not drift. Root only: unprivileged status must never
+# write a pool it can merely read (same rule as the trash finalization).
+upgrade_identity_record() { # <path> <metafile> <live id>
+  local f="$1" meta="$2" cur="$3"
+  if [ "$EUID" -ne 0 ]; then
+    echo "  note  $f: identity in legacy dev.ino form; sudo locked status rewrites it"
+    return 0
+  fi
+  if rewrite_meta_id "$meta" "$cur"; then
+    echo "  info  $f: identity record upgraded (dev.ino -> volume uuid)"
+    return 0
+  fi
+  echo "  DRIFT $f: identity record could not be upgraded ($meta)"
+  return 1
+}
+
 # verify_node <path> <metafile> <lock_user>
 # Prints drift descriptions; returns 0 clean/open, 1 drift.
 verify_node() {
@@ -976,8 +1089,18 @@ verify_node() {
   [ "$cur" = "$lockmode" ] || { echo "  DRIFT $f: mode $cur, expected $lockmode"; bad=1; }
   cur="$(flags_of "$f")"
   [ "$cur" = "$flagsym" ] || { echo "  DRIFT $f: flags '$cur', expected '$flagsym'"; bad=1; }
-  cur="$(node_id "$f")"
-  [ "$cur" = "$id" ] || { echo "  DRIFT $f: dev/ino $cur, expected $id (node replaced)"; bad=1; }
+  local sn=0
+  if cur="$(node_id "$f")"; then
+    same_node "$id" "$cur" || sn=$?
+  else
+    sn=3
+  fi
+  case "$sn" in
+    0) ;;
+    2) upgrade_identity_record "$f" "$meta" "$cur" || bad=1 ;;
+    3) echo "  DRIFT $f: identity could not be read (the window helper is unavailable)"; bad=1 ;;
+    *) echo "  DRIFT $f: identity $cur, expected $id (node replaced)"; bad=1 ;;
+  esac
 
   if [ "$recursive" = "1" ] && [ -d "$f" ]; then
     local stray
@@ -1476,27 +1599,42 @@ abs_leaf() { # <path>
   fi
 }
 
-# The record stores dev/ino in stat's "%d.%i" spelling; the helper's argv
-# grammar spells the same pair dev:ino, and accepts either separator on
-# input while always EMITTING the colon form in its own output. Translate
-# here anyway, so what goes over the wire matches the grammar the helper
-# documents and the ids in its error prose read the same as ours.
+# The record separates the identity's two halves with "."; the helper's
+# argv grammar uses ":", and accepts either on input while always EMITTING
+# the colon form in its own output. Translate here anyway, so what goes
+# over the wire matches the grammar the helper documents and the ids in its
+# error prose read the same as ours.
 # The --*-id options are all mandatory: "-" is how a call says it has no
 # expectation, and omitting one is a usage error, not a default.
 helper_id_for() { # <path>
-  local p="$1" id=""
+  local p="$1" id="" live="" sn=0
   snap_paths "$p"
   if [ -f "$META" ]; then
     id="$(meta_field "$META" id)"
   fi
-  # TODO(toctou): for a node with no record this stat and the helper's
-  # openat are separated by a process spawn. The residual is a stale
-  # refusal, never a wrong target: the helper compares what it opened
-  # against this value and exits 2 rather than acting on a mismatch.
-  if [ -z "$id" ]; then
-    id="$(node_id "$p" 2>/dev/null)" || id=""
+  # TODO(toctou): this read and the helper's openat are separated by a
+  # process spawn. The residual is a stale refusal, never a wrong target:
+  # the helper compares what it opened against this value and exits 2
+  # rather than acting on a mismatch.
+  if [ -z "$id" ] || [ "$(id_form "$id")" = "dev" ]; then
+    live="$(node_id "$p" 2>/dev/null)" || live=""
   fi
-  [ -n "$id" ] || { printf '%s' '-'; return 0; }
+  if [ -z "$id" ]; then
+    id="$live"
+  elif [ -n "$live" ]; then
+    # A pre-0.6.0 record names a dev the kernel may have reassigned at the
+    # last mount, and the helper compares exactly. Same inode means the
+    # same node, so send what the helper will actually see; a different
+    # inode sends the record unchanged and earns the refusal it deserves.
+    same_node "$id" "$live" || sn=$?
+    if [ "$sn" -eq 2 ]; then
+      id="$live"
+    fi
+  fi
+  if [ -z "$id" ]; then
+    printf '%s' '-'
+    return 0
+  fi
   printf '%s' "${id/./:}"
 }
 
@@ -2021,6 +2159,7 @@ do_lock_one() {
       leaf_tier=anchor
     fi
   fi
+
   if [ "$under_ssh" -eq 1 ] && [ "$leaf_tier" != "anchor" ]; then
     echo "${E_RED}${E_B}ERROR:${E_OFF} $f: ~/.ssh and its files take the anchor tier only -- sshd" >&2
     echo "       StrictModes and the ssh client's config check require" >&2
@@ -2508,9 +2647,14 @@ do_rekey() { # <old> <new>
     cmd_rows "  " "sudo locked tombstone $old" "records it as gone instead" >&2
     return 1
   fi
-  cur="$(node_id "$new")"
-  if [ "$cur" != "$want" ]; then
-    echo "${E_RED}${E_B}refusing:${E_OFF} $new is dev/ino $cur, but the record for $old holds $want" >&2
+  cur="$(node_id "$new")" || return 1
+  local sn=0
+  same_node "$want" "$cur" || sn=$?
+  # sn 2 is a pre-0.6.0 record naming this very node; the next root status
+  # rewrites its id field, and refusing the repair over a spelling would be
+  # the reboot bug all over again.
+  if [ "$sn" -eq 1 ]; then
+    echo "${E_RED}${E_B}refusing:${E_OFF} $new is identity $cur, but the record for $old holds $want" >&2
     echo "  The node at $new is not the one that record describes, so re-keying" >&2
     echo "  would attach its snapshot and flag history to a different file." >&2
     cmd_rows "  " "sudo locked tombstone $old" "if the recorded node is really gone" >&2
@@ -2691,8 +2835,17 @@ status_row() { # <path> [brief]
       return 0
       ;;
   esac
-  if verify_node "$n" "$META" "$lock_user" >/dev/null 2>&1; then
+  # Clean, but not always silent: verify_node reports a record it repaired
+  # (an identity upgraded, a suspension finalized) on its way to saying
+  # nothing is wrong. Discarding that output would hide the one thing the
+  # row cannot show -- and, unprivileged, the note asking for the sudo run
+  # that does the repair.
+  local vout
+  if vout="$(verify_node "$n" "$META" "$lock_user" 2>/dev/null)"; then
     echo "    ${P_GRN}✓${P_OFF}  $n ${P_DIM}($tier $(meta_field "$META" flag))${P_OFF}"
+    if [ -n "$vout" ]; then
+      printf '%s\n' "$vout" | sed 's/^/      /'
+    fi
     return 0
   fi
   if [ "$brief" = "brief" ]; then

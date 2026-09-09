@@ -26,8 +26,18 @@
  *   6  operation completed but the parent's entry list changed in a way the
  *      operation does not account for; `anomaly` lines on stdout
  *
+ * Node identity (`--parent-id`, `--target-id`, `--src-id`, and what the `id`
+ * verb prints) is `<volume uuid>:<inode>`, or `<st_dev>:<inode>` on a
+ * filesystem that reports no volume uuid (devfs) and in records written
+ * before locked 0.6.0. st_dev is NOT a volume key: APFS assigns it at mount
+ * in mount order, so it can name a different volume after a reboot. The
+ * volume uuid is a property of the volume itself and survives one. `-` means
+ * "no expectation". Both `:` and `.` are accepted as the separator on input;
+ * output always uses `:`.
+ *
  * stdout carries only tab-separated machine lines (binurl, anomaly,
- * window-open). stderr carries one lowercase prose line per error.
+ * window-open), plus the one bare `<id>` line the `id` verb prints. stderr
+ * carries one lowercase prose line per error.
  *
  * Entry names on `anomaly` lines are backslash-escaped (\\, \t, \n, \r, \xNN
  * for other control bytes) so a hostile filename cannot forge or split a
@@ -41,6 +51,7 @@
 #import <Foundation/Foundation.h>
 
 #include <sys/types.h>
+#include <sys/attr.h>
 #include <sys/stat.h>
 #include <sys/stdio.h>
 #include <sys/wait.h>
@@ -57,6 +68,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <uuid/uuid.h>
 
 /* ---- constants ---------------------------------------------------------- */
 
@@ -100,15 +112,16 @@ static void
 usage(void)
 {
 	fputs(
-"usage: locked-helper rm --parent <dir> --parent-id <dev:ino|-> --name <entry>\n"
-"                        --target-id <dev:ino|-> [--recursive]\n"
-"       locked-helper mv --parent <dir> --parent-id <dev:ino|-> --name <old>\n"
-"                        --target-id <dev:ino|-> --dest-parent <dir>\n"
-"                        --dest-parent-id <dev:ino|-> --dest-name <new>\n"
-"       locked-helper trash --parent <dir> --parent-id <dev:ino|-> --name <entry>\n"
-"                           --target-id <dev:ino|-> --uid <uid> --gid <gid>\n"
+"usage: locked-helper rm --parent <dir> --parent-id <id|-> --name <entry>\n"
+"                        --target-id <id|-> [--recursive]\n"
+"       locked-helper mv --parent <dir> --parent-id <id|-> --name <old>\n"
+"                        --target-id <id|-> --dest-parent <dir>\n"
+"                        --dest-parent-id <id|-> --dest-name <new>\n"
+"       locked-helper trash --parent <dir> --parent-id <id|-> --name <entry>\n"
+"                           --target-id <id|-> --uid <uid> --gid <gid>\n"
 "                           --home <dir>\n"
-"       locked-helper copy --src <path> --src-id <dev:ino|-> --dest <path>\n",
+"       locked-helper copy --src <path> --src-id <id|-> --dest <path>\n"
+"       locked-helper id <path>\n",
 	    stderr);
 }
 
@@ -310,70 +323,235 @@ join_path(const char *dir, const char *name)
 
 typedef struct {
 	int	given;
-	dev_t	dev;
+	int	by_vol;		/* the expectation names a volume uuid */
+	uuid_t	vol;
+	dev_t	dev;		/* used only when by_vol is 0 */
 	ino_t	ino;
 } nodeid_t;
 
+/* A volume's uuid, or nothing when the filesystem reports none. */
+typedef struct {
+	int	given;
+	uuid_t	u;
+} voluuid_t;
+
 /*
- * "-" means "no expectation". Both "dev:ino" and "dev.ino" are accepted: the
- * bash side's node_id() emits `stat -f '%d.%i'` while this helper's own output
- * and error text use the colon form the spec fixes. Accepting both keeps the
- * two sides from disagreeing over a separator.
+ * getattrlist's fixed-shape answer. ATTR_CMN_RETURNED_ATTRS plus
+ * FSOPT_PACK_INVAL_ATTRS is what makes it fixed: an unsupported attribute is
+ * then packed as zeroes instead of shifting everything after it, and the
+ * returned mask says whether the volume answered at all.
+ */
+struct volattrbuf {
+	uint32_t	len;
+	attribute_set_t	returned;
+	uuid_t		uuid;
+} __attribute__((packed, aligned(4)));
+
+static void
+vol_attrlist(struct attrlist *al)
+{
+	memset(al, 0, sizeof(*al));
+	al->bitmapcount = ATTR_BIT_MAP_COUNT;
+	al->commonattr = ATTR_CMN_RETURNED_ATTRS;
+	al->volattr = ATTR_VOL_INFO | ATTR_VOL_UUID;
+}
+
+static void
+vol_take(const struct volattrbuf *b, voluuid_t *out)
+{
+	out->given = 0;
+	if ((b->returned.volattr & ATTR_VOL_UUID) == 0)
+		return;
+	memcpy(out->u, b->uuid, sizeof(uuid_t));
+	out->given = 1;
+}
+
+/*
+ * The uuid of the volume a node lives on. Asked of the node itself, not of a
+ * mount point: getattrlist answers with the containing volume for any path or
+ * descriptor (probed 2026-09-09). devfs reports none, which leaves `given` 0
+ * and sends the caller to the st_dev form.
+ */
+static int
+vol_uuid_fd(int fd, voluuid_t *out)
+{
+	struct attrlist al;
+	struct volattrbuf b;
+
+	out->given = 0;
+	vol_attrlist(&al);
+	if (fgetattrlist(fd, &al, &b, sizeof(b), FSOPT_PACK_INVAL_ATTRS) != 0)
+		return (-1);
+	vol_take(&b, out);
+	return (0);
+}
+
+/* dirfd may be AT_FDCWD when the path is absolute, which is the only shape
+ * the callers pass. FSOPT_NOFOLLOW: a symlink's own volume, never its
+ * target's. */
+static int
+vol_uuid_at(int dirfd, const char *name, voluuid_t *out)
+{
+	struct attrlist al;
+	struct volattrbuf b;
+
+	out->given = 0;
+	vol_attrlist(&al);
+	if (getattrlistat(dirfd, name, &al, &b, sizeof(b),
+	    FSOPT_NOFOLLOW | FSOPT_PACK_INVAL_ATTRS) != 0)
+		return (-1);
+	vol_take(&b, out);
+	return (0);
+}
+
+/*
+ * How to re-ask the kernel about a node without naming a path this process
+ * does not already hold: a descriptor when there is one, else a (dirfd, name)
+ * pair for the *at() call. A symlink or a socket never yields a descriptor,
+ * so the pair is the only form available for those.
+ */
+typedef struct {
+	int		 fd;	/* -1 when there is none */
+	int		 dirfd;
+	const char	*name;
+} nodeat_t;
+
+static nodeat_t
+at_fd(int fd)
+{
+	nodeat_t a;
+
+	a.fd = fd;
+	a.dirfd = -1;
+	a.name = NULL;
+	return (a);
+}
+
+static nodeat_t
+at_name(int dirfd, const char *name)
+{
+	nodeat_t a;
+
+	a.fd = -1;
+	a.dirfd = dirfd;
+	a.name = name;
+	return (a);
+}
+
+/*
+ * "-" means "no expectation". Both "<vol>:<ino>" and "<vol>.<ino>" are
+ * accepted: the bash side's records spell the separator with a dot while this
+ * helper's own output and error text use the colon the header fixes. A uuid
+ * contains neither, so the separator is unambiguous either way.
  */
 static int
 parse_id(const char *s, nodeid_t *out)
 {
+	uuid_string_t ub;
 	char *end;
-	long long dv;
 	unsigned long long iv;
 
 	out->given = 0;
+	out->by_vol = 0;
 	out->dev = 0;
 	out->ino = 0;
+	memset(out->vol, 0, sizeof(out->vol));
 	if (s == NULL || strcmp(s, "-") == 0)
 		return (0);
 
-	errno = 0;
-	dv = strtoll(s, &end, 10);
-	if (end == s || errno != 0 || (*end != ':' && *end != '.'))
-		return (-1);
-	s = end + 1;
+	if (strlen(s) > 36 && (s[36] == ':' || s[36] == '.')) {
+		memcpy(ub, s, 36);
+		ub[36] = '\0';
+		if (uuid_parse(ub, out->vol) != 0)
+			return (-1);
+		out->by_vol = 1;
+		s += 37;
+	} else {
+		long long dv;
+
+		errno = 0;
+		dv = strtoll(s, &end, 10);
+		if (end == s || errno != 0 || (*end != ':' && *end != '.'))
+			return (-1);
+		out->dev = (dev_t)dv;
+		s = end + 1;
+	}
 	errno = 0;
 	iv = strtoull(s, &end, 10);
 	if (end == s || errno != 0 || *end != '\0')
 		return (-1);
 
-	out->dev = (dev_t)dv;
 	out->ino = (ino_t)iv;
 	out->given = 1;
 	return (0);
 }
 
+/* The st_dev form: still what an in-window entry snapshot speaks, since those
+ * comparisons never outlive one run of this process, and still the fallback
+ * for a filesystem with no volume uuid. Printed UNSIGNED through uint32_t,
+ * the way stat(1) prints it: dev_t is a signed 32-bit type, devfs's st_dev
+ * has the high bit set, and a leading "-" would both disagree with every
+ * record the bash side ever wrote and read as a uuid to its eye. */
 static void
 fmt_id(char *buf, size_t n, dev_t dev, ino_t ino)
 {
-	snprintf(buf, n, "%lld:%llu", (long long)dev, (unsigned long long)ino);
+	snprintf(buf, n, "%llu:%llu", (unsigned long long)(uint32_t)dev,
+	    (unsigned long long)ino);
+}
+
+static void
+fmt_vol_id(char *buf, size_t n, const uuid_t vol, ino_t ino)
+{
+	uuid_string_t u;
+
+	uuid_unparse_upper(vol, u);
+	snprintf(buf, n, "%s:%llu", u, (unsigned long long)ino);
 }
 
 /*
  * Identity gate. Every caller runs this BEFORE any flag word is cleared, so a
- * refusal leaves the filesystem exactly as it was found.
+ * refusal leaves the filesystem exactly as it was found. `at` says how to
+ * reach the node for its volume uuid; the volume is only asked for when the
+ * expectation names one, and a volume that reports none while the record
+ * names one is a mismatch, not a pass.
  */
 static int
 check_id(const char *what, const char *path, const nodeid_t *want,
-    const struct stat *st)
+    const struct stat *st, nodeat_t at)
 {
+	voluuid_t vol;
 	char got[64], exp[64];
+	int match;
 
 	if (!want->given)
 		return (0);
-	if (st->st_dev == want->dev && st->st_ino == want->ino)
+
+	vol.given = 0;
+	if (want->by_vol) {
+		if (at.fd >= 0)
+			(void)vol_uuid_fd(at.fd, &vol);
+		else
+			(void)vol_uuid_at(at.dirfd, at.name, &vol);
+		match = vol.given && uuid_compare(vol.u, want->vol) == 0 &&
+		    st->st_ino == want->ino;
+	} else {
+		match = st->st_dev == want->dev && st->st_ino == want->ino;
+	}
+	if (match)
 		return (0);
 
-	fmt_id(got, sizeof(got), st->st_dev, st->st_ino);
-	fmt_id(exp, sizeof(exp), want->dev, want->ino);
-	errf("%s %s changed identity (dev:ino %s expected %s)", what, path,
-	    got, exp);
+	if (want->by_vol) {
+		if (vol.given)
+			fmt_vol_id(got, sizeof(got), vol.u, st->st_ino);
+		else
+			snprintf(got, sizeof(got), "no-volume-uuid:%llu",
+			    (unsigned long long)st->st_ino);
+		fmt_vol_id(exp, sizeof(exp), want->vol, want->ino);
+	} else {
+		fmt_id(got, sizeof(got), st->st_dev, st->st_ino);
+		fmt_id(exp, sizeof(exp), want->dev, want->ino);
+	}
+	errf("%s %s changed identity (%s expected %s)", what, path, got, exp);
 	return (-1);
 }
 
@@ -634,7 +812,7 @@ window_open(window_t *w, const char *path, const nodeid_t *want)
 		errf("cannot stat parent %s: %s", path, strerror(errno));
 		return (EX_HELPER_OPFAIL);
 	}
-	if (check_id("parent", path, want, &w->st) != 0)
+	if (check_id("parent", path, want, &w->st, at_fd(w->fd)) != 0)
 		return (EX_HELPER_IDENT);
 	w->saved = w->st.st_flags;
 	if (snapshot(w->fd, path, &w->before) != 0)
@@ -742,7 +920,11 @@ target_open(target_t *t, int pfd, const char *ppath, const char *name,
 		errf("cannot stat %s: %s", t->path, strerror(errno));
 		return (EX_HELPER_OPFAIL);
 	}
-	if (check_id("target", t->path, want, &t->st) != 0)
+	/* The volume comes from the held parent fd and the entry name, never
+	 * from a re-resolved path -- the same *at() discipline as the stat
+	 * above. For a symlink or a socket this is the only identity check
+	 * there will be, since neither yields a descriptor. */
+	if (check_id("target", t->path, want, &t->st, at_name(pfd, name)) != 0)
 		return (EX_HELPER_IDENT);
 	t->saved = t->st.st_flags;
 
@@ -772,7 +954,7 @@ target_open(target_t *t, int pfd, const char *ppath, const char *name,
 		errf("cannot stat %s: %s", t->path, strerror(errno));
 		return (EX_HELPER_OPFAIL);
 	}
-	if (check_id("target", t->path, want, &t->st) != 0)
+	if (check_id("target", t->path, want, &t->st, at_fd(t->fd)) != 0)
 		return (EX_HELPER_IDENT);
 	t->saved = t->st.st_flags;
 	return (EX_HELPER_OK);
@@ -1142,7 +1324,7 @@ parse_ids(const char *s, nodeid_t *out, const char *what)
 	if (need(s, what) != 0)
 		return (-1);
 	if (parse_id(s, out) != 0) {
-		errf("%s is not a dev:ino identity", what);
+		errf("%s is not a node identity", what);
 		return (-1);
 	}
 	return (0);
@@ -1723,7 +1905,7 @@ cmd_copy(int argc, char **argv)
 		status = EX_HELPER_OPFAIL;
 		goto cleanup;
 	}
-	if (check_id("source", o.src, &sid, &st) != 0) {
+	if (check_id("source", o.src, &sid, &st, at_fd(sfd)) != 0) {
 		status = EX_HELPER_IDENT;
 		goto cleanup;
 	}
@@ -1770,6 +1952,43 @@ cleanup:
 	return (status);
 }
 
+/* ---- verb: id ----------------------------------------------------------- */
+
+/*
+ * What the bash side's node_id() calls. Printing the identity from the same
+ * code that later compares it is the point: the two sides cannot spell one
+ * node differently. Mutates nothing and needs no root -- unprivileged
+ * `locked status` reads identities too.
+ */
+static int
+cmd_id(int argc, char **argv)
+{
+	struct stat st;
+	voluuid_t vol;
+	char buf[64];
+
+	if (argc != 3) {
+		errf("id takes exactly one path");
+		return (EX_HELPER_USAGE);
+	}
+	/* Absolute like every other path this binary takes: one grammar, and
+	 * nothing resolved against a cwd that is the caller's. */
+	if (need_abs(argv[2], "<path>") != 0)
+		return (EX_HELPER_USAGE);
+	if (lstat(argv[2], &st) != 0) {
+		errf("cannot stat %s: %s", argv[2], strerror(errno));
+		return (EX_HELPER_OPFAIL);
+	}
+	vol.given = 0;
+	(void)vol_uuid_at(AT_FDCWD, argv[2], &vol);
+	if (vol.given)
+		fmt_vol_id(buf, sizeof(buf), vol.u, st.st_ino);
+	else
+		fmt_id(buf, sizeof(buf), st.st_dev, st.st_ino);
+	printf("%s\n", buf);
+	return (EX_HELPER_OK);
+}
+
 /* ---- entry point -------------------------------------------------------- */
 
 int
@@ -1799,6 +2018,16 @@ main(int argc, char **argv)
 		usage();
 		return (EX_HELPER_USAGE);
 	}
+	/* Dispatched before the root gate: `id` changes nothing, and the bash
+	 * side's unprivileged verbs need it. */
+	if (strcmp(argv[1], "id") == 0) {
+		status = cmd_id(argc, argv);
+		if (status == EX_HELPER_USAGE)
+			usage();
+		fflush(stdout);
+		return (status);
+	}
+
 	if (geteuid() != 0) {
 		errf("must run as root");
 		return (EX_HELPER_USAGE);
