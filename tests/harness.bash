@@ -1202,6 +1202,15 @@ locked status "$BACK" >"$OUTF" 2>&1 || true
 ok   "per-path status renders the suspended row" grep -qF "~  $BACK (content, suspended" "$OUTF"
 ok   "per-path status shows the bin line"      grep -qF "bin: $VD/bin/back.txt" "$OUTF"
 
+note "== mediated: the pool is left consistent =="
+# The reappearance fixture is deliberate drift, and the status rows above
+# are its last consumer. Drop it HERE, not at the end of the file: every
+# whole-pool verify a later section runs would otherwise inherit its
+# drift, and what this harness leaves behind should be only what it meant
+# to leave.
+rm -f -- "$(meta_path "$BACK")"
+ok   "verify clean once the drift fixture is gone" locked verify --quiet
+
 note "== why: what is actually stopping this =="
 WHYF="$MED/why-plain.txt"
 as_user /bin/sh -c "echo w > '$WHYF'"
@@ -1301,12 +1310,6 @@ ok   "the same call with the real id works"    "$HELPER" rm --parent "$IDW" \
        --parent-id "$("$HELPER" id "$IDW")" --name victim.txt --target-id -
 deny "and the entry is gone"                   test -e "$IDW/victim.txt"
 chflags -- nouappnd "$IDW"
-
-note "== mediated: the pool is left consistent =="
-# The reappearance fixture is deliberate drift; drop it so what this
-# harness leaves behind is only what it meant to leave.
-rm -f -- "$(meta_path "$BACK")"
-ok   "verify clean once the drift fixture is gone" locked verify --quiet
 
 # ---- summary ---------------------------------------------------------------
 
