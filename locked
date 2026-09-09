@@ -1519,6 +1519,13 @@ release_node() {
       ;;
     placement|anchor)
       fclear "$flag" "$f" || return 1
+      # Placement keeps lock-account ownership and 770 through the unlock,
+      # deliberately: that IS the seal's structure, not drift. The owner
+      # must stay the lock account because `uappnd` is a user flag its
+      # owner could clear, and group rwx is the door the user comes back
+      # in by. The flag is the whole of what an unlock lifts; the recorded
+      # owner/group/mode are the pre-adoption identity, kept for a future
+      # un-provision.
       # Anchor files keep the snapshot flow so the relock diff-witness has
       # a baseline (ownership untouched either way).
       if [ "$tier" = "anchor" ] && [ -f "$f" ]; then
@@ -2157,6 +2164,32 @@ do_lock_one() {
     leaf_tier=content
     if [ "$f" = "$user_home" ] || [ "$under_ssh" -eq 1 ]; then
       leaf_tier=anchor
+    fi
+  fi
+
+  # A relock is not a tier change: a node with a record keeps the tier the
+  # record names. Defaulting to content instead turned a routine
+  # unlock/lock round trip on a placement dir into a failure -- content
+  # needs a uniform tree, and a placement dir's children legitimately carry
+  # the lock group -- and would have restored the wrong mode. The ~ and
+  # ~/.ssh anchor defaults above agree with any record those paths can
+  # have, and the ~/.ssh rule below still gets the last word.
+  snap_paths "$f"
+  local rec_tier=""
+  if [ -f "$META" ]; then
+    case "$(meta_field "$META" state)" in
+      locked|unlocked) rec_tier="$(meta_field "$META" tier)" ;;
+    esac
+  fi
+  if [ -n "$rec_tier" ]; then
+    if [ -z "$OPT_TIER" ]; then
+      leaf_tier="$rec_tier"
+    elif [ "$OPT_TIER" != "$rec_tier" ]; then
+      echo "${E_RED}${E_B}ERROR:${E_OFF} $f is recorded as tier $rec_tier; a relock keeps the recorded tier" >&2
+      echo "       A tier change is not a relock: it would have to un-provision" >&2
+      echo "       the seal this record describes, and no verb does that yet." >&2
+      log_action lock "$f" refuse-tier-change
+      return 1
     fi
   fi
 
