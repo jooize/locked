@@ -488,6 +488,28 @@ check "staging is left empty"             "0" \
       "$(ls -A "$SNAPROOT/$INV/.staging" | wc -l | tr -d ' ')"
 deny "no root-only bytes reached the target" grep -qF secret "$CFG"
 
+note "== cli: an edit carries the sealed file's xattrs, not the candidate's =="
+# Keeping a sealed file's extended attributes is part of locked's job, and
+# the candidate is read with cat, which carries bytes only. Its own fixture:
+# xattrs cannot be set on a file that is already uchg.
+XCFG="$FAKE_HOME/sub/xattr-edit.txt"
+printf 'version 1\n' >"$XCFG"
+chown "$INV" "$XCFG"
+xattr -w house.test v1 "$XCFG"
+ok   "lock the xattr edit fixture"         locked lock --yes "$XCFG"
+XPROP="$PROPD/xattr.proposed.txt"
+as_user /bin/sh -c "printf 'version 2\n' > '$XPROP'"
+as_user xattr -w house.evil planted "$XPROP"
+ok   "edit --from the xattr fixture"       locked edit --yes --from "$XPROP" "$XCFG"
+check "the proposed content installed"     "version 2" "$(head -1 "$XCFG")"
+check "the sealed file keeps its xattr"    "v1" "$(xattr -p house.test "$XCFG")"
+deny "the candidate's xattr is not adopted" xattr -p house.evil "$XCFG"
+check "the edited file is sealed again"    "uchg" "$(flags_of "$XCFG")"
+ok   "verify clean after the xattr edit"   locked verify
+ok   "revert the xattr fixture"            locked revert "$XCFG"
+check "the reverted content"               "version 1" "$(head -1 "$XCFG")"
+check "the reverted file keeps its xattr"  "v1" "$(xattr -p house.test "$XCFG")"
+
 note "== cli: ~/.ssh class -- anchor only, ownership never changes =="
 as_user mkdir -m 700 -- "$FAKE_HOME/.ssh"
 SSHCFG="$FAKE_HOME/.ssh/config"

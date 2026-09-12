@@ -2447,6 +2447,21 @@ do_edit_one() {
     return 0
   fi
 
+  # The candidate was read with cat, so it holds content and nothing else.
+  # Keeping a sealed file's extended attributes and ACLs is part of what
+  # locked is for, so they come from $f -- a re-application onto a
+  # candidate that has none of its own, never a merge, and nothing the
+  # candidate might have carried is trusted.
+  local fid
+  fid="$(node_id "$f")" || { rm -f -- "$stage"; return 1; }
+  "$LOCKED_HELPER" xattrs-from --src "$f" --src-id "${fid/./:}" \
+    --dest "$stage" || {
+    rm -f -- "$stage"
+    echo "edit: cannot carry $f's extended attributes onto the candidate" >&2
+    log_action edit "$f" refuse-xattrs
+    return 1
+  }
+
   show_diff "$label" "$f" \
     diff "--color=$DIFF_COLOR" -u "$f" "$stage" || { rm -f -- "$stage"; return 1; }
   echo

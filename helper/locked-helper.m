@@ -121,6 +121,8 @@ usage(void)
 "                           --target-id <id|-> --uid <uid> --gid <gid>\n"
 "                           --home <dir>\n"
 "       locked-helper copy --src <path> --src-id <id|-> --dest <path>\n"
+"       locked-helper xattrs-from --src <path> --src-id <id|->\n"
+"                                 --dest <path>\n"
 "       locked-helper id <path>\n",
 	    stderr);
 }
@@ -1952,6 +1954,99 @@ cleanup:
 	return (status);
 }
 
+/* ---- verb: xattrs-from -------------------------------------------------- */
+
+/*
+ * Re-apply a sealed file's own extended attributes and ACLs to a staged
+ * candidate whose CONTENT came from somewhere else. `locked edit` reads the
+ * candidate as the invoker, with cat, which carries bytes and nothing else;
+ * without this an edit would quietly strip attributes locked is holding the
+ * file responsible for keeping. The candidate arrives with no attributes of
+ * its own, so this is a re-application, never a merge -- nothing the
+ * candidate brought is trusted or kept.
+ *
+ * COPYFILE_DATA and COPYFILE_STAT are both deliberately absent: the content
+ * is exactly what the human approved in the diff, and mode, owner and the
+ * flag word belong to the install step (see the cp -p hazard in cmd_copy).
+ *
+ * The source is pinned by identity, not by ownership -- an anchor-tier node
+ * (~/.ssh/config) is legitimately owned by the invoker, so ownership says
+ * nothing here, while the recorded identity says exactly which node this
+ * has to be. The destination must be root-owned: it is the staging file the
+ * caller just created, and anything else is not ours to write to.
+ */
+static int
+cmd_xattrs_from(int argc, char **argv)
+{
+	opts_t o;
+	nodeid_t sid;
+	struct stat st;
+	int sfd = -1, dfd = -1, status = EX_HELPER_OK;
+
+	if (parse_opts(argc, argv, &o) != 0)
+		return (EX_HELPER_USAGE);
+	if (need_abs(o.src, "--src") != 0 || need_abs(o.dest, "--dest") != 0 ||
+	    parse_ids(o.src_id, &sid, "--src-id") != 0)
+		return (EX_HELPER_USAGE);
+
+	sfd = open(o.src, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+	if (sfd < 0) {
+		errf("cannot open %s: %s", o.src, strerror(errno));
+		status = EX_HELPER_OPFAIL;
+		goto cleanup;
+	}
+	if (fstat(sfd, &st) != 0) {
+		errf("cannot stat %s: %s", o.src, strerror(errno));
+		status = EX_HELPER_OPFAIL;
+		goto cleanup;
+	}
+	if (check_id("source", o.src, &sid, &st, at_fd(sfd)) != 0) {
+		status = EX_HELPER_IDENT;
+		goto cleanup;
+	}
+	if (!S_ISREG(st.st_mode)) {
+		errf("%s is not a regular file", o.src);
+		status = EX_HELPER_OPFAIL;
+		goto cleanup;
+	}
+
+	dfd = open(o.dest, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+	if (dfd < 0) {
+		errf("cannot open %s: %s", o.dest, strerror(errno));
+		status = EX_HELPER_OPFAIL;
+		goto cleanup;
+	}
+	if (fstat(dfd, &st) != 0) {
+		errf("cannot stat %s: %s", o.dest, strerror(errno));
+		status = EX_HELPER_OPFAIL;
+		goto cleanup;
+	}
+	if (!S_ISREG(st.st_mode)) {
+		errf("%s is not a regular file", o.dest);
+		status = EX_HELPER_OPFAIL;
+		goto cleanup;
+	}
+	if (st.st_uid != 0) {
+		errf("%s is not root-owned; refusing", o.dest);
+		status = EX_HELPER_OPFAIL;
+		goto cleanup;
+	}
+
+	if (fcopyfile(sfd, dfd, NULL, COPYFILE_XATTR | COPYFILE_ACL) != 0) {
+		errf("cannot carry attributes from %s to %s: %s", o.src,
+		    o.dest, strerror(errno));
+		status = EX_HELPER_OPFAIL;
+		goto cleanup;
+	}
+
+cleanup:
+	if (sfd >= 0)
+		close(sfd);
+	if (dfd >= 0)
+		close(dfd);
+	return (status);
+}
+
 /* ---- verb: id ----------------------------------------------------------- */
 
 /*
@@ -2041,6 +2136,8 @@ main(int argc, char **argv)
 		status = cmd_trash(argc, argv);
 	else if (strcmp(argv[1], "copy") == 0)
 		status = cmd_copy(argc, argv);
+	else if (strcmp(argv[1], "xattrs-from") == 0)
+		status = cmd_xattrs_from(argc, argv);
 	else {
 		errf("unknown verb %s", argv[1]);
 		usage();
