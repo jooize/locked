@@ -447,7 +447,7 @@ EDITBODY="$SCRATCH/do_edit_one.body"
 awk '/^do_edit_one\(\) \{/,/^\}$/' "$LOCKED" >"$EDITBODY"
 ok   "the edit body was extracted"        test -s "$EDITBODY"
 ok   "the diff reads the frozen copy"     \
-     grep -qF 'diff "--color=$DIFF_COLOR" -u "$f" "$stage"' "$EDITBODY"
+     grep -qF 'diff --color=never -u "$f" "$stage"' "$EDITBODY"
 ok   "the install reads the frozen copy"  \
      grep -qF 'atomic_replace "$stage" "$f"' "$EDITBODY"
 FREEZELN="$(grep -n 'show_diff' "$EDITBODY" | head -1 | cut -d: -f1)"
@@ -531,6 +531,153 @@ check "reverted content"                 "Host example" "$(head -1 "$SSHCFG")"
 check "reverted owner stays user"        "$INV" "$(owner_of "$SSHCFG")"
 check "reverted flag schg"               "schg" "$(flags_of "$SSHCFG")"
 ok   "verify clean with ssh in pool"     locked verify
+
+note "== cli: diff witness encodes controls and invisibles =="
+# The diff is the trust decision, so the candidate must not be able to
+# paint it: an escape sequence can scroll a removal out of sight or repaint
+# it, and a bidi override can read as one thing and install as another.
+# Each fixture below carries one class of byte and is driven through all
+# three diff sites with the real verbs; the display is then read back, and
+# the encoded token has to be in it while the raw byte must not be.
+#
+# Fixture bytes never reach a log line: every assertion here reports a
+# count or a description, so this harness's own output stays printable
+# whatever the fixtures hold.
+#
+# No fixture carries a NUL. diff does print one, but a NUL cannot survive a
+# bash variable, and the encoder treats it as the C0 control that \x01
+# already stands for here.
+DWD="$FAKE_HOME/diffwitness"
+install -d -o "$INV" -g staff -m 755 "$DWD"
+DW="$SCRATCH/diff-witness.out"
+DW_ESC="$(printf '\033')"
+DW_C1="$(printf '\302[\200-\237]')"   # a c1 control still in its utf-8 form
+
+DW_LBL=() DW_NDL=()
+dw_want() { DW_LBL+=("$1"); DW_NDL+=("$2"); }
+
+dw_site() { # <desc> <cmd...>: run one verb, then read its display back
+  local desc="$1"; shift
+  local rc=0 i=0
+  "$@" >"$DW" 2>&1 || rc=$?
+  check "$desc succeeded"                  "0" "$rc"
+  while [ "$i" -lt "${#DW_NDL[@]}" ]; do
+    ok   "$desc shows ${DW_LBL[$i]}"       grep -qF -- "${DW_NDL[$i]}" "$DW"
+    i=$((i + 1))
+  done
+  check "$desc leaks no raw escape"        "0" \
+        "$(LC_ALL=C grep -c -- "$DW_ESC" "$DW" || true)"
+  check "$desc leaks no raw c1 byte"       "0" \
+        "$(LC_ALL=C grep -c -- "$DW_C1" "$DW" || true)"
+}
+
+DWE="$DWD/edit-target.txt"
+printf 'plain\n' >"$DWE"
+chown "$INV:staff" "$DWE"
+ok   "the edit target seals"              locked lock --yes "$DWE"
+
+dw_case() { # <name> <printf escapes> <label> <needle>...: one class, three sites
+  local name="$1" bytes="$2"; shift 2
+  DW_LBL=() DW_NDL=()
+  while [ "$#" -ge 2 ]; do dw_want "$1" "$2"; shift 2; done
+  local rc f s p
+  # Content relock: adopt plain, release (which is what snapshots), write
+  # the fixture, reseal. The reseal is the site that draws the diff.
+  f="$DWD/$name.txt"
+  rc=0
+  printf 'plain\n' >"$f"
+  chown "$INV:staff" "$f"
+  locked lock --yes "$f" >/dev/null 2>&1 || rc=1
+  locked unlock "$f" >/dev/null 2>&1 || rc=1
+  printf '%b' "$bytes" >"$f"
+  check "content fixture ($name) was set up" "0" "$rc"
+  dw_site "content relock ($name)"        locked lock --yes "$f"
+  # Anchor relock: the same round under ~/.ssh, where the tier is forced.
+  s="$FAKE_HOME/.ssh/$name.cfg"
+  rc=0
+  printf 'plain\n' >"$s"
+  chown "$INV:staff" "$s"
+  locked lock --yes "$s" >/dev/null 2>&1 || rc=1
+  locked unlock "$s" >/dev/null 2>&1 || rc=1
+  printf '%b' "$bytes" >"$s"
+  check "anchor fixture ($name) was set up" "0" "$rc"
+  dw_site "anchor relock ($name)"         locked lock --yes "$s"
+  # Edit: the fixture arrives as a proposal for a sealed plain file, and
+  # the revert hands that file back to the next class unchanged.
+  p="$PROPD/$name.proposed"
+  printf '%b' "$bytes" >"$p"
+  chown "$INV:staff" "$p"
+  dw_site "edit --from ($name)"           locked edit --yes --from "$p" "$DWE"
+  rc=0
+  locked revert "$DWE" >/dev/null 2>&1 || rc=1
+  check "the edit target reverted ($name)" "0" "$rc"
+}
+
+# The keep-raw needles are built from escapes so this file stays ascii and
+# the bytes are exactly the ones asserted: o with diaeresis, a rightwards
+# arrow, a Persian word with a zero width non-joiner between its two parts,
+# and a tab between two letters.
+DW_OE="$(printf '%b' '\xc3\xb6')"
+DW_ARROW="$(printf '%b' '\xe2\x86\x92')"
+DW_FA="$(printf '%b' '\xd9\x86\xd9\x85\xdb\x8c\xe2\x80\x8c\xd8\xae\xd9\x88\xd8\xa7\xd9\x87\xd9\x85')"
+DW_TAB="$(printf '%b' 'tab\there')"
+
+dw_case esc  'esc \x1b[31mred\x1b[0m\n' \
+        'the escape as a token'             '\x{1B}'
+dw_case c0   'soh \x01 cr\x0d end\n' \
+        'start of heading as a token'       '\x{01}' \
+        'carriage return as a token'        '\x{0D}'
+dw_case del  'del \x7f end\n' \
+        'delete as a token'                 '\x{7F}'
+dw_case c1   'c1 \xc2\x85 end\n' \
+        'the c1 control as a token'         '\x{85}'
+dw_case bidi 'bidi \xe2\x80\xae evil \xe2\x81\xa6 end\n' \
+        'the bidi override as a token'      '\x{202E}' \
+        'the bidi isolate as a token'       '\x{2066}'
+dw_case zw   'zwsp \xe2\x80\x8b lrm \xe2\x80\x8e end\n' \
+        'zero width space as a token'       '\x{200B}' \
+        'the left-to-right mark as a token' '\x{200E}'
+dw_case bom  '\xef\xbb\xbfbom on the first line\n' \
+        'a leading byte order mark'         '\x{FEFF}'
+dw_case bad  'bad \xc3 end\n' \
+        'the invalid byte as a token'       '\x{C3}'
+dw_case keep '\xc3\xb6 \xe2\x86\x92 \xd9\x86\xd9\x85\xdb\x8c\xe2\x80\x8c\xd8\xae\xd9\x88\xd8\xa7\xd9\x87\xd9\x85 tab\there\n' \
+        'o with diaeresis byte-exact'       "$DW_OE" \
+        'the arrow byte-exact'              "$DW_ARROW" \
+        'the Persian word with its joiner'  "$DW_FA" \
+        'the tab byte-exact'                "$DW_TAB"
+
+ok   "verify clean after the witness round" locked verify
+
+note "== diff witness: the filter is the only thing that emits an escape =="
+# The painter runs only on a tty, which this harness is not, so it is
+# exercised on the very source the script runs -- lifted out of locked by
+# the quotes that delimit it, never a second copy of the program.
+DWFILT="$SCRATCH/diff-filter.pl"
+sed -n "/^readonly DIFF_FILTER='\$/,/^'\$/p" "$LOCKED" | sed '1d;$d' >"$DWFILT"
+ok   "the filter source was lifted out"    test -s "$DWFILT"
+ok   "the filter source compiles"          /usr/bin/perl -c "$DWFILT"
+DWPIN="$SCRATCH/painter.in"
+DWPOUT="$SCRATCH/painter.out"
+printf '%b' '+add \x1b[31m\n-del\n@@ -1 +1 @@\n--- a\n' >"$DWPIN"
+/usr/bin/perl "$DWFILT" 1 <"$DWPIN" >"$DWPOUT" 2>&1 || true
+check "an addition line opens green"       "1" \
+      "$(grep -cF -- "${DW_ESC}[32m+add" "$DWPOUT" || true)"
+check "the token wears reverse video"      "1" \
+      "$(grep -cF -- "${DW_ESC}[7m\\x{1B}${DW_ESC}[27m" "$DWPOUT" || true)"
+check "reverse video ends, the line color does not" "1" \
+      "$(grep -cF -- "[31m${DW_ESC}[0m" "$DWPOUT" || true)"
+check "a removal line opens red"           "1" \
+      "$(grep -cF -- "${DW_ESC}[31m-del" "$DWPOUT" || true)"
+check "a hunk header opens cyan"           "1" \
+      "$(grep -cF -- "${DW_ESC}[36m@@" "$DWPOUT" || true)"
+check "a file header goes bold"            "1" \
+      "$(grep -cF -- "${DW_ESC}[1m--- a" "$DWPOUT" || true)"
+/usr/bin/perl "$DWFILT" 0 <"$DWPIN" >"$DWPOUT" 2>&1 || true
+check "color off emits no escape at all"   "0" \
+      "$(LC_ALL=C grep -c -- "$DW_ESC" "$DWPOUT" || true)"
+check "color off still encodes the token"  "1" \
+      "$(grep -cF -- '\x{1B}' "$DWPOUT" || true)"
 
 note "== cli: dry-run mutates nothing =="
 DR="$FAKE_HOME/dryrun.txt"

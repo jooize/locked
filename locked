@@ -76,10 +76,8 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   C_OFF=$'\033[0m' C_B=$'\033[1m' C_DIM=$'\033[2m'
   C_RED=$'\033[31m' C_GRN=$'\033[32m' C_YEL=$'\033[33m'
   C_CYN=$'\033[36m' C_MAG=$'\033[35m' C_BLU=$'\033[1;34m'
-  DIFF_COLOR=always
 else
   C_OFF='' C_B='' C_DIM='' C_RED='' C_GRN='' C_YEL='' C_CYN='' C_MAG='' C_BLU=''
-  DIFF_COLOR=never
 fi
 if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
   E_OFF=$'\033[0m' E_B=$'\033[1m' E_DIM=$'\033[2m'
@@ -1228,34 +1226,164 @@ tier_for_ancestor() {
 
 # ---- seal / release primitives ---------------------------------------------
 
+# The diff witness renders candidate bytes, so it must not let those bytes
+# talk to the terminal: an escape sequence in a proposed config could move
+# the cursor, erase the line above or repaint a removal as an addition, and
+# the approval would then be given to something other than what installs.
+# Every diff site runs with --color=never and pipes the capture through this
+# filter, which is the only thing in the block that emits an escape -- so
+# any escape on screen is locked's own.
+#
+# Encoded, as \x{HH} or \x{HHHH} (wider for wider code points): the C0
+# controls except tab and newline, delete, the C1 block, the bidi
+# overrides, embeddings and isolates, zero width space, the left- and
+# right-to-left marks, and the byte order mark wherever it sits. A leading
+# mark therefore shows as a token in the one hunk that carries it, which
+# costs a visible \x{FEFF} on a first line and saves any reasoning about
+# offsets. Carriage return is a C0 control, so a CRLF file shows \x{0D} at
+# every line end: that is the honest rendering. Zero width non-joiner and
+# joiner stay raw -- Persian and Arabic text and emoji sequences are built
+# from them.
+#
+# A byte that is not valid UTF-8 is encoded as itself, one token per byte,
+# never dropped and never folded into a replacement character. That is why
+# the UTF-8 scan is spelled out below instead of calling Encode::decode
+# with a malformed-byte callback: Encode consumes the whole bad sequence
+# and reports only its first byte, which would take bytes out of the
+# witness. vis -s was the other candidate and cannot serve either -- it
+# rewrites every non-ASCII byte in every locale, so a Swedish or Persian
+# config would arrive unreadable.
+#
+# perl is the one runtime dependency this adds. The program reads no
+# locale: it works in bytes from end to end, which it has to, because
+# sudo's env_reset strips LANG before locked ever runs.
+#
+# The source is a single-quoted bash string, and the program holds no
+# single quote of its own, so bash expands nothing and perl sees the bytes
+# written here -- no heredoc, no escaping, nothing between the two.
+# shellcheck disable=SC2016  # the single quotes are the point: no expansion
+readonly DIFF_FILTER='
+use strict;
+my $on = (shift(@ARGV) || 0) ? 1 : 0;
+binmode(STDIN);
+binmode(STDOUT);
+# Strict UTF-8: no overlongs, no surrogates, nothing above U+10FFFF. The
+# ASCII branch is last so the multibyte alternatives are tried first.
+my $UTF8 = qr/
+    [\xC2-\xDF][\x80-\xBF]
+  | \xE0[\xA0-\xBF][\x80-\xBF]
+  | [\xE1-\xEC][\x80-\xBF]{2}
+  | \xED[\x80-\x9F][\x80-\xBF]
+  | [\xEE-\xEF][\x80-\xBF]{2}
+  | \xF0[\x90-\xBF][\x80-\xBF]{2}
+  | [\xF1-\xF3][\x80-\xBF]{3}
+  | \xF4[\x80-\x8F][\x80-\xBF]{2}
+  | [\x00-\x7F]
+/x;
+sub cp_of {
+  my @b = unpack("C*", $_[0]);
+  return $b[0] if @b == 1;
+  return (($b[0] & 0x1F) << 6) | ($b[1] & 0x3F) if @b == 2;
+  return (($b[0] & 0x0F) << 12) | (($b[1] & 0x3F) << 6) | ($b[2] & 0x3F) if @b == 3;
+  return (($b[0] & 0x07) << 18) | (($b[1] & 0x3F) << 12)
+       | (($b[2] & 0x3F) << 6) | ($b[3] & 0x3F);
+}
+sub hidden {
+  my $c = shift;
+  return 1 if $c < 0x20 && $c != 0x09 && $c != 0x0A;
+  return 1 if $c == 0x7F;
+  return 1 if $c >= 0x80 && $c <= 0x9F;
+  return 1 if $c == 0x200B || $c == 0x200E || $c == 0x200F || $c == 0xFEFF;
+  return 1 if $c >= 0x202A && $c <= 0x202E;
+  return 1 if $c >= 0x2066 && $c <= 0x2069;
+  return 0;
+}
+# Reverse video, not a full reset, so the line color survives the token and
+# an encoded \x{1B} is still told apart from one a file spells out itself.
+sub tok {
+  my $c = shift;
+  my $t = "\\x{" . ($c < 0x100 ? sprintf("%02X", $c) : sprintf("%04X", $c)) . "}";
+  return $on ? "\e[7m" . $t . "\e[27m" : $t;
+}
+sub paint {
+  my $l = shift;
+  return "\e[1m"  if $l =~ /^(?:\+\+\+ |--- |diff |Only in |Binary files )/;
+  return "\e[36m" if $l =~ /^\@\@/;
+  return "\e[32m" if $l =~ /^\+/ && $l !~ /^\+\+\+/;
+  return "\e[31m" if $l =~ /^-/  && $l !~ /^---/;
+  return "";
+}
+while (defined(my $s = <STDIN>)) {
+  my $nl = ($s =~ s/\n\z//) ? 1 : 0;
+  my $pre = $on ? paint($s) : "";
+  my $out = "";
+  my $len = length($s);
+  pos($s) = 0;
+  while (pos($s) < $len) {
+    # Printable ASCII in one bite; the per-unit scan is for the rest.
+    if ($s =~ /\G([\x09\x0A\x20-\x7E]++)/gc) { $out .= $1; next; }
+    if ($s =~ /\G($UTF8)/gc) {
+      my $c = cp_of($1);
+      $out .= hidden($c) ? tok($c) : $1;
+      next;
+    }
+    $s =~ /\G(.)/gcs and $out .= tok(ord($1));
+  }
+  $out = $pre . $out . "\e[0m" if $pre ne "";
+  print STDOUT $out;
+  print STDOUT "\n" if $nl;
+}
+'
+
+# diff_filter <1|0>: stdin to stdout, controls and invisibles encoded, the
+# diff painted when the argument says color is on.
+diff_filter() { /usr/bin/perl -e "$DIFF_FILTER" "$1"; }
+
 # Diff-witness display, shared by the three diff sites (content relock,
 # anchor relock, edit). Capture FIRST: a diff that fails must abort before
 # its content is presented as reviewable -- exit 1 is "differs", anything
 # above is trouble. Into a temp file, not a variable: a tree diff can be
-# large and hold NULs. Short output prints inline; long output on a tty is
-# announced by a next: gate and paged (less -RF; an early pager quit is not
-# an error), plain cat off-tty. The header starts FLUSH -- the caller owns
-# any blank line before this block -- and the block ends with the diff's
-# own final newline.
+# large and hold NULs. The capture is then encoded into a second file and
+# only the encoded one is ever shown; a filter that cannot run refuses the
+# display rather than falling back to raw bytes. Line count comes off the
+# encoded file, which is what the gate is about to page. Short output
+# prints inline; long output on a tty is announced by a next: gate and
+# paged (less -RF; an early pager quit is not an error), plain cat off-tty.
+# The header starts FLUSH -- the caller owns any blank line before this
+# block -- and the block ends with the diff's own final newline.
 show_diff() { # <label> <path> <diff-cmd>...
-  local label="$1" path="$2" tmp rc=0 lines
+  local label="$1" path="$2" raw enc rc=0 lines dcolor
   shift 2
-  tmp="$(mktemp "${TMPDIR:-/tmp}/locked-diff.XXXXXX")" || return 1
-  "$@" >"$tmp" 2>&1 || rc=$?
+  raw="$(mktemp "${TMPDIR:-/tmp}/locked-diff.XXXXXX")" || return 1
+  enc="$(mktemp "${TMPDIR:-/tmp}/locked-diff.XXXXXX")" || { rm -f -- "$raw"; return 1; }
+  "$@" >"$raw" 2>&1 || rc=$?
   if [ "$rc" -gt 1 ]; then
+    # diff failed, but its output still came off the candidate, so it is
+    # encoded like any other. Stderr decides the color here.
+    dcolor=0; [ -n "$E_OFF" ] && dcolor=1
     echo "${E_RED}${E_B}ERROR:${E_OFF} diff failed for $path:" >&2
-    cat -- "$tmp" >&2
-    rm -f -- "$tmp"
+    diff_filter "$dcolor" <"$raw" >&2 || true
+    rm -f -- "$raw" "$enc"
     return 1
   fi
   set_pal
   printf -- '%s--- %s: %s ---%s\n' "$P_B" "$label" "$path" "$P_OFF"
   if [ "$rc" -eq 0 ]; then
     echo "(no changes)"
-    rm -f -- "$tmp"
+    rm -f -- "$raw" "$enc"
     return 0
   fi
-  lines="$(wc -l <"$tmp" | tr -d ' ')"
+  # P_OFF is empty exactly when set_pal found no tty on this fd or NO_COLOR
+  # set, so the filter paints on the same condition the rest of the block
+  # colors on, including when the caller redirected fd 1.
+  dcolor=0; [ -n "$P_OFF" ] && dcolor=1
+  if ! diff_filter "$dcolor" <"$raw" >"$enc"; then
+    echo "${E_RED}${E_B}ERROR:${E_OFF} cannot render the diff for $path; not showing it unencoded" >&2
+    rm -f -- "$raw" "$enc"
+    return 1
+  fi
+  rm -f -- "$raw"
+  lines="$(wc -l <"$enc" | tr -d ' ')"
   if [ -t 0 ] && [ -t 1 ] && [ "$lines" -gt 24 ]; then
     # The skip key is dim: it is the alternative, not the offer. Declining
     # here only skips the pager -- the confirm that follows still asks.
@@ -1263,12 +1391,12 @@ show_diff() { # <label> <path> <diff-cmd>...
     printf -v gate '%snext:%s diff (%s lines); Enter opens it%s · n skips%s ' \
       "$P_B" "$P_OFF" "$lines" "$P_DIM" "$P_OFF"
     if gate_answer 1 "$gate" 1 "Enter or y opens, n skips"; then
-      /usr/bin/less -RF -- "$tmp" || true
+      /usr/bin/less -RF -- "$enc" || true
     fi
   else
-    cat -- "$tmp"
+    cat -- "$enc"
   fi
-  rm -f -- "$tmp"
+  rm -f -- "$enc"
   return 0
 }
 
@@ -1336,12 +1464,12 @@ seal_content() {
       echo "no changes since unlock: $f"
     else
       show_diff 'diff snapshot -> current' "$f" \
-        diff "--color=$DIFF_COLOR" -u "$SNAP" "$f" || return 1
+        diff --color=never -u "$SNAP" "$f" || return 1
       echo
     fi
   elif [ "$is_dir" -eq 1 ] && [ -d "$SNAPDIR" ]; then
     show_diff 'diff snapshot -> current' "$f" \
-      diff "--color=$DIFF_COLOR" -ru "$SNAPDIR" "$f" || return 1
+      diff --color=never -ru "$SNAPDIR" "$f" || return 1
     echo
   else
     echo "adopting into pool (no prior snapshot): $f"
@@ -1501,7 +1629,7 @@ seal_anchor() {
         echo "no changes since unlock: $f"
       else
         show_diff 'diff snapshot -> current' "$f" \
-          diff "--color=$DIFF_COLOR" -u "$SNAP" "$f" || return 1
+          diff --color=never -u "$SNAP" "$f" || return 1
         echo
       fi
     else
@@ -2463,7 +2591,7 @@ do_edit_one() {
   }
 
   show_diff "$label" "$f" \
-    diff "--color=$DIFF_COLOR" -u "$f" "$stage" || { rm -f -- "$stage"; return 1; }
+    diff --color=never -u "$f" "$stage" || { rm -f -- "$stage"; return 1; }
   echo
   confirm "Install and reseal $(subj "$f")?" installs || {
     echo "${E_YEL}aborted; $f unchanged${E_OFF}" >&2
