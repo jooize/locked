@@ -110,7 +110,7 @@ refuse() { # <desc> <needle> <cmd...>: expect failure WITH the named message,
   if out="$("$@" 2>&1)"; then
     FAIL=$((FAIL + 1)); note "  FAIL  $desc (expected refusal)"
     [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/        | /'
-  elif printf '%s\n' "$out" | grep -qF "$needle"; then
+  elif printf '%s\n' "$out" | grep -qF -e "$needle"; then
     PASS=$((PASS + 1)); note "  ok    $desc"
   else
     FAIL=$((FAIL + 1)); note "  FAIL  $desc (refused, but not with '$needle')"
