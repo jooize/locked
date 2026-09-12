@@ -295,32 +295,78 @@ run() {
   fi
 }
 
-confirm() {
-  # $1: prompt. Returns 0 on yes. Fail closed: non-tty without --yes aborts.
+# ONE implementation of the gate contract, shared by every y/N prompt and
+# every `next:` gate here, which had agreed on Enter and on little else.
+# `y`/`yes` continue, `n`/`no` decline, Enter takes the site's default, and
+# ANYTHING ELSE IS NOT ACTED ON: it is named back in yellow -- a correction,
+# not a refusal -- and the gate asks again. A case whose last arm is the
+# continue turns a typo, a stray paste or a leaned-on key into consent at
+# exactly the moment a human is being asked to take responsibility. End of
+# input declines: a closed stdin is not consent, and these gates fail closed.
+#
+# The caller owns the decline line and its logging -- only it knows what
+# stays unchanged -- and hands the gate line in already rendered, so
+# per-site colour and wording stay where they are composed.
+#
+# The palette follows the fd, exactly as C_*/E_* do: fd 2 is this process's
+# stderr and fd 1 its stdout. A caller whose own stdout is redirected away
+# from the tty never reaches a gate -- both sites test the tty first -- so
+# the fd is a sound stand-in for the stream here.
+gate_answer() { # <fd> <rendered gate line> <Enter continues: 0|1> <unknown-input tail>
+  local fd="$1" line="$2" enter_yes="$3" tail="$4" reply yel off
+  if [ "$fd" -eq 1 ]; then
+    yel="$C_YEL" off="$C_OFF"
+  else
+    yel="$E_YEL" off="$E_OFF"
+  fi
+  while :; do
+    printf '%s' "$line" >&"$fd"
+    if ! IFS= read -r reply; then
+      printf '\n' >&"$fd"   # no echoed Enter closed the gate line
+      return 1
+    fi
+    case "$reply" in
+      y|Y|yes|YES) return 0 ;;
+      n|N|no|NO)   return 1 ;;
+      '')
+        if [ "$enter_yes" -eq 1 ]; then
+          return 0
+        fi
+        return 1
+        ;;
+    esac
+    # Yellow is the attention role: this is the one line the human has to
+    # notice, because they just answered wrong. Truncated -- it echoes
+    # untrusted input back, and it has to stay one line next to the gate it
+    # is about to re-print.
+    printf '%snot an answer: "%s"; %s%s\n' "$yel" "${reply:0:20}" "$tail" "$off" >&"$fd"
+  done
+}
+
+confirm() { # <prompt> [<what y does; default "continues">]
+  # Returns 0 on yes. Fail closed: non-tty without --yes aborts.
   [ "$OPT_YES" -eq 1 ] && return 0
   if [ ! -t 0 ]; then
     echo "stdin is not a tty and --yes not given; aborting" >&2
     return 1
   fi
-  local reply
+  local line
   # Bold carries the decision (terminal-output): the whole sentence,
   # `[y/N]` included, is the authoritative register of this screen.
-  printf '%s%s [y/N]%s ' "$E_B" "$1" "$E_OFF" >&2
-  IFS= read -r reply
-  case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+  printf -v line '%s%s [y/N]%s ' "$E_B" "$1" "$E_OFF"
+  gate_answer 2 "$line" 0 "y ${2:-continues}, Enter or n aborts"
 }
 
-confirm_hard() {
+confirm_hard() { # <prompt> [<what y does; default "continues">]
   # High-signal prompts (node identity changed): --yes does NOT satisfy
   # this; a human at a tty must answer.
   if [ ! -t 0 ]; then
     echo "refusing: this decision needs a human at a tty (--yes does not apply)" >&2
     return 1
   fi
-  local reply
-  printf '%s%s [y/N]%s ' "$E_B" "$1" "$E_OFF" >&2
-  IFS= read -r reply
-  case "$reply" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+  local line
+  printf -v line '%s%s [y/N]%s ' "$E_B" "$1" "$E_OFF"
+  gate_answer 2 "$line" 0 "y ${2:-continues}, Enter or n aborts"
 }
 
 # During an unlock window a released ancestor can be swapped by anything
@@ -1180,9 +1226,14 @@ show_diff() { # <label> <path> <diff-cmd>...
   fi
   lines="$(wc -l <"$tmp" | tr -d ' ')"
   if [ -t 0 ] && [ -t 1 ] && [ "$lines" -gt 24 ]; then
-    printf '%snext:%s diff (%s lines); Enter opens it ' "$P_B" "$P_OFF" "$lines"
-    IFS= read -r _ || true
-    /usr/bin/less -RF -- "$tmp" || true
+    # The skip key is dim: it is the alternative, not the offer. Declining
+    # here only skips the pager -- the confirm that follows still asks.
+    local gate
+    printf -v gate '%snext:%s diff (%s lines); Enter opens it%s · n skips%s ' \
+      "$P_B" "$P_OFF" "$lines" "$P_DIM" "$P_OFF"
+    if gate_answer 1 "$gate" 1 "Enter or y opens, n skips"; then
+      /usr/bin/less -RF -- "$tmp" || true
+    fi
   else
     cat -- "$tmp"
   fi
@@ -2322,8 +2373,8 @@ do_edit_one() {
   show_diff 'diff current -> edited' "$f" \
     diff "--color=$DIFF_COLOR" -u "$f" "$stage" || { rm -f -- "$stage"; return 1; }
   echo
-  confirm "Install and reseal $(subj "$f")?" || {
-    echo "${E_YEL}aborted: $f (edit discarded)${E_OFF}" >&2
+  confirm "Install and reseal $(subj "$f")?" installs || {
+    echo "${E_YEL}aborted; $f unchanged${E_OFF}" >&2
     rm -f -- "$stage"
     return 2
   }
