@@ -298,6 +298,15 @@ Children then keep `staff`. The costs are worse than the benefit: `verify` would
 On Linux the same design would need setgid on the directory, or an explicit `chgrp`, for the inheritance to happen at all. `locked` is Darwin-only and does not handle that case.
 
 ## Caveats
+
+This section collects the sharp edges of the how-to; what each verb does
+and does not guarantee is written out in
+[DESIGN-v2.md](DESIGN-v2.md#guarantees-and-limits-by-verb).
+
+- A caller without a tty -- an editor's or an agent's embedded shell, a
+  script -- cannot answer the confirm gate: `locked` refuses unless
+  `--yes` is given, and `--yes` skips the gate, so the diff is approved
+  unseen. Run `locked` from a real terminal when you want the gate.
 - First lock assumes file is currently owned by you. To bring a file owned by someone else into the pool: `sudo chown -h <you>:staff <file>` first, then `sudo locked lock <file>` captures meta and locks. Or hand-write the meta file before unlocking once.
 - Other admins on the same machine can read snapshots via `sudo` (root reads all). Only encryption fixes that; not in scope here.
 - Records written before 0.6.0 identify their node by `dev.ino`. They still match (the inode is what proves the node), and the next root `status`, `lock` or `unlock` rewrites the field to the volume-uuid form with an `info` line. An unprivileged `status` says so and names the command that does it.

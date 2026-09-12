@@ -77,14 +77,101 @@ the chain's ancestors, for edits that need a rename into a frozen parent
 -- atomic-save editors); the next `lock` re-walks and re-seals the chain
 in reverse.
 
-## Diff-witness on relock
+## Guarantees and limits by verb
 
-`locked lock` shows the snapshot-vs-current diff and requires explicit
-confirmation before sealing (pinned-style "the diff matches what I
-intended"). Plain `/usr/bin/diff` on bytes under the pinned PATH --
-trusted-binary != trusted-output: no git drivers/textconv anywhere in the
-display path. `--yes` answers the prompt for non-interactive use;
-`--dry-run` prints every mutation and performs none.
+What each verb promises, and where the promise stops. Every verb that
+changes a sealed file shows a diff first and asks before it proceeds
+(pinned-style "the diff matches what I intended"); `--yes` answers the
+prompt for non-interactive use and `--dry-run` prints every mutation and
+performs none.
+
+### `edit`: the candidate is frozen before you see it
+
+The editor runs as the invoker on a copy in a user-owned temp dir, so any
+process running as the invoker can read or rewrite that copy while the
+editor is open. That is the same exposure `sudoedit` has, and the reason
+the copy is never the thing that installs. When the editor exits (with
+`--from`, right away) the bytes are read as the invoker and written into
+root-held staging. **Everything after that reads
+the frozen bytes**: the no-change check, the diff, the confirm gate, the
+install. Nothing that happens to the copy or the proposal after the diff
+is on screen can change what gets installed.
+
+The candidate carries content and nothing else, because it was read with
+`cat`. Extended attributes and ACLs are re-applied onto it from the
+sealed file (`xattrs-from`), never taken from the copy, so quarantine and
+ACL metadata survive an edit and the copy cannot smuggle any in.
+
+### `unlock` and relock are detection, not prevention
+
+Between `unlock` and the next `lock` the file is writable by the invoker
+and readable exactly as before. The relock diff (snapshot -> current)
+shows what changed during the window; it does not stop it, and any reader
+in that window sees the unlocked content. `edit` is the preferred path
+because it has no window. `unlock` exists for what `edit` cannot serve:
+tools that must rename into the directory (atomic-save editors, via
+`--chain`), and edits inside a content-tier directory tree.
+
+### The anchor node stays mountable-over (measured 2026-09-12)
+
+A user can attach a disk image over a directory
+(`hdiutil attach -mountpoint <dir>`) only where the user owns that
+directory. A placement-tier directory is owned by the lock account, so a
+mount over it is refused with "Permission denied". The anchor tier leaves
+ownership unchanged -- that is the tier's whole point, the node is the
+user's home -- so **the anchor node itself can still be mounted over**. A
+mount there shadows the entire tree by path: a reader resolving by path
+sees the image's content, and detaching afterwards leaves nothing the
+seal can show. This is a by-path substitution no flag closes. A
+mount-table check is an idea, not a decision.
+
+### Placement under an atomic-save writer strands a temp per save
+
+A placement seal puts `uappnd` on the directory, which lets a writer
+create a new file but not rename over the sealed one. A temp+rename
+writer therefore leaves its temp beside the target on every save, named
+something like `<file>.tmp.<pid>.<hex>`. Measured on Claude Code's
+`.claude.json`: roughly 250 KB of strand per save, with the writer's
+in-place fallback keeping the state itself correct. The directory's
+`uappnd` refuses the unlink too, so the user cannot remove them. Cleanup
+is one command, and it takes a glob because `rm`, `trash`, `lock` and
+`unlock` all accept many paths in one batch:
+
+```sh
+sudo locked trash <dir>/<name>.tmp.*
+```
+
+There is no automatic janitor, by design: a verb that deletes files it
+was never handed is not something `locked` does.
+
+### What the diff witness shows, and what it cannot
+
+The diff is `/usr/bin/diff` on bytes under the pinned PATH --
+trusted-binary != trusted-output, so no git driver and no textconv sits
+anywhere in the display path. diff's own color is disabled and `locked`
+paints the `+`, `-` and `@@` lines itself, so the only escape sequences
+reaching the terminal are locked's own.
+
+The diff then goes through locked's own encoder before it is drawn.
+Rendered as `\x{HH}` / `\x{HHHH}` tokens, in reverse video on a tty: the
+C0 controls except tab and newline, DEL, the C1 controls, the bidi
+overrides and isolates (U+202A-U+202E, U+2066-U+2069), U+200B, U+200E,
+U+200F and U+FEFF, and any byte that is not valid UTF-8. Tab, newline,
+ZWNJ, ZWJ and every other valid UTF-8 sequence pass raw.
+
+Two residuals. Homoglyphs are not distinguishable: a Cyrillic "а" is
+drawn the way a Latin "a" is. And off a tty there is no reverse video, so
+an encoded token is indistinguishable from a file that literally
+contains the text `\x{1B}`.
+
+### Callers without a tty
+
+The confirm gate refuses when stdin is not a tty unless `--yes` is given,
+and `--yes` skips the gate outright. A caller with no tty -- an editor's
+embedded shell prompt, an agent's tool shell, a script -- therefore
+either fails closed or approves blind; there is no third behaviour. A
+diff is only a witness while a human is reading it, so the mutating verbs
+belong in a real terminal.
 
 ## Detection layer: `locked verify` + alerts
 
