@@ -126,13 +126,18 @@ usage: sudo locked <action> [options] [args]
       files/dirs). --chain also drops flags on chain ancestors, for
       edits that need a rename into a frozen parent (atomic-save
       editors). Next lock re-seals the chain.
-  edit [--editor CMD] [--yes] <file>...
+  edit [--editor CMD | --from COPY] [--yes] <file>...
       sudoedit-style: copy the locked file to a user-owned temp copy,
       run your editor on it as you, then diff and confirm before the
       staged result is installed and resealed. The file is never left
       unlocked and no chain release is needed. Editor: --editor, else
       SUDO_EDITOR/VISUAL/EDITOR, else vi (single command, gets the
       copy's path as its argument).
+      --from COPY takes the whole proposed content from COPY instead of
+      running an editor -- one copy, one file. COPY is frozen into
+      lock-account staging before the diff is drawn, and the diff and the
+      install both read that frozen copy: whatever happens to COPY after
+      you are shown the diff cannot change what installs.
   revert [--dry-run] <path>...
       Files only: save current to .attic, restore snapshot, re-seal if
       the file was locked.
@@ -199,6 +204,7 @@ OPT_TIER=""
 OPT_FLAG=sappnd
 OPT_FLAG_SET=0
 OPT_EDITOR=""
+OPT_FROM=""
 OPT_YES=0
 OPT_DRY=0
 OPT_CHAIN=0
@@ -214,6 +220,8 @@ while [ $# -gt 0 ]; do
     --flag=*)  OPT_FLAG="${1#--flag=}"; OPT_FLAG_SET=1; shift ;;
     --editor)   OPT_EDITOR="${2:?--editor needs a value}"; shift 2 ;;
     --editor=*) OPT_EDITOR="${1#--editor=}"; shift ;;
+    --from)     OPT_FROM="${2:?--from needs a value}"; shift 2 ;;
+    --from=*)   OPT_FROM="${1#--from=}"; shift ;;
     --yes)     OPT_YES=1; shift ;;
     --dry-run) OPT_DRY=1; shift ;;
     --chain)   OPT_CHAIN=1; shift ;;
@@ -240,6 +248,29 @@ if [ "$OPT_RECURSIVE" -eq 1 ]; then
     rm|trash|mv|rekey) ;;
     *) echo "--recursive applies to rm, trash, mv and rekey only" >&2; exit 1 ;;
   esac
+fi
+
+# --from names ONE proposed content for ONE file. It replaces the editor
+# rather than accompanying it, and it means nothing to any other verb --
+# each of those is refused here rather than quietly ignored, so a
+# misplaced flag can never read as approval of something it never touched.
+if [ -n "$OPT_FROM" ]; then
+  if [ "$action" != "edit" ]; then
+    echo "--from applies to edit only" >&2
+    exit 1
+  fi
+  if [ -n "$OPT_EDITOR" ]; then
+    echo "--from and --editor are alternatives; give one of them" >&2
+    exit 1
+  fi
+  if [ "${#PATHS[@]}" -gt 1 ]; then
+    echo "--from is one proposed copy for one file; got ${#PATHS[@]} files" >&2
+    exit 1
+  fi
+  if [ ! -f "$OPT_FROM" ]; then
+    echo "--from: not a regular file: $OPT_FROM" >&2
+    exit 1
+  fi
 fi
 
 # status and why are reporting only -- they change nothing on disk -- so
@@ -2309,12 +2340,22 @@ EOF
   fi
 }
 
+# The staging file both edit paths freeze their candidate into: a fresh
+# name in the lock account's mode-700 dir, out of the invoker's reach.
+stage_new() {
+  local stage_dir="$USER_SNAPSHOTS/.staging"
+  install -d -m 700 -o "$lock_user" -g "$lock_user" "$stage_dir" || return 1
+  mktemp "${stage_dir}/edit.XXXXXX"
+}
+
 # sudoedit-style edit: the locked file never spends time unlocked. The
 # editor runs AS THE INVOKER on a user-owned temp copy; the candidate is
 # then pulled into lock-account staging (out of user reach) BEFORE the
 # diff is shown, so what you approve is exactly what installs -- a
-# tampered copy shows up in the diff. atomic_replace lifts append flags
-# on the parent, so no chain release is needed.
+# tampered copy shows up in the diff. --from replaces the editor with a
+# copy the invoker prepared in advance, frozen the same way and at the
+# same point in the flow. atomic_replace lifts append flags on the
+# parent, so no chain release is needed.
 do_edit_one() {
   local f="$1"
   f="$(readlink -f "$f")" || { echo "skip: cannot resolve $1" >&2; return 1; }
@@ -2338,39 +2379,57 @@ do_edit_one() {
     return 1
   fi
 
-  # User-owned working copy in a private temp dir.
-  local editdir copy
-  editdir="$(mktemp -d /tmp/locked-edit.XXXXXX)" || return 1
-  copy="$editdir/$(basename "$f")"
-  cp -- "$f" "$copy" || { rm -rf -- "$editdir"; return 1; }
-  chown -R "$inv" "$editdir" || { rm -rf -- "$editdir"; return 1; }
-  chmod 700 "$editdir" || { rm -rf -- "$editdir"; return 1; }
-  chmod 600 "$copy" || { rm -rf -- "$editdir"; return 1; }
+  # Two ways to produce the candidate. Both end with it frozen in $stage,
+  # and everything from the diff down reads ONLY $stage -- neither the
+  # editor's copy nor the --from proposal is looked at again.
+  local stage label
+  if [ -n "$OPT_FROM" ]; then
+    # Freeze FIRST. The proposal sits in the invoker's own space, where
+    # anything running as the invoker can swap it at any moment; taking it
+    # out of reach before a single byte is displayed is what makes the
+    # diff a promise instead of a snapshot of one past moment.
+    label='diff current -> proposed'
+    stage="$(stage_new)" || return 1
+    cp -- "$OPT_FROM" "$stage" || { rm -f -- "$stage"; return 1; }
+    if cmp -s -- "$stage" "$f"; then
+      rm -f -- "$stage"
+      echo "no changes: $f"
+      log_action edit "$f" skip-unchanged
+      return 0
+    fi
+  else
+    label='diff current -> edited'
+    # User-owned working copy in a private temp dir.
+    local editdir copy
+    editdir="$(mktemp -d /tmp/locked-edit.XXXXXX)" || return 1
+    copy="$editdir/$(basename "$f")"
+    cp -- "$f" "$copy" || { rm -rf -- "$editdir"; return 1; }
+    chown -R "$inv" "$editdir" || { rm -rf -- "$editdir"; return 1; }
+    chmod 700 "$editdir" || { rm -rf -- "$editdir"; return 1; }
+    chmod 600 "$copy" || { rm -rf -- "$editdir"; return 1; }
 
-  local editor
-  editor="${OPT_EDITOR:-${SUDO_EDITOR:-${VISUAL:-${EDITOR:-vi}}}}"
-  if ! sudo -u "$inv" -- "$editor" "$copy"; then
-    echo "editor exited nonzero; nothing installed: $f" >&2
+    local editor
+    editor="${OPT_EDITOR:-${SUDO_EDITOR:-${VISUAL:-${EDITOR:-vi}}}}"
+    if ! sudo -u "$inv" -- "$editor" "$copy"; then
+      echo "editor exited nonzero; nothing installed: $f" >&2
+      rm -rf -- "$editdir"
+      return 1
+    fi
+
+    if cmp -s -- "$copy" "$f"; then
+      echo "no changes: $f"
+      rm -rf -- "$editdir"
+      log_action edit "$f" skip-unchanged
+      return 0
+    fi
+
+    # Pull the candidate out of user reach BEFORE showing the diff.
+    stage="$(stage_new)" || { rm -rf -- "$editdir"; return 1; }
+    cp -- "$copy" "$stage" || { rm -f -- "$stage"; rm -rf -- "$editdir"; return 1; }
     rm -rf -- "$editdir"
-    return 1
   fi
 
-  if cmp -s -- "$copy" "$f"; then
-    echo "no changes: $f"
-    rm -rf -- "$editdir"
-    log_action edit "$f" skip-unchanged
-    return 0
-  fi
-
-  # Pull the candidate out of user reach BEFORE showing the diff.
-  local stage_dir stage
-  stage_dir="$USER_SNAPSHOTS/.staging"
-  install -d -m 700 -o "$lock_user" -g "$lock_user" "$stage_dir" || { rm -rf -- "$editdir"; return 1; }
-  stage="$(mktemp "${stage_dir}/edit.XXXXXX")" || { rm -rf -- "$editdir"; return 1; }
-  cp -- "$copy" "$stage" || { rm -f -- "$stage"; rm -rf -- "$editdir"; return 1; }
-  rm -rf -- "$editdir"
-
-  show_diff 'diff current -> edited' "$f" \
+  show_diff "$label" "$f" \
     diff "--color=$DIFF_COLOR" -u "$f" "$stage" || { rm -f -- "$stage"; return 1; }
   echo
   confirm "Install and reseal $(subj "$f")?" installs || {

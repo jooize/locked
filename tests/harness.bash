@@ -394,6 +394,66 @@ ok   "verify clean after edit"           locked verify
 ok   "revert undoes the edit"            locked revert "$CFG"
 check "revert restored pre-edit"         "version 4" "$(head -1 "$CFG")"
 
+note "== cli: locked edit --from -- a proposal instead of an editor =="
+# A tool (or the user) writes the whole proposed file somewhere they own;
+# locked freezes it into lock-account staging before drawing the diff.
+PROPD="$SCRATCH/proposals"
+install -d -o "$INV" -g staff -m 755 "$PROPD"
+PROP="$PROPD/config.proposed.txt"
+as_user /bin/sh -c "printf 'from a proposal\n' > '$PROP'"
+ok   "edit --from installs the proposal"  locked edit --yes --from "$PROP" "$CFG"
+check "proposed content installed"        "from a proposal" "$(head -1 "$CFG")"
+check "still locked after edit --from"    "uchg" "$(flags_of "$CFG")"
+check "owner still lock account"          "$LOCK_ACCT" "$(owner_of "$CFG")"
+ok   "verify clean after edit --from"     locked verify
+ok   "revert undoes the --from edit"      locked revert "$CFG"
+check "revert restored the pre-edit file" "version 4" "$(head -1 "$CFG")"
+
+refuse "a missing proposal is refused"    "--from: not a regular file" \
+       locked edit --yes --from "$PROPD/nope" "$CFG"
+check "the target is untouched"           "version 4" "$(head -1 "$CFG")"
+check "the target is still sealed"        "uchg" "$(flags_of "$CFG")"
+refuse "--from with --editor is refused"  "alternatives" \
+       locked edit --yes --from "$PROP" --editor "$ED" "$CFG"
+refuse "--from with two files is refused" "one proposed copy for one file" \
+       locked edit --yes --from "$PROP" "$CFG" "$CFG"
+refuse "--from on another verb is refused" "--from applies to edit only" \
+       locked lock --yes --from "$PROP" "$CFG"
+
+# A proposal identical to the sealed file is a no-op, exactly as an editor
+# that changed nothing is.
+PROPSAME="$PROPD/config.same.txt"
+cat -- "$CFG" >"$PROPSAME"
+chown "$INV" "$PROPSAME"
+check "an unchanged proposal installs nothing" "no changes: $CFG" \
+      "$(locked edit --yes --from "$PROPSAME" "$CFG")"
+check "the unchanged target is still sealed"   "uchg" "$(flags_of "$CFG")"
+
+# Off-tty the gate has nobody to ask, so it fails closed and names --yes --
+# and the frozen copy must not be left behind in staging.
+locked_notty() { locked "$@" </dev/null; }
+refuse "no tty and no --yes is refused"   "--yes not given" \
+       locked_notty edit --from "$PROP" "$CFG"
+check "the declined target is unchanged"  "version 4" "$(head -1 "$CFG")"
+check "the staging dir is left empty"     "0" \
+      "$(ls -A "$SNAPROOT/$INV/.staging" | wc -l | tr -d ' ')"
+
+# The freeze property itself: that a swap of the proposal between the diff
+# and the install changes nothing. There is no pause in the flow a test can
+# reach into without a test-only hook in locked, so it is asserted on the
+# code instead -- the install reads $stage, and the proposal is never named
+# again once it has been frozen.
+EDITBODY="$SCRATCH/do_edit_one.body"
+awk '/^do_edit_one\(\) \{/,/^\}$/' "$LOCKED" >"$EDITBODY"
+ok   "the edit body was extracted"        test -s "$EDITBODY"
+ok   "the diff reads the frozen copy"     \
+     grep -qF 'diff "--color=$DIFF_COLOR" -u "$f" "$stage"' "$EDITBODY"
+ok   "the install reads the frozen copy"  \
+     grep -qF 'atomic_replace "$stage" "$f"' "$EDITBODY"
+FREEZELN="$(grep -n 'show_diff' "$EDITBODY" | head -1 | cut -d: -f1)"
+deny "the proposal is not named after the freeze" \
+     /bin/sh -c "tail -n +$FREEZELN '$EDITBODY' | grep -q 'OPT_FROM'"
+
 note "== cli: ~/.ssh class -- anchor only, ownership never changes =="
 as_user mkdir -m 700 -- "$FAKE_HOME/.ssh"
 SSHCFG="$FAKE_HOME/.ssh/config"

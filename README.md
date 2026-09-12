@@ -31,7 +31,9 @@ Three tiers, named by what they protect:
 - `sudo locked edit <file>` -- sudoedit-style edit, the preferred flow:
   your editor runs as you on a user-owned temp copy, the candidate is
   staged out of reach, then diff + confirm installs and reseals. The
-  file is never left unlocked and no chain release is needed.
+  file is never left unlocked and no chain release is needed. With
+  `--from <copy>` the proposed content comes from a file you prepared
+  instead of from an editor -- see below.
 - `sudo locked unlock <path>` -- release just that node (snapshot taken);
   `--chain` also drops the ancestors' flags when an edit needs a rename
   into a frozen parent (atomic-save editors).
@@ -76,6 +78,22 @@ Three tiers, named by what they protect:
 
 Tests: `sudo /bin/bash tests/harness.bash` (scratch-dir only; stands in
 `daemon` for the lock account, no global state touched).
+
+### Proposed edits from a tool
+
+A tool — Claude, a script, anything you would rather not hand the sealed
+file to — writes the whole proposed file somewhere you own, say
+`.tmp/settings.proposed.json`, and gives you one line to run:
+
+```sh
+sudo locked edit --from .tmp/settings.proposed.json ~/.config/agents/claude/settings/settings.json
+```
+
+locked copies the proposal into lock-account staging before it draws
+anything on your screen, and the diff, the confirm and the install all
+read that frozen copy. Whatever happens to the file under `.tmp` after
+you have looked at the diff — a rewrite by the same tool, or by anything
+else running as you — cannot change what installs.
 
 ## Nix install (nix-darwin module)
 
