@@ -653,13 +653,21 @@ note "== diff witness: the filter is the only thing that emits an escape =="
 # The painter runs only on a tty, which this harness is not, so it is
 # exercised on the very source the script runs -- lifted out of locked by
 # the quotes that delimit it, never a second copy of the program.
+#
+# The input is shaped like real unified output, because the file headers are
+# recognized by where they sit: the pair at the top, then a hunk, then a
+# removed line of SQL or Lua comment (-- not a header, which the diff shows
+# as --- not a header) and an added line beginning ++. Those two are content
+# and have to keep the colors of a removal and an addition -- painting a
+# removal as a header would be the falsification this filter exists to stop.
 DWFILT="$SCRATCH/diff-filter.pl"
 sed -n "/^readonly DIFF_FILTER='\$/,/^'\$/p" "$LOCKED" | sed '1d;$d' >"$DWFILT"
 ok   "the filter source was lifted out"    test -s "$DWFILT"
 ok   "the filter source compiles"          /usr/bin/perl -c "$DWFILT"
 DWPIN="$SCRATCH/painter.in"
 DWPOUT="$SCRATCH/painter.out"
-printf '%b' '+add \x1b[31m\n-del\n@@ -1 +1 @@\n--- a\n' >"$DWPIN"
+printf '%b' '--- a\n+++ b\n@@ -1 +1 @@\n+add \x1b[31m\n-del\n--- not a header\n+++ not a header\n' \
+      >"$DWPIN"
 /usr/bin/perl "$DWFILT" 1 <"$DWPIN" >"$DWPOUT" 2>&1 || true
 check "an addition line opens green"       "1" \
       "$(grep -cF -- "${DW_ESC}[32m+add" "$DWPOUT" || true)"
@@ -673,6 +681,14 @@ check "a hunk header opens cyan"           "1" \
       "$(grep -cF -- "${DW_ESC}[36m@@" "$DWPOUT" || true)"
 check "a file header goes bold"            "1" \
       "$(grep -cF -- "${DW_ESC}[1m--- a" "$DWPOUT" || true)"
+check "its mate goes bold too"             "1" \
+      "$(grep -cF -- "${DW_ESC}[1m+++ b" "$DWPOUT" || true)"
+check "a removal that reads like a header opens red" "1" \
+      "$(grep -cF -- "${DW_ESC}[31m--- not a header" "$DWPOUT" || true)"
+check "an addition that reads like a header opens green" "1" \
+      "$(grep -cF -- "${DW_ESC}[32m+++ not a header" "$DWPOUT" || true)"
+check "and neither of them goes bold"      "0" \
+      "$(grep -cF -- "${DW_ESC}[1m--- not a header" "$DWPOUT" || true)"
 /usr/bin/perl "$DWFILT" 0 <"$DWPIN" >"$DWPOUT" 2>&1 || true
 check "color off emits no escape at all"   "0" \
       "$(LC_ALL=C grep -c -- "$DW_ESC" "$DWPOUT" || true)"

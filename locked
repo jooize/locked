@@ -1305,12 +1305,23 @@ sub tok {
   my $t = "\\x{" . ($c < 0x100 ? sprintf("%02X", $c) : sprintf("%04X", $c)) . "}";
   return $on ? "\e[7m" . $t . "\e[27m" : $t;
 }
+# A file header is recognized by position, never by its prefix: a removed
+# line of SQL or Lua that begins -- arrives here as --- foo, and painting
+# that bold instead of red would be the very falsification this filter is
+# here to stop. In unified output the --- / +++ pair can only sit at the
+# very start or straight after a diff line, so two of them are expected
+# there and nowhere else. Only in and Binary files stay lexical: a content
+# line always carries a prefix character, so neither can begin one.
+my $expect = 2;
 sub paint {
   my $l = shift;
-  return "\e[1m"  if $l =~ /^(?:\+\+\+ |--- |diff |Only in |Binary files )/;
+  if ($l =~ /^diff /) { $expect = 2; return "\e[1m"; }
+  if ($expect > 0 && $l =~ /^(?:--- |\+\+\+ )/) { $expect--; return "\e[1m"; }
+  $expect = 0;
+  return "\e[1m"  if $l =~ /^(?:Only in |Binary files )/;
   return "\e[36m" if $l =~ /^\@\@/;
-  return "\e[32m" if $l =~ /^\+/ && $l !~ /^\+\+\+/;
-  return "\e[31m" if $l =~ /^-/  && $l !~ /^---/;
+  return "\e[32m" if $l =~ /^\+/;
+  return "\e[31m" if $l =~ /^-/;
   return "";
 }
 while (defined(my $s = <STDIN>)) {
