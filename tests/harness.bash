@@ -454,6 +454,40 @@ FREEZELN="$(grep -n 'show_diff' "$EDITBODY" | head -1 | cut -d: -f1)"
 deny "the proposal is not named after the freeze" \
      /bin/sh -c "tail -n +$FREEZELN '$EDITBODY' | grep -q 'OPT_FROM'"
 
+note "== cli: edit reads the candidate as the invoker, never as root =="
+# Both candidate paths sit in the invoker's own space, so a same-UID
+# process can replace either with a symlink. Read as root, the link would
+# pull a root-only file's bytes into staging and, once approved, into a
+# file the invoker can read.
+ROOTONLY="$SCRATCH/rootonly"
+printf 'secret\n' >"$ROOTONLY"
+chmod 600 "$ROOTONLY"
+as_user ln -s "$ROOTONLY" "$PROPD/link.proposed.txt"
+refuse "a symlinked proposal is refused"  "cannot read as" \
+       locked edit --yes --from "$PROPD/link.proposed.txt" "$CFG"
+check "the target is unchanged"           "version 4" "$(head -1 "$CFG")"
+check "the target is still sealed"        "uchg" "$(flags_of "$CFG")"
+check "staging is left empty"             "0" \
+      "$(ls -A "$SNAPROOT/$INV/.staging" | wc -l | tr -d ' ')"
+deny "no root-only bytes reached the target" grep -qF secret "$CFG"
+
+# The editor runs as the invoker, so it can leave a symlink behind just as
+# readily as any other process running as them.
+ED2="$SCRATCH/edscript-symlink"
+cat >"$ED2" <<EOS
+#!/bin/sh
+rm -f -- "\$1"
+ln -s '$ROOTONLY' "\$1"
+EOS
+chmod 755 "$ED2"
+refuse "a symlink left by the editor is refused" "cannot read the edited copy" \
+       locked edit --yes --editor "$ED2" "$CFG"
+check "the target is unchanged"           "version 4" "$(head -1 "$CFG")"
+check "the target is still sealed"        "uchg" "$(flags_of "$CFG")"
+check "staging is left empty"             "0" \
+      "$(ls -A "$SNAPROOT/$INV/.staging" | wc -l | tr -d ' ')"
+deny "no root-only bytes reached the target" grep -qF secret "$CFG"
+
 note "== cli: ~/.ssh class -- anchor only, ownership never changes =="
 as_user mkdir -m 700 -- "$FAKE_HOME/.ssh"
 SSHCFG="$FAKE_HOME/.ssh/config"

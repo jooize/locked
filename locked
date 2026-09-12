@@ -2354,8 +2354,12 @@ stage_new() {
 # diff is shown, so what you approve is exactly what installs -- a
 # tampered copy shows up in the diff. --from replaces the editor with a
 # copy the invoker prepared in advance, frozen the same way and at the
-# same point in the flow. atomic_replace lifts append flags on the
-# parent, so no chain release is needed.
+# same point in the flow. Either candidate is READ AS THE INVOKER, so a
+# symlink left in its place resolves with the invoker's privileges and
+# never with root's -- otherwise a same-UID process could route a
+# root-only file's bytes into staging and, once approved, into a file the
+# invoker can read. atomic_replace lifts append flags on the parent, so
+# no chain release is needed.
 do_edit_one() {
   local f="$1"
   f="$(readlink -f "$f")" || { echo "skip: cannot resolve $1" >&2; return 1; }
@@ -2380,8 +2384,9 @@ do_edit_one() {
   fi
 
   # Two ways to produce the candidate. Both end with it frozen in $stage,
-  # and everything from the diff down reads ONLY $stage -- neither the
-  # editor's copy nor the --from proposal is looked at again.
+  # and everything from there down -- the no-change check, the diff, the
+  # install -- reads ONLY $stage; neither the editor's copy nor the --from
+  # proposal is looked at again.
   local stage label
   if [ -n "$OPT_FROM" ]; then
     # Freeze FIRST. The proposal sits in the invoker's own space, where
@@ -2390,13 +2395,16 @@ do_edit_one() {
     # diff a promise instead of a snapshot of one past moment.
     label='diff current -> proposed'
     stage="$(stage_new)" || return 1
-    cp -- "$OPT_FROM" "$stage" || { rm -f -- "$stage"; return 1; }
-    if cmp -s -- "$stage" "$f"; then
+    # The root-side redirect is the point, not an oversight (SC2024): the
+    # WRITE has to land in lock-account staging; only the READ drops to
+    # the invoker, so a planted symlink resolves with their privileges.
+    # shellcheck disable=SC2024
+    sudo -u "$inv" -- /bin/cat -- "$OPT_FROM" >"$stage" || {
       rm -f -- "$stage"
-      echo "no changes: $f"
-      log_action edit "$f" skip-unchanged
-      return 0
-    fi
+      echo "--from: cannot read as $inv: $OPT_FROM" >&2
+      log_action edit "$f" refuse-unreadable-proposal
+      return 1
+    }
   else
     label='diff current -> edited'
     # User-owned working copy in a private temp dir.
@@ -2416,17 +2424,27 @@ do_edit_one() {
       return 1
     fi
 
-    if cmp -s -- "$copy" "$f"; then
-      echo "no changes: $f"
-      rm -rf -- "$editdir"
-      log_action edit "$f" skip-unchanged
-      return 0
-    fi
-
     # Pull the candidate out of user reach BEFORE showing the diff.
     stage="$(stage_new)" || { rm -rf -- "$editdir"; return 1; }
-    cp -- "$copy" "$stage" || { rm -f -- "$stage"; rm -rf -- "$editdir"; return 1; }
+    # Root-side redirect, invoker-side read -- see the --from branch.
+    # shellcheck disable=SC2024
+    sudo -u "$inv" -- /bin/cat -- "$copy" >"$stage" || {
+      rm -f -- "$stage"
+      rm -rf -- "$editdir"
+      echo "edit: cannot read the edited copy as $inv: $copy" >&2
+      log_action edit "$f" refuse-unreadable-copy
+      return 1
+    }
     rm -rf -- "$editdir"
+  fi
+
+  # Decided on the frozen bytes, not on the candidate: the no-change check
+  # and the install now agree by construction.
+  if cmp -s -- "$stage" "$f"; then
+    rm -f -- "$stage"
+    echo "no changes: $f"
+    log_action edit "$f" skip-unchanged
+    return 0
   fi
 
   show_diff "$label" "$f" \
