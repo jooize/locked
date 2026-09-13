@@ -327,7 +327,7 @@ run() {
 # ONE implementation of the gate contract, shared by every y/N prompt and
 # every `next:` gate here, which had agreed on Enter and on little else.
 # `y`/`yes` continue, `n`/`no` decline, Enter takes the site's default, and
-# ANYTHING ELSE IS NOT ACTED ON: it is named back in yellow -- a correction,
+# ANYTHING ELSE IS NOT ACTED ON: one yellow line says so -- a correction,
 # not a refusal -- and the gate asks again. A case whose last arm is the
 # continue turns a typo, a stray paste or a leaned-on key into consent at
 # exactly the moment a human is being asked to take responsibility. End of
@@ -365,10 +365,12 @@ gate_answer() { # <fd> <rendered gate line> <Enter continues: 0|1> <unknown-inpu
         ;;
     esac
     # Yellow is the attention role: this is the one line the human has to
-    # notice, because they just answered wrong. Truncated -- it echoes
-    # untrusted input back, and it has to stay one line next to the gate it
-    # is about to re-print.
-    printf '%snot an answer: "%s"; %s%s\n' "$yel" "${reply:0:20}" "$tail" "$off" >&"$fd"
+    # notice, because they just answered wrong. What was typed is NEVER
+    # echoed: the terminal already showed it as it was typed, and a pasted
+    # control sequence printed raw could rewrite the very line the human is
+    # about to answer. No key coloring inside it either -- one role per
+    # line, and attention wins.
+    printf '%snot an answer; %s%s\n' "$yel" "$tail" "$off" >&"$fd"
   done
 }
 
@@ -381,8 +383,13 @@ confirm() { # <prompt> [<what y does; default "continues">]
   fi
   local line
   # Bold carries the decision (terminal-output): the whole sentence,
-  # `[y/N]` included, is the authoritative register of this screen.
-  printf -v line '%s%s [y/N]%s ' "$E_B" "$1" "$E_OFF"
+  # `[y/N]` included, is the authoritative register of this screen. The two
+  # KEYS inside the brackets are bold blue -- the role for what the human
+  # may hand the program -- so the eye finds the answer without reading the
+  # sentence; the brackets and the slash stay plain bold structure. Each key
+  # re-opens bold after its own reset, because the reset clears it.
+  printf -v line '%s%s [%sy%s%s/%sN%s%s]%s ' \
+    "$E_B" "$1" "$E_BLU" "$E_OFF" "$E_B" "$E_BLU" "$E_OFF" "$E_B" "$E_OFF"
   gate_answer 2 "$line" 0 "y ${2:-continues}, Enter or n aborts"
 }
 
@@ -394,7 +401,9 @@ confirm_hard() { # <prompt> [<what y does; default "continues">]
     return 1
   fi
   local line
-  printf -v line '%s%s [y/N]%s ' "$E_B" "$1" "$E_OFF"
+  # Same shape as confirm: bold sentence, bold-blue keys.
+  printf -v line '%s%s [%sy%s%s/%sN%s%s]%s ' \
+    "$E_B" "$1" "$E_BLU" "$E_OFF" "$E_B" "$E_BLU" "$E_OFF" "$E_B" "$E_OFF"
   gate_answer 2 "$line" 0 "y ${2:-continues}, Enter or n aborts"
 }
 
@@ -1396,11 +1405,17 @@ show_diff() { # <label> <path> <diff-cmd>...
   rm -f -- "$raw"
   lines="$(wc -l <"$enc" | tr -d ' ')"
   if [ -t 0 ] && [ -t 1 ] && [ "$lines" -gt 24 ]; then
-    # The skip key is dim: it is the alternative, not the offer. Declining
-    # here only skips the pager -- the confirm that follows still asks.
+    # Three weights, one per job (terminal-output): bold runs from `next:`
+    # through the `;` because that clause IS the decision, the mechanics
+    # after it are plain so the bold has something to stand against, and the
+    # tail is dim because it is the alternative, not the offer. Both keys the
+    # human may type are bold blue. Dim is re-opened after the key's reset,
+    # which clears it. Declining here only skips the pager -- the confirm
+    # that follows still asks.
     local gate
-    printf -v gate '%snext:%s diff (%s lines); Enter opens it%s · n skips%s ' \
-      "$P_B" "$P_OFF" "$lines" "$P_DIM" "$P_OFF"
+    printf -v gate '%snext: diff (%s lines);%s %sEnter%s opens it %s· %s%sn%s%s skips%s ' \
+      "$P_B" "$lines" "$P_OFF" "$P_BLU" "$P_OFF" \
+      "$P_DIM" "$P_OFF" "$P_BLU" "$P_OFF" "$P_DIM" "$P_OFF"
     if gate_answer 1 "$gate" 1 "Enter or y opens, n skips"; then
       /usr/bin/less -RF -- "$enc" || true
     fi

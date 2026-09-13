@@ -746,17 +746,22 @@ if [ -x /usr/bin/expect ]; then
   TTYEXP="$SCRATCH/tty-lock.exp"
   cat >"$TTYEXP" <<EOF
 set timeout 15
+# The two keys inside [y/N] are painted bold blue, so SGR runs sit between
+# the characters and the bracketed literal is no longer contiguous. Each
+# run is optional, so this same pattern still matches the uncolored prompt
+# (NO_COLOR, or a redirected stderr).
+set ynp {\[(\x1b\[[0-9;]*m)*y(\x1b\[[0-9;]*m)*/(\x1b\[[0-9;]*m)*N(\x1b\[[0-9;]*m)*\]}
 spawn env SNAPSHOTS_ROOT=$SNAPROOT INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME LOCKED_ALERT_DIR=$ALERTS SUDO_USER=$INV /bin/bash $LOCKED lock $TTYCFG
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
-  -ex "\[y/N\]"
+  -re \$ynp
 }
 send "y\r"
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
-  -ex "\[y/N\]"
+  -re \$ynp
 }
 send "y\r"
 expect {
