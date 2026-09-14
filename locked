@@ -1601,7 +1601,15 @@ lock_witness() { # <path> <tier>
   [ "$t" = "placement" ] && return 0
   snap_paths "$f"
   if [ -L "$f" ]; then
-    echo "symlink -> $(readlink "$f") (the link node is sealed, not its target)"
+    # -e follows the link, so it asks after the TARGET. A missing one is
+    # not a refusal -- the target may still arrive -- but it is the one
+    # thing about this seal a reader cannot see from the link text, so the
+    # witness says it and the gate below answers for it.
+    if [ ! -e "$f" ]; then
+      echo "symlink -> $(readlink "$f") (target missing; the link node is sealed, not its target)"
+    else
+      echo "symlink -> $(readlink "$f") (the link node is sealed, not its target)"
+    fi
     shown=1
   elif [ -d "$f" ]; then
     if [ "$t" = "content" ]; then
@@ -2529,18 +2537,14 @@ do_lock_one() {
   f="$(leaf_path "$1")" || return 1
   local is_link=0
   [ -L "$f" ] && is_link=1
-  if [ "$is_link" -eq 1 ]; then
-    # A dangling link is a node, but not one worth sealing: it names
-    # nothing, so the seal would freeze a promise nothing keeps. Same shape
-    # as the missing-path skip. What the link points AT is not checked
-    # beyond that -- the link node is what gets sealed, and its target is
-    # somebody else's node with its own tier and its own record.
-    if [ ! -e "$f" ]; then
-      echo "skip $f: dangling symlink (its target does not exist)" >&2
-      log_action lock "$f" skip-dangling
-      return 1
-    fi
-  else
+  # A link takes none of these checks: -e and -f follow it, so they answer
+  # about the TARGET, and the target is not the node being sealed. What the
+  # link points AT is not checked at all -- a dangling link is a node whose
+  # target is absent right now (a volume not mounted, a file its first run
+  # creates), and it is sealed as a link node like any other. Whether that
+  # is worth sealing is the operator's call, so the witness says the target
+  # is missing and the gate decides.
+  if [ "$is_link" -eq 0 ]; then
     [ -e "$f" ] || { echo "skip $f: does not exist" >&2; log_action lock "$f" skip-noent; return 1; }
     if [ ! -f "$f" ] && [ ! -d "$f" ]; then
       echo "skip $f: not a regular file or directory" >&2

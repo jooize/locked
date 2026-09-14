@@ -87,7 +87,9 @@ since placement needs entries to place and every OS identity check
 resolves the path and judges the target. The link node is precisely what a
 same-UID process can re-point, which is what sealing the target left open.
 The target keeps its own ownership and takes its own record if you name it
-too; a dangling link is refused.
+too. A dangling link is sealed the same way: its target may arrive later,
+and whether the link is worth sealing meanwhile is your call, not the
+tool's -- the witness above the plan notes that the target is missing.
 
 `locked status <leaf>` verifies the FULL chain: per level owner, group,
 mode, exact flag word vs meta, and volume-uuid/inode identity. `locked unlock`

@@ -1691,12 +1691,26 @@ locked revert "$LNK" >"$OUTF" 2>&1 || true
 ok   "revert on a link finds no snapshot"      grep -qF "no snapshot to revert from" "$OUTF"
 check "the target content is untouched"        "target" "$(head -1 "$LNKT")"
 
+# A dangling link is informed on, not refused: the target may arrive later
+# (a volume mounted, a file a first run creates), so whether the link is
+# worth sealing meanwhile is the operator's call. Same one-node rule as
+# above -- the link seals, the absent target is only noted.
 DNG="$LNKD/dangling.txt"
-as_user ln -s "$LNKD/nothing-here.txt" "$DNG"
-refuse "a dangling link is skipped"            "dangling symlink" locked lock --yes "$DNG"
-check "the dangling link keeps its owner"      "$INV" "$(owner_of "$DNG")"
+DNGT="$LNKD/nothing-here.txt"
+as_user ln -s "$DNGT" "$DNG"
+locked lock --yes "$DNG" >"$OUTF" 2>&1 || true
+ok   "the witness says the target is missing"  grep -qF "target missing" "$OUTF"
+check "the dangling LINK node is sealed"       "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$DNG")"
+check "the record names the content tier"      "content" "$(meta_get "$DNG" tier)"
+ok   "and the link got a record of its own"    test -f "$(meta_path "$DNG")"
+deny "no snapshot is taken for a dangling link" test -f "$(snap_path "$DNG")"
+deny "the missing target is still missing"     test -e "$DNGT"
+deny "and the target got no record"            test -f "$(meta_path "$DNGT")"
+ok   "verify clean with a sealed dangling link" locked verify --quiet
+ok   "unlock the dangling link"                locked unlock "$DNG"
+check "the unlocked dangling link is back to the invoker" "$INV" "$(owner_of "$DNG")"
 check "and carries no flag"                    "" "$(flags_of "$DNG")"
-deny "and got no record"                       test -f "$(meta_path "$DNG")"
+check "and still points where it did"          "$DNGT" "$(readlink "$DNG")"
 
 LNK2="$LNKD/link2.txt"
 as_user ln -s "$LNKT" "$LNK2"
