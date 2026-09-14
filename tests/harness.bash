@@ -731,11 +731,12 @@ check "home anchored sappnd"              "sappnd" "$(flags_of "$ADMHOME")"
 check "stop node left untouched"          "" "$(flags_of "$ADMSTOP")"
 ok   "verify clean with admin stop node"  locked_home "$ADMHOME" verify
 
-note "== cli: interactive chain seal keeps the tty (no --yes) =="
-# The chain loop feeds its ancestor list on fd 3 so the seal prompts still
-# read the terminal. When the heredoc sat on stdin the leaf prompt worked
-# (it runs before the loop) and the home anchor died fail-closed, so the
-# regression is only visible from a pty -- hence expect.
+note "== cli: the interactive plan gate seals the whole chain (no --yes) =="
+# One gate per leaf: the plan is derived and printed first, and the single
+# [y/N] after it covers the leaf AND every ancestor in the list. A second
+# prompt would leave this script waiting, so the case still guards the
+# fd-3 chain feed -- the apply loop must never read the chain text as an
+# answer -- and now also guards against a seal that asks again on its own.
 if [ -x /usr/bin/expect ]; then
   TTYSTOP="$SCRATCH/ttyusers"
   install -d -m 755 -o root -g wheel "$TTYSTOP"
@@ -755,9 +756,13 @@ spawn env SNAPSHOTS_ROOT=$SNAPROOT INSTALL_TARGET=$SCRATCH/not-installed LOCKED_
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
-  -re \$ynp
+  "plan for "
 }
-send "y\r"
+expect {
+  timeout { exit 1 }
+  eof     { exit 1 }
+  "2 nodes to change"
+}
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
@@ -771,11 +776,41 @@ expect {
 catch wait result
 exit [lindex \$result 3]
 EOF
-  ok   "interactive lock answers both prompts" /usr/bin/expect -f "$TTYEXP"
+  ok   "interactive lock answers one gate for the chain" /usr/bin/expect -f "$TTYEXP"
   check "interactive leaf sealed uchg"         "uchg" "$(flags_of "$TTYCFG")"
   check "interactive home anchored sappnd"     "sappnd" "$(flags_of "$TTYHOME")"
+
+  # A decline at the gate is a decline of the whole plan: the leaf is not
+  # sealed, and the ancestor the plan listed as already locked stays as it
+  # was. sappnd on the home lets a new entry be created under it, which is
+  # what the placement/anchor tiers are for.
+  TTYDEC="$TTYHOME/declined.txt"
+  as_user /bin/sh -c "printf 'x\n' > '$TTYDEC'"
+  TTYEXP2="$SCRATCH/tty-decline.exp"
+  cat >"$TTYEXP2" <<EOF
+set timeout 15
+spawn env SNAPSHOTS_ROOT=$SNAPROOT INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME LOCKED_ALERT_DIR=$ALERTS SUDO_USER=$INV /bin/bash $LOCKED lock $TTYDEC
+expect {
+  timeout { exit 1 }
+  eof     { exit 1 }
+  "1 node to change"
+}
+send "n\r"
+expect {
+  timeout { exit 1 }
+  eof
+}
+catch wait result
+exit [lindex \$result 3]
+EOF
+  TTYDRC=0
+  /usr/bin/expect -f "$TTYEXP2" >/dev/null 2>&1 || TTYDRC=$?
+  check "a typed decline exits 2"              "2" "$TTYDRC"
+  check "the declined leaf keeps its owner"    "$INV" "$(owner_of "$TTYDEC")"
+  check "the declined leaf carries no flag"    "" "$(flags_of "$TTYDEC")"
+  check "the home anchor is still sealed"      "sappnd" "$(flags_of "$TTYHOME")"
 else
-  note "  skip  interactive chain seal (no expect on this machine)"
+  note "  skip  interactive plan gate (no expect on this machine)"
 fi
 
 note "== cli: no-arg status lists the populated pool =="
@@ -1594,6 +1629,131 @@ ok   "the same call with the real id works"    "$HELPER" rm --parent "$IDW" \
        --parent-id "$("$HELPER" id "$IDW")" --name victim.txt --target-id -
 deny "and the entry is gone"                   test -e "$IDW/victim.txt"
 chflags -- nouappnd "$IDW"
+
+note "== lock: a symlink argument is sealed as the node, not resolved =="
+# The motivating shape: ~/.claude/settings.json is a link into a config
+# repo. Resolving it sealed the TARGET and reported "already locked" for
+# the link, leaving the link node user-owned -- so a same-UID process could
+# repoint it and every reader would follow the new target instead.
+LNKD="$MED/linkarea"
+install -d -o "$INV" -g staff -m 777 "$LNKD"
+LNKT="$LNKD/target.txt"
+as_user /bin/sh -c "echo target > '$LNKT'"
+LNKO="$LNKD/other.txt"
+as_user /bin/sh -c "echo other > '$LNKO'"
+LNK="$LNKD/link.txt"
+as_user ln -s "$LNKT" "$LNK"
+# The control for the denial below: unsealed, this is an ordinary swap.
+ok   "the invoker can repoint it while unsealed" as_user ln -sfn "$LNKT" "$LNK"
+
+ok   "lock --yes a link"                       locked lock --yes "$LNK"
+check "the LINK node is sealed"                "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$LNK")"
+check "the target keeps its owner"             "$INV" "$(owner_of "$LNKT")"
+check "the target carries no flag"             "" "$(flags_of "$LNKT")"
+deny "the target got no record of its own"     test -f "$(meta_path "$LNKT")"
+check "the record names the content tier"      "content" "$(meta_get "$LNK" tier)"
+check "and is not recursive"                   "0" "$(meta_get "$LNK" recursive)"
+deny "no snapshot is taken for a link"         test -f "$(snap_path "$LNK")"
+check "the parent got placement"               "uappnd" "$(flags_of "$LNKD")"
+ok   "verify clean with a sealed link"         locked verify --quiet
+# A link is one node everywhere: status reads the link's own record rather
+# than resolving to a target that has none.
+locked status "$LNK" >"$OUTF" 2>&1 || true
+ok   "status reports the link's own record"    grep -qF "✓  $LNK (content uchg)" "$OUTF"
+deny "and never resolves to the target"        grep -qF "$LNKT" "$OUTF"
+
+# The point of the change: the link entry can no longer be re-pointed.
+deny "the invoker cannot repoint the sealed link" as_user ln -sfn "$LNKO" "$LNK"
+check "the link still names its target"        "$LNKT" "$(readlink "$LNK")"
+check "and still resolves to the target"       "target" "$(head -1 "$LNK")"
+# Attribution: with the parent's placement flag lifted, only the link
+# node's own uchg is left to refuse -- which is what sealing the link
+# rather than its target bought.
+chflags -- nouappnd "$LNKD"
+deny "the link's own uchg refuses the swap"    as_user ln -sfn "$LNKO" "$LNK"
+chflags -- uappnd "$LNKD"
+
+ok   "unlock the link"                         locked unlock "$LNK"
+check "the unlocked link is back to the invoker" "$INV" "$(owner_of "$LNK")"
+check "and carries no flag"                    "" "$(flags_of "$LNK")"
+check "and still points where it did"          "$LNKT" "$(readlink "$LNK")"
+# No re-point control here: unlock releases the named node only, and the
+# parent's placement seal still refuses the unlink that ln -sfn needs.
+ok   "relock the link"                         locked lock --yes "$LNK"
+check "the relocked link is sealed again"      "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$LNK")"
+ok   "verify clean after the round trip"       locked verify --quiet
+refuse "edit refuses a symlink"                "no content to edit" \
+       locked edit --yes --from "$LNKO" "$LNK"
+check "the refused link is untouched"          "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$LNK")"
+# Same one-node rule for revert: a link has no snapshot, and the file it
+# points at is not what was named.
+locked revert "$LNK" >"$OUTF" 2>&1 || true
+ok   "revert on a link finds no snapshot"      grep -qF "no snapshot to revert from" "$OUTF"
+check "the target content is untouched"        "target" "$(head -1 "$LNKT")"
+
+DNG="$LNKD/dangling.txt"
+as_user ln -s "$LNKD/nothing-here.txt" "$DNG"
+refuse "a dangling link is skipped"            "dangling symlink" locked lock --yes "$DNG"
+check "the dangling link keeps its owner"      "$INV" "$(owner_of "$DNG")"
+check "and carries no flag"                    "" "$(flags_of "$DNG")"
+deny "and got no record"                       test -f "$(meta_path "$DNG")"
+
+LNK2="$LNKD/link2.txt"
+as_user ln -s "$LNKT" "$LNK2"
+refuse "--tier placement on a link is refused" "does not apply to a link" \
+       locked lock --yes --tier placement "$LNK2"
+refuse "--tier anchor on a link is refused"    "does not apply to a link" \
+       locked lock --yes --tier anchor "$LNK2"
+check "the refused link keeps its owner"       "$INV" "$(owner_of "$LNK2")"
+deny "and got no record"                       test -f "$(meta_path "$LNK2")"
+
+note "== lock: the plan is derived first and gated once =="
+# Every seal used to ask for itself, so declining an ancestor left the leaf
+# ALREADY SEALED under a parent nobody had protected. The plan is derived
+# before anything is touched, printed root-most first, and answered once.
+# Its own stop node, so the chain is exactly leaf + one placement parent.
+PLANSTOP="$SCRATCH/planstop"
+install -d -m 755 -o root -g wheel "$PLANSTOP"
+PLAND="$PLANSTOP/area"
+install -d -o "$INV" -g staff -m 777 "$PLAND"
+PLANF="$PLAND/leaf.txt"
+as_user /bin/sh -c "echo plan > '$PLANF'"
+
+# Off-tty the gate has nobody to ask and fails closed, which is a decline:
+# the plan is printed, the exit is 2, and not one node has been touched.
+PLANRC=0
+locked_notty lock "$PLANF" >"$OUTF" 2>&1 || PLANRC=$?
+check "an unanswerable gate declines"          "2" "$PLANRC"
+ok   "the plan is printed before the gate"     grep -qF "plan for $PLANF (tier content)" "$OUTF"
+ok   "the plan lists the leaf"                 grep -q "seal content  *$PLANF" "$OUTF"
+ok   "the plan lists the parent"               grep -q "seal placement  *$PLAND" "$OUTF"
+PLAN_P="$(grep -n "seal placement" "$OUTF" | head -1 | cut -d: -f1)"
+PLAN_L="$(grep -n "seal content" "$OUTF" | head -1 | cut -d: -f1)"
+ok   "the plan reads root-most first"          test "$PLAN_P" -lt "$PLAN_L"
+check "the declined leaf keeps its owner"      "$INV" "$(owner_of "$PLANF")"
+check "and carries no flag"                    "" "$(flags_of "$PLANF")"
+deny "and got no record"                       test -f "$(meta_path "$PLANF")"
+check "the parent was not touched either"      "" "$(flags_of "$PLAND")"
+check "and the parent keeps its owner"         "$INV" "$(owner_of "$PLAND")"
+
+ok   "seal the parent on its own"              locked lock --yes --tier placement "$PLAND"
+locked_notty lock "$PLANF" >"$OUTF" 2>&1 || true
+ok   "the plan shows the sealed ancestor"      grep -q "already locked  *$PLAND" "$OUTF"
+ok   "and still offers the leaf"               grep -q "seal content  *$PLANF" "$OUTF"
+
+locked lock --dry-run --yes "$PLANF" >"$OUTF" 2>&1 || true
+ok   "dry run prints the plan"                 grep -qF "plan for $PLANF (tier content)" "$OUTF"
+ok   "dry run says nothing changed"            grep -qF "dry run: nothing changed" "$OUTF"
+check "dry run left the leaf's owner"          "$INV" "$(owner_of "$PLANF")"
+check "dry run left no flag on it"             "" "$(flags_of "$PLANF")"
+deny "dry run wrote no record"                 test -f "$(meta_path "$PLANF")"
+
+ok   "the leaf seals after the previews"       locked lock --yes "$PLANF"
+check "the leaf is sealed"                     "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$PLANF")"
+locked lock --yes "$PLANF" >"$OUTF" 2>&1 || true
+ok   "a whole chain asks nothing"              grep -qF "already locked: $PLANF" "$OUTF"
+deny "and prints no plan"                      grep -qF "plan for" "$OUTF"
+ok   "verify clean after the plan round"       locked verify --quiet
 
 # ---- summary ---------------------------------------------------------------
 

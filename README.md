@@ -26,8 +26,11 @@ Three tiers, named by what they protect:
 ## Workflow
 - `sudo locked lock <path>` -- adopt or relock. Derives and provisions the
   whole ancestor chain (placement for user-owned parents, anchor for `~`),
-  stops only at a root-owned node, shows the snapshot diff, and asks
-  before sealing (`--yes` for scripted runs, `--dry-run` to preview).
+  stops only at a root-owned node. Nothing is touched until the whole
+  ceremony is derived: the snapshot diff, then the plan -- one line per
+  node, root-most first -- then one question for all of it (`--yes` for
+  scripted runs, `--dry-run` prints the plan and stops). Naming a symlink
+  seals the link itself, not what it points at.
 - `sudo locked edit <file>` -- sudoedit-style edit, the preferred flow:
   your editor runs as you on a user-owned temp copy, the candidate is
   staged out of reach, then diff + confirm installs and reseals. The
@@ -229,7 +232,12 @@ Touch ID/password prompt names `/usr/local/sbin/locked unlock /nonexistent`; bin
 
 `sudo locked lock <path>` adopts any file or dir you own -- no manual
 chown. The first lock captures owner/group/mode as canonical, takes a
-baseline snapshot, and provisions the ancestor chain.
+baseline snapshot, and provisions the ancestor chain. It shows you the
+plan for the whole chain and asks once, before it has touched anything.
+
+A symlink is adopted as the link node itself: the link is what a process
+running as you could re-point, so that is what gets sealed. Its target is
+a separate node -- name it too if it should be sealed as well.
 
 ## Snapshot layout
 ```

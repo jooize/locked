@@ -115,8 +115,11 @@ usage: sudo locked <action> [options] [args]
   lock [--tier T] [--flag F] [--yes] [--dry-run] <path>...
       Adopt or relock. Derives and provisions the whole ancestor chain:
       leaf tier (default content), placement for user-owned ancestors,
-      anchor for \$HOME. Shows snapshot->current diff and asks before
-      sealing; --yes answers yes (required when stdin is not a tty).
+      anchor for \$HOME. Nothing is touched until the whole ceremony is
+      derived: the snapshot->current diff, then the plan -- one line per
+      node, root-most first -- then ONE question for the lot. --yes
+      answers it (required when stdin is not a tty); --dry-run prints the
+      plan and stops. A symlink argument seals the LINK, not its target.
       --tier content|placement|anchor    leaf tier (default content)
       --flag sappnd|schg                 anchor flag (default sappnd)
   unlock [--chain] [--dry-run] <path>...
@@ -560,12 +563,21 @@ same_node() { # <recorded> <live>
 
 # chflags gotcha (probed 2026-08-05): "--" must come BEFORE the flag word;
 # after it, BSD getopt treats "--" as a filename and poisons the exit code.
+#
+# The single-node form always passes -h: a symlink argument is sealed as the
+# node it is (see leaf_path), so the flag has to land on the LINK and never
+# on whatever it points at -- the target is somebody else's node. On
+# anything that is not a link -h changes nothing, which is why it is
+# unconditional here rather than a branch. The -R form needs no -h: its
+# traversal is -P by default, so a link inside a sealed tree already takes
+# the flag on itself rather than on its target (probed 2026-09-14, which is
+# also why verify's find(1) stray scan does not trip over one).
 fset() {   # fset <flagword> <path> [-R]
   local flagword="$1" path="$2" recur="${3:-}"
   if [ -n "$recur" ]; then
     run chflags -R -- "$flagword" "$path"
   else
-    run chflags -- "$flagword" "$path"
+    run chflags -h -- "$flagword" "$path"
   fi
 }
 fclear() { # fclear <flagword> <path> [-R]
@@ -1152,7 +1164,11 @@ verify_node() {
     return 0
   fi
 
-  if [ ! -e "$f" ]; then
+  # -L as well as -e: a sealed symlink whose TARGET was removed is still
+  # there as a node, and every check below is an lstat, so it is verifiable
+  # exactly as before. Only -e would call it missing and report drift on a
+  # node nothing touched.
+  if [ ! -e "$f" ] && [ ! -L "$f" ]; then
     echo "  DRIFT $f: missing"
     return 1
   fi
@@ -1233,7 +1249,7 @@ tier_for_ancestor() {
   fi
 }
 
-# ---- seal / release primitives ---------------------------------------------
+# ---- diff witness ----------------------------------------------------------
 
 # The diff witness renders candidate bytes, so it must not let those bytes
 # talk to the terminal: an escape sequence in a proposed config could move
@@ -1426,95 +1442,230 @@ show_diff() { # <label> <path> <diff-cmd>...
   return 0
 }
 
-# seal_content <path>: adopt or relock a content-tier node (file or dir).
-seal_content() {
-  local f="$1"
-  snap_paths "$f"
-  local is_dir=0
-  [ -d "$f" ] && is_dir=1
+# ---- planning --------------------------------------------------------------
+#
+# A lock ceremony derives everything it would do BEFORE it touches anything,
+# and asks once. What made that necessary: every seal used to ask for
+# itself, so declining an ancestor left the leaf ALREADY SEALED under a
+# parent nobody had protected -- the one state the chain exists to prevent,
+# reached by answering a question honestly.
+#
+# So every refusal that used to sit between a seal's first line and its own
+# confirm is raised in the planning pass instead -- drifted-but-locked, a
+# foreign owner, a mixed tree -- alongside the ones do_lock_one already made
+# up front (a bad stop node, a tier change). The seal_* functions below
+# apply an already-decided action and ask nothing. The one question they may
+# raise is check_reseal_identity's, which reports an anomaly -- a node
+# swapped during an unlock window -- that no plan could have shown as
+# routine.
 
-  local owner_now group_now mode_now
-  owner_now="$(stat -f '%Su' "$f")"
-  group_now="$(stat -f '%Sg' "$f")"
-  mode_now="$(stat -f '%OLp' "$f")"
-
-  local target_owner target_group target_mode
+# content_targets <path>: sets T_OWNER/T_GROUP/T_MODE, the identity a
+# content-tier node is restored to on unlock. A record is authoritative
+# once one exists; a first adoption takes the node's current identity.
+# Shared by the planning pass and by the seal, so the two can never derive
+# it differently. Every stat is an lstat, so a symlink answers for itself.
+T_OWNER="" T_GROUP="" T_MODE=""
+content_targets() { # <path>
+  local p="$1"
+  snap_paths "$p"
   if [ -f "$META" ]; then
-    target_owner="$(meta_field "$META" owner)"
-    target_group="$(meta_field "$META" group)"
-    target_mode="$(meta_field "$META" mode)"
-    local state
+    T_OWNER="$(meta_field "$META" owner)"
+    T_GROUP="$(meta_field "$META" group)"
+    T_MODE="$(meta_field "$META" mode)"
+  else
+    T_OWNER="$(stat -f '%Su' "$p")" || return 1
+    T_GROUP="$(stat -f '%Sg' "$p")" || return 1
+    T_MODE="$(stat -f '%OLp' "$p")" || return 1
+  fi
+}
+
+# plan_node <path> <tier> [<anchor flagword>]: what sealing this node would
+# do, decided without touching it. Prints the action word; on a node that
+# cannot be sealed at all it prints the refusal on stderr and returns 1, so
+# the whole ceremony stops before its first change.
+#
+# The actions: "seal <tier>" for a first seal, "relock <tier>" for a record
+# that was unlocked, "reflag anchor (<old> -> <new>)" for a tier-internal
+# escalation, and "already locked" for a record that still verifies --
+# which the plan SHOWS rather than hides, because a chain is easier to
+# judge whole than in parts. The anchor tier carries its flag word in
+# both seal and relock, because the flag is what an anchor seal IS.
+#
+# Called from a command substitution, so snap_paths' globals are the
+# subshell's; nothing here writes anything the caller needs back.
+plan_node() {
+  local p="$1" t="$2" fl="${3:-}"
+  snap_paths "$p"
+  local state="" prev_flag=""
+  if [ -f "$META" ]; then
     state="$(meta_field "$META" state)"
-    if [ "$state" = "locked" ]; then
-      if verify_node "$f" "$META" "$lock_user" >/dev/null 2>&1; then
-        echo "already locked: $f"
-        log_action lock "$f" skip-already-locked
+    prev_flag="$(meta_field "$META" flag)"
+  fi
+
+  # One locked-and-verifying answer for all three tiers. Anchor adds the
+  # flag word to the question: a record locked under sappnd says nothing
+  # about a schg request, which is an escalation, not a no-op.
+  local settled=0
+  if [ "$state" = "locked" ]; then
+    settled=1
+    if [ "$t" = "anchor" ] && [ "$prev_flag" != "$fl" ]; then
+      settled=0
+    fi
+  fi
+  if [ "$settled" -eq 1 ]; then
+    if verify_node "$p" "$META" "$lock_user" >/dev/null 2>&1; then
+      printf 'already locked'
+      return 0
+    fi
+    echo "${E_RED}${E_B}ERROR:${E_OFF} $p is marked locked but drifted -- investigate before relocking:" >&2
+    verify_node "$p" "$META" "$lock_user" >&2 || true
+    return 1
+  fi
+
+  case "$t" in
+    content)
+      # A symlink is never a tree: it has no children of its own, and -d
+      # would answer for whatever it points at.
+      local is_dir=0
+      if [ ! -L "$p" ] && [ -d "$p" ]; then
+        is_dir=1
+      fi
+      content_targets "$p" || return 1
+      if [ ! -f "$META" ] && [ "$T_OWNER" != "$inv" ]; then
+        echo "skip $p: not owned by you (owner=$T_OWNER)" >&2
+        log_action lock "$p" skip-not-owned
+        return 1
+      fi
+      # Recursive adoption sanity: single owner + single group across the
+      # tree, so unlock's chown -R restore is lossless.
+      if [ "$is_dir" -eq 1 ]; then
+        local stray
+        stray="$(find "$p" \( ! -user "$T_OWNER" ! -user "$lock_user" \) -o \( ! -group "$T_GROUP" ! -group "$lock_user" \) 2>/dev/null | head -3)"
+        if [ -n "$stray" ]; then
+          echo "${E_RED}${E_B}ERROR:${E_OFF} $p tree has mixed ownership; content tier needs a uniform tree:" >&2
+          printf '%s\n' "$stray" | sed 's/^/    /' >&2
+          return 1
+        fi
+      fi
+      ;;
+    placement)
+      [ -d "$p" ] || {
+        echo "${E_RED}${E_B}ERROR:${E_OFF} placement tier needs a directory: $p" >&2
+        return 1
+      }
+      if [ ! -f "$META" ]; then
+        local owner_now
+        owner_now="$(stat -f '%Su' "$p")"
+        if [ "$owner_now" != "$inv" ]; then
+          echo "${E_RED}${E_B}ERROR:${E_OFF} $p owned by $owner_now; placement adoption needs your ownership" >&2
+          return 1
+        fi
+      fi
+      ;;
+    anchor)
+      if [ "$state" = "locked" ]; then
+        # Tier-internal escalation (sappnd <-> schg): a normal relock that
+        # clears the previous system flag before applying the new one.
+        printf 'reflag anchor (%s -> %s)' "$prev_flag" "$fl"
         return 0
       fi
-      echo "${E_RED}${E_B}ERROR:${E_OFF} $f is marked locked but drifted -- investigate before relocking:" >&2
-      verify_node "$f" "$META" "$lock_user" >&2 || true
-      return 1
-    fi
-    if [ "$mode_now" != "$target_mode" ]; then
-      echo "  note: mode drifted from $target_mode to $mode_now during edit; restoring $target_mode on lock" >&2
-    fi
-  else
-    # Initial adoption: current identity becomes canonical.
-    if [ "$owner_now" != "$inv" ]; then
-      echo "skip $f: not owned by you (owner=$owner_now)" >&2
-      log_action lock "$f" skip-not-owned
-      return 1
-    fi
-    target_owner="$owner_now"
-    target_group="$group_now"
-    target_mode="$mode_now"
-  fi
+      ;;
+  esac
 
-  # Recursive adoption sanity: single owner + single group across the tree,
-  # so unlock's chown -R restore is lossless.
-  if [ "$is_dir" -eq 1 ]; then
-    local stray
-    stray="$(find "$f" \( ! -user "$target_owner" ! -user "$lock_user" \) -o \( ! -group "$target_group" ! -group "$lock_user" \) 2>/dev/null | head -3)"
-    if [ -n "$stray" ]; then
-      echo "${E_RED}${E_B}ERROR:${E_OFF} $f tree has mixed ownership; content tier needs a uniform tree:" >&2
-      printf '%s\n' "$stray" | sed 's/^/    /' >&2
-      return 1
-    fi
+  # A relock names its tier the way a first seal does: the header carries
+  # the LEAF's tier and nothing else, so without it an ancestor's line
+  # would not say whether it is coming back as placement or as an anchor.
+  if [ -f "$META" ]; then
+    case "$t" in
+      content)   printf 'relock content' ;;
+      placement) printf 'relock placement' ;;
+      anchor)    printf 'relock anchor (%s)' "$fl" ;;
+    esac
+    return 0
   fi
+  case "$t" in
+    content)   printf 'seal content' ;;
+    placement) printf 'seal placement' ;;
+    anchor)    printf 'seal anchor (%s)' "$fl" ;;
+  esac
+}
 
-  # Diff-witness: snapshot (unlock-time state) vs current, then confirm.
-  # The trailing blank is the composer's: it separates the diff block from
-  # the prompt that decides on it.
-  if [ "$is_dir" -eq 0 ] && [ -f "$SNAP" ]; then
+# The witness the gate is answered on: what the snapshot says the leaf held
+# when it was released, against what it holds now. Only content and anchor
+# FILES have one -- a content directory diffs against its .snapdir, a
+# placement parent has no content of its own, and a symlink's content IS
+# its target, which is one line rather than a diff. The block owns its
+# trailing blank line, which separates it from the plan below it.
+lock_witness() { # <path> <tier>
+  local f="$1" t="$2" shown=0
+  [ "$t" = "placement" ] && return 0
+  snap_paths "$f"
+  if [ -L "$f" ]; then
+    echo "symlink -> $(readlink "$f") (the link node is sealed, not its target)"
+    shown=1
+  elif [ -d "$f" ]; then
+    if [ "$t" = "content" ]; then
+      if [ -d "$SNAPDIR" ]; then
+        show_diff 'diff snapshot -> current' "$f" \
+          diff --color=never -ru "$SNAPDIR" "$f" || return 1
+      else
+        echo "adopting into pool (no prior snapshot): $f"
+      fi
+      shown=1
+    fi
+  elif [ -f "$SNAP" ]; then
     if cmp -s "$SNAP" "$f"; then
       echo "no changes since unlock: $f"
     else
       show_diff 'diff snapshot -> current' "$f" \
         diff --color=never -u "$SNAP" "$f" || return 1
-      echo
     fi
-  elif [ "$is_dir" -eq 1 ] && [ -d "$SNAPDIR" ]; then
-    show_diff 'diff snapshot -> current' "$f" \
-      diff --color=never -ru "$SNAPDIR" "$f" || return 1
-    echo
+    shown=1
   else
     echo "adopting into pool (no prior snapshot): $f"
+    shown=1
   fi
-  # Name the mechanism the way the placement and anchor prompts do, so what
-  # you approve is visible: a dir takes uchg on every node of its tree.
-  local seal_note="uchg"
-  if [ "$is_dir" -eq 1 ]; then
-    seal_note="uchg recursive"
+  if [ "$shown" -eq 1 ]; then
+    echo
   fi
-  confirm "Seal $(subj "$f") (tier content, $seal_note)?" || {
-    echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
-  }
+  return 0
+}
 
-  # Baseline snapshot on first adoption so revert always has one.
-  if [ "$is_dir" -eq 0 ] && [ ! -f "$SNAP" ]; then
-    run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || return 1
-  elif [ "$is_dir" -eq 1 ] && [ ! -d "$SNAPDIR" ]; then
-    run snapshot_tree "$f" "$SNAPDIR" || return 1
+# ---- seal / release primitives ---------------------------------------------
+
+# seal_content <path>: apply a decided content-tier seal. The node is a
+# file, a directory (sealed recursively) or a symlink (sealed as the link
+# node itself). Whether it may be sealed at all was settled by plan_node.
+seal_content() {
+  local f="$1"
+  snap_paths "$f"
+  local is_dir=0 is_link=0
+  [ -L "$f" ] && is_link=1
+  if [ "$is_link" -eq 0 ] && [ -d "$f" ]; then
+    is_dir=1
+  fi
+
+  content_targets "$f" || return 1
+  local target_owner="$T_OWNER" target_group="$T_GROUP" target_mode="$T_MODE"
+
+  if [ -f "$META" ] && [ "$is_link" -eq 0 ]; then
+    local mode_now
+    mode_now="$(stat -f '%OLp' "$f")"
+    if [ "$mode_now" != "$target_mode" ]; then
+      echo "  note: mode drifted from $target_mode to $mode_now during edit; restoring $target_mode on lock" >&2
+    fi
+  fi
+
+  # Baseline snapshot on first adoption so revert always has one. A
+  # symlink gets none: its content is the path it names, which the identity
+  # record pins already, and the helper's copy verb opens its source
+  # O_NOFOLLOW -- a link is precisely what it refuses to read through.
+  if [ "$is_link" -eq 0 ]; then
+    if [ "$is_dir" -eq 0 ] && [ ! -f "$SNAP" ]; then
+      run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || return 1
+    elif [ "$is_dir" -eq 1 ] && [ ! -d "$SNAPDIR" ]; then
+      run snapshot_tree "$f" "$SNAPDIR" || return 1
+    fi
   fi
 
   # Seal: ownership, mode, then flag LAST (flags block chmod/chown).
@@ -1524,7 +1675,13 @@ seal_content() {
     fset uchg "$f" -R || return 1
   else
     run chown -h "${lock_user}:${lock_user}" "$f" || return 1
-    run chmod "$target_mode" "$f" || return 1
+    # No chmod on a link: chmod(2) follows, so it would restyle the
+    # TARGET -- somebody else's node -- and a link's own mode gates
+    # nothing on macOS. What may replace the link is governed by its
+    # parent directory, which the chain seals.
+    if [ "$is_link" -eq 0 ]; then
+      run chmod "$target_mode" "$f" || return 1
+    fi
     fset uchg "$f" || return 1
   fi
 
@@ -1545,11 +1702,10 @@ seal_content() {
   log_action lock "$f" ok
 }
 
-# seal_placement <dir>: adopt or relock a placement-tier parent dir.
+# seal_placement <dir>: apply a decided placement-tier seal to a parent dir.
 seal_placement() {
   local d="$1"
   snap_paths "$d"
-  [ -d "$d" ] || { echo "${E_RED}${E_B}ERROR:${E_OFF} placement tier needs a directory: $d" >&2; return 1; }
 
   local owner_now group_now mode_now
   owner_now="$(stat -f '%Su' "$d")"
@@ -1557,18 +1713,10 @@ seal_placement() {
   mode_now="$(stat -f '%OLp' "$d")"
 
   if [ -f "$META" ]; then
-    local state
-    state="$(meta_field "$META" state)"
-    if [ "$state" = "locked" ]; then
-      if verify_node "$d" "$META" "$lock_user" >/dev/null 2>&1; then
-        return 0   # chain ancestor already good; stay quiet.
-      fi
-      echo "${E_RED}${E_B}ERROR:${E_OFF} $d is marked locked but drifted -- investigate:" >&2
-      verify_node "$d" "$META" "$lock_user" >&2 || true
-      return 1
-    fi
     # Re-seal after an unlock ceremony: reapply flag only -- but never
-    # silently bless a node that was swapped during the window.
+    # silently bless a node that was swapped during the window. This is the
+    # one live question left in an applying seal, because it reports an
+    # anomaly the plan could not have shown as routine.
     check_reseal_identity "$d" "$META" || {
       echo "${E_YEL}aborted: $d${E_OFF}" >&2; return 2
     }
@@ -1591,13 +1739,6 @@ seal_placement() {
     return 0
   fi
 
-  if [ "$owner_now" != "$inv" ]; then
-    echo "${E_RED}${E_B}ERROR:${E_OFF} $d owned by $owner_now; placement adoption needs your ownership" >&2
-    return 1
-  fi
-  confirm "Provision $(subj "$d") (tier placement: owner ${lock_user}, group-write, uappnd)?" || {
-    echo "${E_YEL}aborted: $d${E_OFF}" >&2; return 2
-  }
   # Ownership to the lock account; the invoker keeps add-rights via the lock
   # group. Flag last.
   run chown "${lock_user}:${lock_user}" "$d" || return 1
@@ -1620,10 +1761,10 @@ seal_placement() {
   log_action lock "$d" ok
 }
 
-# seal_anchor <path> <flagword>: system flag, ownership and mode untouched.
-# Anchor FILES still get the snapshot + diff-witness (ssh config class:
-# ownership never changes but the content is what's being sealed); dirs
-# (~, ~/.ssh) have no content snapshot.
+# seal_anchor <path> <flagword>: apply a decided anchor seal -- system flag,
+# ownership and mode untouched. Anchor FILES still get the snapshot (ssh
+# config class: ownership never changes but the content is what's being
+# sealed); dirs (~, ~/.ssh) have no content snapshot.
 seal_anchor() {
   local f="$1" flagword="$2"
   snap_paths "$f"
@@ -1639,33 +1780,12 @@ seal_anchor() {
   if [ -f "$META" ]; then
     state="$(meta_field "$META" state)"
     prev_flag="$(meta_field "$META" flag)"
-    if [ "$state" = "locked" ] && [ "$prev_flag" = "$flagword" ]; then
-      if verify_node "$f" "$META" "$lock_user" >/dev/null 2>&1; then
-        return 0
-      fi
-      echo "${E_RED}${E_B}ERROR:${E_OFF} $f is marked locked but drifted -- investigate:" >&2
-      verify_node "$f" "$META" "$lock_user" >&2 || true
-      return 1
-    fi
-  fi
-
-  if [ "$is_file" -eq 1 ]; then
-    if [ -f "$SNAP" ]; then
-      if cmp -s "$SNAP" "$f"; then
-        echo "no changes since unlock: $f"
-      else
-        show_diff 'diff snapshot -> current' "$f" \
-          diff --color=never -u "$SNAP" "$f" || return 1
-        echo
-      fi
-    else
-      echo "adopting into pool (no prior snapshot): $f"
-    fi
   fi
 
   # Dirs have no content diff, so a swap during the window is invisible
-  # except by identity -- check it. (Files are covered by the diff above,
-  # and atomic-save legitimately changes a file's inode.)
+  # except by identity -- check it. (Files are covered by the witness the
+  # plan gate was answered on, and atomic-save legitimately changes a
+  # file's inode.) This is the one live question left in an applying seal.
   if [ -f "$META" ] && [ "$is_file" -eq 0 ]; then
     check_reseal_identity "$f" "$META" || {
       echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
@@ -1674,15 +1794,9 @@ seal_anchor() {
 
   if [ "$state" = "locked" ] && [ "$prev_flag" != "$flagword" ]; then
     # Tier-internal escalation (sappnd <-> schg) is a normal relock: clear
-    # the previous system flag before applying the new one.
-    confirm "Change anchor flag on $(subj "$f"): $prev_flag -> $flagword?" || {
-      echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
-    }
+    # the previous system flag before applying the new one. The plan named
+    # the change as "reflag anchor" and the gate approved it.
     fclear "$prev_flag" "$f" || return 1
-  else
-    confirm "Anchor $(subj "$f") ($flagword; ownership unchanged)?" || {
-      echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
-    }
   fi
 
   if [ "$is_file" -eq 1 ] && [ ! -f "$SNAP" ]; then
@@ -1739,6 +1853,12 @@ release_node() {
     return 0
   fi
 
+  # A symlink node is released as the link it is: no snapshot to refresh
+  # (it never had one) and no mode to put back (chmod would follow through
+  # to the target). fclear passes -h, so the flag comes off the link.
+  local is_link=0
+  [ -L "$f" ] && is_link=1
+
   # Clear flag FIRST (flags block chmod/chown), then restore identity.
   case "$tier" in
     content)
@@ -1748,10 +1868,14 @@ release_node() {
         run chown -R "${owner}:${group}" "$f" || return 1
       else
         fclear "$flag" "$f" || return 1
-        run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || return 1
+        if [ "$is_link" -eq 0 ]; then
+          run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || return 1
+        fi
         run chown -h "${owner}:${group}" "$f" || return 1
       fi
-      run chmod "$mode" "$f" || return 1
+      if [ "$is_link" -eq 0 ]; then
+        run chmod "$mode" "$f" || return 1
+      fi
       ;;
     placement|anchor)
       fclear "$flag" "$f" || return 1
@@ -1788,7 +1912,9 @@ release_node() {
       "state=unlocked" || return 1
   fi
   echo "${C_GRN}✓${C_OFF} unlocked: $f ($tier)"
-  [ "$tier" = "content" ] && [ "$recursive" != "1" ] && echo "  snapshot: $SNAP"
+  if [ "$tier" = "content" ] && [ "$recursive" != "1" ] && [ "$is_link" -eq 0 ]; then
+    echo "  snapshot: $SNAP"
+  fi
 
   # Atomic-save hint: if the parent still carries an append/immutable flag,
   # editors that save via rename will fail until --chain releases it.
@@ -1839,6 +1965,23 @@ abs_leaf() { # <path>
     printf '%s\n' "/$b"
   else
     printf '%s\n' "$d/$b"
+  fi
+}
+
+# The node a lock or unlock verb acts on.
+#
+# A SYMLINK argument names the link itself, never its target: the link node
+# is the one a same-UID process can repoint, so resolving through it would
+# seal the target and leave the actual redirection wide open -- and then
+# report "already locked" for a link nothing protects. abs_leaf is exactly
+# the right shape for that (parent canonicalized, the entry's own name
+# kept), and it already refuses a name the window helper's grammar cannot
+# carry. Anything else is canonicalized whole, as before.
+leaf_path() { # <path>
+  if [ -L "$1" ]; then
+    abs_leaf "$1"
+  else
+    readlink -f "$1" || { echo "skip: cannot resolve $1" >&2; return 1; }
   fi
 }
 
@@ -2382,12 +2525,27 @@ chain_diagnosis() { # <path> [<command> <description>]...
 # ---- actions ---------------------------------------------------------------
 
 do_lock_one() {
-  local f="$1"
-  f="$(readlink -f "$f")" || { echo "skip: cannot resolve $1" >&2; return 1; }
-  [ -e "$f" ] || { echo "skip $f: does not exist" >&2; log_action lock "$f" skip-noent; return 1; }
-  if [ ! -f "$f" ] && [ ! -d "$f" ]; then
-    echo "skip $f: not a regular file or directory" >&2
-    return 1
+  local f
+  f="$(leaf_path "$1")" || return 1
+  local is_link=0
+  [ -L "$f" ] && is_link=1
+  if [ "$is_link" -eq 1 ]; then
+    # A dangling link is a node, but not one worth sealing: it names
+    # nothing, so the seal would freeze a promise nothing keeps. Same shape
+    # as the missing-path skip. What the link points AT is not checked
+    # beyond that -- the link node is what gets sealed, and its target is
+    # somebody else's node with its own tier and its own record.
+    if [ ! -e "$f" ]; then
+      echo "skip $f: dangling symlink (its target does not exist)" >&2
+      log_action lock "$f" skip-dangling
+      return 1
+    fi
+  else
+    [ -e "$f" ] || { echo "skip $f: does not exist" >&2; log_action lock "$f" skip-noent; return 1; }
+    if [ ! -f "$f" ] && [ ! -d "$f" ]; then
+      echo "skip $f: not a regular file or directory" >&2
+      return 1
+    fi
   fi
 
   local under_ssh=0
@@ -2429,6 +2587,21 @@ do_lock_one() {
     fi
   fi
 
+  # A symlink takes the content tier and no other. Placement is for a
+  # directory with entries to place, and a link has none; anchor is for the
+  # nodes the OS identity-checks, and every one of those checks resolves
+  # the path, so it judges the target and never the link. Content is the
+  # tier that seals a node as itself, which is the whole point of naming a
+  # link here.
+  if [ "$is_link" -eq 1 ] && [ "$leaf_tier" != "content" ]; then
+    echo "${E_RED}${E_B}ERROR:${E_OFF} $f is a symlink; the $leaf_tier tier does not apply to a link" >&2
+    echo "       A link has no entries to place and no ownership the OS" >&2
+    echo "       checks -- content is the only tier that seals the link" >&2
+    echo "       node itself. Name its target to seal that too." >&2
+    log_action lock "$f" refuse-link-tier
+    return 1
+  fi
+
   if [ "$under_ssh" -eq 1 ] && [ "$leaf_tier" != "anchor" ]; then
     echo "${E_RED}${E_B}ERROR:${E_OFF} $f: ~/.ssh and its files take the anchor tier only -- sshd" >&2
     echo "       StrictModes and the ssh client's config check require" >&2
@@ -2449,34 +2622,123 @@ do_lock_one() {
   local chain
   chain="$(chain_for "$f")" || return 1
 
-  # Leaf first, then ancestors upward (reverse of unlock --chain).
-  case "$leaf_tier" in
-    content)   seal_content "$f" || return $? ;;
-    placement) seal_placement "$f" || return $? ;;
-    anchor)    seal_anchor "$f" "$leaf_flag" || return $? ;;
-  esac
+  # ---- plan ----------------------------------------------------------------
+  #
+  # Collected leaf first, then ancestors nearest-first: that is the order
+  # the seals run in below, and the display reverses it. Any refusal here
+  # ends the ceremony with nothing touched.
+  local -a plan_paths plan_tiers plan_flags plan_actions
+  plan_paths=(); plan_tiers=(); plan_flags=(); plan_actions=()
+  local act
+  act="$(plan_node "$f" "$leaf_tier" "$leaf_flag")" || return 1
+  plan_paths+=("$f")
+  plan_tiers+=("$leaf_tier")
+  plan_flags+=("$leaf_flag")
+  plan_actions+=("$act")
 
-  # The chain feeds fd 3, not stdin: the loop body seals ancestors, and every
-  # seal asks for confirmation on stdin. A plain `done <<EOF` would put the
-  # heredoc there and confirm() -- which fails closed off a tty -- would abort
-  # the anchor even with a human at the terminal.
+  # The chain feeds fd 3, not stdin: this loop spawns the window helper (for
+  # node identity) once per ancestor, every child inherits this process's
+  # stdin, and a plain `done <<EOF` would leave chain text sitting in front
+  # of the gate that follows.
   local a t
   while IFS= read -r a <&3; do
     [ -n "$a" ] || continue
     [ "$a" = "$f" ] && continue
     t="$(tier_for_ancestor "$a")"
-    case "$t" in
-      anchor)    seal_anchor "$a" sappnd || return $? ;;
-      placement) seal_placement "$a" || return $? ;;
-    esac
+    act="$(plan_node "$a" "$t" sappnd)" || return 1
+    plan_paths+=("$a")
+    plan_tiers+=("$t")
+    plan_flags+=(sappnd)
+    plan_actions+=("$act")
   done 3<<EOF
 $chain
 EOF
+
+  local n i w=0 changes=0
+  n="${#plan_paths[@]}"
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    if [ "${plan_actions[$i]}" != "already locked" ]; then
+      changes=$((changes + 1))
+    fi
+    if [ "${#plan_actions[$i]}" -gt "$w" ]; then
+      w="${#plan_actions[$i]}"
+    fi
+    i=$((i + 1))
+  done
+
+  # A chain that is already whole asks nothing: there is no change to
+  # consent to, and a gate over an empty set trains the eye to say yes.
+  if [ "$changes" -eq 0 ]; then
+    echo "already locked: $f"
+    log_action lock "$f" skip-already-locked
+    return 0
+  fi
+
+  # The witness first (what the leaf holds now against what it held when it
+  # was released), then the plan, then the one question.
+  if [ "${plan_actions[0]}" != "already locked" ]; then
+    lock_witness "$f" "$leaf_tier" || return 1
+  fi
+
+  # Root-most first: a tree reads top-down, and the node that governs
+  # everything under it is the one to read first. The plan shares the
+  # prompt's stream, so redirecting stdout can never separate the gate from
+  # the list it is about. Already-locked rows are dim -- they are context,
+  # not offer.
+  echo "${E_B}plan for $f (tier $leaf_tier):${E_OFF}" >&2
+  i=$((n - 1))
+  while [ "$i" -ge 0 ]; do
+    if [ "${plan_actions[$i]}" = "already locked" ]; then
+      printf '%s  %-*s  %s%s\n' "$E_DIM" "$w" "${plan_actions[$i]}" \
+        "${plan_paths[$i]}" "$E_OFF" >&2
+    else
+      printf '  %-*s  %s\n' "$w" "${plan_actions[$i]}" "${plan_paths[$i]}" >&2
+    fi
+    i=$((i - 1))
+  done
+  echo >&2
+
+  if [ "$OPT_DRY" -eq 1 ]; then
+    echo "dry run: nothing changed" >&2
+    log_action lock "$f" dry-run
+    return 0
+  fi
+
+  local noun="nodes"
+  [ "$changes" -eq 1 ] && noun="node"
+  confirm "Seal $(subj "$f") as listed ($changes $noun to change)?" seals || {
+    # The decline is the decision this run made, so it goes in the log
+    # beside the seals that were taken -- and it is the whole record of
+    # the run, since not one node was touched.
+    log_action lock "$f" abort
+    echo "${E_YEL}aborted: $f${E_OFF}" >&2
+    return 2
+  }
+
+  # ---- apply ---------------------------------------------------------------
+  #
+  # Leaf first, then ancestors nearest-first (the plan's own order), and no
+  # further questions: the gate above answered for all of them.
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    if [ "${plan_actions[$i]}" != "already locked" ]; then
+      case "${plan_tiers[$i]}" in
+        content)   seal_content "${plan_paths[$i]}" || return $? ;;
+        placement) seal_placement "${plan_paths[$i]}" || return $? ;;
+        anchor)    seal_anchor "${plan_paths[$i]}" "${plan_flags[$i]}" || return $? ;;
+      esac
+    fi
+    i=$((i + 1))
+  done
 }
 
 do_unlock_one() {
-  local f="$1"
-  f="$(readlink -f "$f")" || { echo "skip: cannot resolve $1" >&2; return 1; }
+  local f
+  # leaf_path, not readlink -f: a sealed symlink is a record of its own, and
+  # resolving through it here would look for the target's record and report
+  # the link as "not in pool".
+  f="$(leaf_path "$1")" || return 1
   release_node "$f" || return $?
   if [ "$OPT_CHAIN" -eq 1 ]; then
     local chain a
@@ -2516,6 +2778,15 @@ stage_new() {
 # no chain release is needed.
 do_edit_one() {
   local f="$1"
+  # A symlink has no content of its own to put an editor on, and resolving
+  # through it would edit a file the caller did not name. Say which node is
+  # editable instead of quietly acting on another one.
+  if [ -L "$f" ]; then
+    echo "skip $f: a symlink has no content to edit -- name the file it points at" >&2
+    echo "  (re-pointing the link is a lock/unlock of the link node itself)" >&2
+    log_action edit "$f" refuse-symlink
+    return 1
+  fi
   f="$(readlink -f "$f")" || { echo "skip: cannot resolve $1" >&2; return 1; }
   snap_paths "$f"
   [ -f "$META" ] || { echo "skip $f: not in pool (edit works on locked files; use lock to adopt)" >&2; return 1; }
@@ -2650,10 +2921,15 @@ do_edit_one() {
 }
 
 do_revert_one() {
-  local f="$1"
-  f="$(readlink -f "$f")" || { echo "skip: cannot resolve $1" >&2; return 1; }
+  local f
+  # leaf_path, so a symlink is one node everywhere (see do_lock_one). A
+  # link has no snapshot of its own -- its content is the path it names --
+  # so it falls into the "nothing to revert from" answer below, which is
+  # the true one. Resolving instead would revert the file it points at,
+  # which the caller did not name.
+  f="$(leaf_path "$1")" || return 1
   snap_paths "$f"
-  if [ -d "$f" ]; then
+  if [ ! -L "$f" ] && [ -d "$f" ]; then
     echo "skip $f: revert supports files only (unlock, restore by hand, lock)" >&2
     return 1
   fi
@@ -3220,12 +3496,18 @@ EOF
 
 do_status_one() {
   local f="$1" resolved
-  # readlink -f fails on a path that no longer exists -- which is exactly
-  # the expected condition of a retired or suspended record. Fall back to
-  # the path as typed (absolute only) so those records stay reachable by
-  # name; records are keyed by the canonical path captured at lock time,
-  # so the typed absolute path is the same key in the ordinary case.
-  if resolved="$(readlink -f "$f" 2>/dev/null)"; then
+  # leaf_path, so a symlink is one node everywhere: lock records the link
+  # itself, and resolving here would report the target's chain and call
+  # the link "not in pool".
+  #
+  # It fails on a path that no longer exists -- which is exactly the
+  # expected condition of a retired or suspended record. Fall back to the
+  # path as typed (absolute only) so those records stay reachable by name;
+  # records are keyed by the canonical path captured at lock time, so the
+  # typed absolute path is the same key in the ordinary case. Its own
+  # diagnostics are dropped with them: this is a reporting verb, and the
+  # fallback below is the answer, not an error.
+  if resolved="$(leaf_path "$f" 2>/dev/null)"; then
     f="$resolved"
   else
     case "$f" in

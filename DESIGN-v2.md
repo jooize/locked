@@ -69,6 +69,25 @@ ceremony:
    re-provisioned. The walk stops at the first node owned by neither the
    invoker nor the lock account; that node must be root-owned with no
    group/other write (`/Users` on stock macOS) or the lock is refused.
+4. **Nothing is touched until the whole ceremony is derived.** Every
+   refusal is raised in that pass; then the diff witness, then the plan --
+   one line per node, root-most first, the ones that need nothing shown as
+   `already locked` -- and then one `[y/N]` for the lot. Declining changes
+   nothing at all. `--yes` answers that gate, `--dry-run` prints the plan
+   and stops before it. Each seal used to ask for itself, which meant
+   declining an ancestor left the leaf sealed under a parent nobody had
+   protected. The only question left after the gate is the alarm a node
+   raises when its identity changed during an unlock window: an anomaly,
+   not a step in the plan.
+
+A **symlink argument names the link, not its target.** The parent is
+canonicalized and the link's own name is kept, so the link node itself is
+what gets sealed -- content tier, the only tier that applies to a link,
+since placement needs entries to place and every OS identity check
+resolves the path and judges the target. The link node is precisely what a
+same-UID process can re-point, which is what sealing the target left open.
+The target keeps its own ownership and takes its own record if you name it
+too; a dangling link is refused.
 
 `locked status <leaf>` verifies the FULL chain: per level owner, group,
 mode, exact flag word vs meta, and volume-uuid/inode identity. `locked unlock`
@@ -82,8 +101,8 @@ in reverse.
 What each verb promises, and where the promise stops. Every verb that
 changes a sealed file shows a diff first and asks before it proceeds
 (pinned-style "the diff matches what I intended"); `--yes` answers the
-prompt for non-interactive use and `--dry-run` prints every mutation and
-performs none.
+prompt for non-interactive use and `--dry-run` performs nothing, printing
+the plan for `lock` and every mutation elsewhere.
 
 ### `edit`: the candidate is frozen before you see it
 
