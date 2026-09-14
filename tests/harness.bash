@@ -332,7 +332,12 @@ ok   "verify clean after relock"         locked verify
 note "== cli: revert restores unlock-time snapshot =="
 ok   "unlock for revert round"           locked unlock "$CFG"
 as_user /bin/sh -c "printf 'version 3\n' > '$CFG'"
-ok   "relock version 3"                  locked lock --yes "$CFG"
+RLF="$SCRATCH/relock-diff-header.out"
+RLRC=0
+locked lock --yes "$CFG" >"$RLF" 2>&1 || RLRC=$?
+check "relock version 3"                 "0" "$RLRC"
+ok   "relock names the snapshot side"    grep -qF -- "--- snapshot: $CFG" "$RLF"
+ok   "relock names the current side"     grep -qF -- "+++ current: $CFG" "$RLF"
 ok   "revert"                            locked revert "$CFG"
 check "content back to unlock-time"      "version 2" "$(head -1 "$CFG")"
 check "reverted file still uchg"         "uchg" "$(flags_of "$CFG")"
@@ -401,7 +406,12 @@ PROPD="$SCRATCH/proposals"
 install -d -o "$INV" -g staff -m 755 "$PROPD"
 PROP="$PROPD/config.proposed.txt"
 as_user /bin/sh -c "printf 'from a proposal\n' > '$PROP'"
-ok   "edit --from installs the proposal"  locked edit --yes --from "$PROP" "$CFG"
+EDF="$SCRATCH/edit-diff-header.out"
+EDRC=0
+locked edit --yes --from "$PROP" "$CFG" >"$EDF" 2>&1 || EDRC=$?
+check "edit --from installs the proposal" "0" "$EDRC"
+ok   "edit --from names current"          grep -qF -- "--- current: $CFG" "$EDF"
+ok   "edit --from names proposed"         grep -qF -- "+++ proposed: $PROP" "$EDF"
 check "proposed content installed"        "from a proposal" "$(head -1 "$CFG")"
 check "still locked after edit --from"    "uchg" "$(flags_of "$CFG")"
 check "owner still lock account"          "$LOCK_ACCT" "$(owner_of "$CFG")"
@@ -447,7 +457,7 @@ EDITBODY="$SCRATCH/do_edit_one.body"
 awk '/^do_edit_one\(\) \{/,/^\}$/' "$LOCKED" >"$EDITBODY"
 ok   "the edit body was extracted"        test -s "$EDITBODY"
 ok   "the diff reads the frozen copy"     \
-     grep -qF 'diff --color=never -u "$f" "$stage"' "$EDITBODY"
+     grep -qF '--label "$lhs" --label "$rhs" "$f" "$stage"' "$EDITBODY"
 ok   "the install reads the frozen copy"  \
      grep -qF 'atomic_replace "$stage" "$f"' "$EDITBODY"
 FREEZELN="$(grep -n 'show_diff' "$EDITBODY" | head -1 | cut -d: -f1)"

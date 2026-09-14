@@ -1628,8 +1628,13 @@ lock_witness() { # <path> <tier>
     if cmp -s "$SNAP" "$f"; then
       echo "no changes since unlock: $f"
     else
+      # Named by role and subject path: the snapshot sits in the pool under
+      # a name that tells the reader nothing. The -ru directory case above
+      # keeps diff's own headers -- it names one pair per file, and a
+      # single --label pair would mislabel every one of them.
       show_diff 'diff snapshot -> current' "$f" \
-        diff --color=never -u "$SNAP" "$f" || return 1
+        diff --color=never -u --label "snapshot: $f" --label "current: $f" \
+        "$SNAP" "$f" || return 1
     fi
     shown=1
   else
@@ -2819,13 +2824,19 @@ do_edit_one() {
   # and everything from there down -- the no-change check, the diff, the
   # install -- reads ONLY $stage; neither the editor's copy nor the --from
   # proposal is looked at again.
-  local stage label
+  # The diff's two sides are named by role and by the subject path, because
+  # the staged candidate lives at a private temp path that tells the reader
+  # nothing. The label carries exactly the bytes the header showed before --
+  # the path -- so nothing new is disclosed, and show_diff's painter still
+  # recognizes the headers by position.
+  local stage label lhs rhs
   if [ -n "$OPT_FROM" ]; then
     # Freeze FIRST. The proposal sits in the invoker's own space, where
     # anything running as the invoker can swap it at any moment; taking it
     # out of reach before a single byte is displayed is what makes the
     # diff a promise instead of a snapshot of one past moment.
     label='diff current -> proposed'
+    lhs="current: $f" rhs="proposed: $OPT_FROM"
     stage="$(stage_new)" || return 1
     # The root-side redirect is the point, not an oversight (SC2024): the
     # WRITE has to land in lock-account staging; only the READ drops to
@@ -2839,6 +2850,7 @@ do_edit_one() {
     }
   else
     label='diff current -> edited'
+    lhs="current: $f" rhs="edited: $f"
     # User-owned working copy in a private temp dir.
     local editdir copy
     editdir="$(mktemp -d /tmp/locked-edit.XXXXXX)" || return 1
@@ -2895,7 +2907,8 @@ do_edit_one() {
   }
 
   show_diff "$label" "$f" \
-    diff --color=never -u "$f" "$stage" || { rm -f -- "$stage"; return 1; }
+    diff --color=never -u --label "$lhs" --label "$rhs" "$f" "$stage" \
+    || { rm -f -- "$stage"; return 1; }
   echo
   confirm "Install and reseal $(subj "$f")?" installs || {
     echo "${E_YEL}aborted; $f unchanged${E_OFF}" >&2
