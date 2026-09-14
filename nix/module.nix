@@ -11,7 +11,7 @@
 #
 # Darwin-only on purpose: locked is built on BSD file flags, dscl and
 # launchd; there is nothing portable to declare.
-{ config, lib, pkgs, ... }:
+{ config, options, lib, pkgs, ... }:
 
 let
   cfg = config.security.locked;
@@ -218,7 +218,7 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable (lib.mkMerge [
+  config = lib.mkIf cfg.enable (lib.mkMerge ([
     {
       assertions = [
         {
@@ -284,5 +284,16 @@ in
         };
       };
     }
-  ]);
+  ]
+  # The lock account is root-only BY CONSTRUCTION here -- this module is what
+  # creates it, with no shell, no password and no service behind it -- so this
+  # is the one place entitled to tell pinned that a file it owns is as
+  # unwritable to the user as a root-owned one. The test is on `options`, not
+  # `config`: reading config.security.pinned to decide what to define would
+  # make this module's output depend on a value it contributes to, which is
+  # infinite recursion. A machine without pinned's module simply has no such
+  # option, and this contributes nothing.
+  ++ lib.optional (options ? security && options.security ? pinned) {
+    security.pinned.rootOnlyOwners = [ lockAccount ];
+  }));
 }
