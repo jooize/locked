@@ -1413,10 +1413,10 @@ show_diff() { # <label> <path> <diff-cmd>...
     # which clears it. Declining here only skips the pager -- the confirm
     # that follows still asks.
     local gate
-    printf -v gate '%snext: diff (%s lines);%s %sEnter%s opens it %s· %s%sn%s%s skips%s ' \
+    printf -v gate '%snext: diff (%s lines);%s %sEnter%s opens the diff %s· %s%sn%s%s skips%s ' \
       "$P_B" "$lines" "$P_OFF" "$P_BLU" "$P_OFF" \
       "$P_DIM" "$P_OFF" "$P_BLU" "$P_OFF" "$P_DIM" "$P_OFF"
-    if gate_answer 1 "$gate" 1 "Enter or y opens, n skips"; then
+    if gate_answer 1 "$gate" 1 "Enter or y opens the diff, n skips"; then
       /usr/bin/less -RF -- "$enc" || true
     fi
   else
