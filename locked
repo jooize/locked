@@ -63,9 +63,11 @@ VERSION=0.10.0
 # ---- palette ---------------------------------------------------------------
 #
 # Semantic color roles (terminal-output framework): bold magenta = the one
-# subject the y/N is about, cyan = identifiers and commands, yellow =
-# attention (notes, drift, aborts), green/red = verdict glyphs and
-# refusals, dim = meta, bold = the decision sentence and structure.
+# subject the y/N is about (a diff's file headers borrow it: they answer
+# what-am-I-looking-at one level down, as in pinned), cyan = identifiers
+# and commands, yellow = attention (notes, drift, aborts), green/red =
+# verdict glyphs and refusals, dim = meta, bold = the decision sentence
+# and structure.
 #
 # Gated PER STREAM: C_* follows stdout, E_* follows stderr, so a piped
 # stdout stays byte-identical for anything parsing it while an alarm on the
@@ -102,10 +104,11 @@ set_pal() {
 }
 set_pal   # initialize for set -u; callers on a redirected fd re-run it
 
-# The one bold-magenta token per decision screen -- the subject the y/N is
-# about. Emits a re-bold after its own reset so it can sit inside the bold
-# prompt sentence without turning the tail plain. Stderr palette: prompts
-# live there.
+# The bold-magenta subject of a decision screen -- what the y/N is about
+# (the diff filter paints file headers the same, see paint). Emits a
+# re-bold after its own reset so it can sit inside the bold prompt
+# sentence without turning the tail plain. Stderr palette: prompts live
+# there.
 subj() { printf '%s%s%s%s' "$E_B$E_MAG" "$1" "$E_OFF" "$E_B"; }
 
 usage() {
@@ -1332,7 +1335,7 @@ sub tok {
 }
 # A file header is recognized by position, never by its prefix: a removed
 # line of SQL or Lua that begins -- arrives here as --- foo, and painting
-# that bold instead of red would be the very falsification this filter is
+# that magenta instead of red would be the very falsification this filter is
 # here to stop. In unified output the --- / +++ pair can only sit at the
 # very start or straight after a diff line, so two of them are expected
 # there and nowhere else. Only in and Binary files stay lexical: a content
@@ -1340,10 +1343,10 @@ sub tok {
 my $expect = 2;
 sub paint {
   my $l = shift;
-  if ($l =~ /^diff /) { $expect = 2; return "\e[1m"; }
-  if ($expect > 0 && $l =~ /^(?:--- |\+\+\+ )/) { $expect--; return "\e[1m"; }
+  if ($l =~ /^diff /) { $expect = 2; return "\e[1;35m"; }
+  if ($expect > 0 && $l =~ /^(?:--- |\+\+\+ )/) { $expect--; return "\e[1;35m"; }
   $expect = 0;
-  return "\e[1m"  if $l =~ /^(?:Only in |Binary files )/;
+  return "\e[1;35m"  if $l =~ /^(?:Only in |Binary files )/;
   return "\e[36m" if $l =~ /^\@\@/;
   return "\e[32m" if $l =~ /^\+/;
   return "\e[31m" if $l =~ /^-/;

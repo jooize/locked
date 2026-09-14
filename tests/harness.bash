@@ -679,16 +679,16 @@ check "a removal line opens red"           "1" \
       "$(grep -cF -- "${DW_ESC}[31m-del" "$DWPOUT" || true)"
 check "a hunk header opens cyan"           "1" \
       "$(grep -cF -- "${DW_ESC}[36m@@" "$DWPOUT" || true)"
-check "a file header goes bold"            "1" \
-      "$(grep -cF -- "${DW_ESC}[1m--- a" "$DWPOUT" || true)"
-check "its mate goes bold too"             "1" \
-      "$(grep -cF -- "${DW_ESC}[1m+++ b" "$DWPOUT" || true)"
+check "a file header goes magenta"         "1" \
+      "$(grep -cF -- "${DW_ESC}[1;35m--- a" "$DWPOUT" || true)"
+check "its mate goes magenta too"          "1" \
+      "$(grep -cF -- "${DW_ESC}[1;35m+++ b" "$DWPOUT" || true)"
 check "a removal that reads like a header opens red" "1" \
       "$(grep -cF -- "${DW_ESC}[31m--- not a header" "$DWPOUT" || true)"
 check "an addition that reads like a header opens green" "1" \
       "$(grep -cF -- "${DW_ESC}[32m+++ not a header" "$DWPOUT" || true)"
-check "and neither of them goes bold"      "0" \
-      "$(grep -cF -- "${DW_ESC}[1m--- not a header" "$DWPOUT" || true)"
+check "and neither of them goes magenta"   "0" \
+      "$(grep -cF -- "${DW_ESC}[1;35m--- not a header" "$DWPOUT" || true)"
 /usr/bin/perl "$DWFILT" 0 <"$DWPIN" >"$DWPOUT" 2>&1 || true
 check "color off emits no escape at all"   "0" \
       "$(LC_ALL=C grep -c -- "$DW_ESC" "$DWPOUT" || true)"
