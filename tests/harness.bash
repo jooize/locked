@@ -457,7 +457,7 @@ EDITBODY="$SCRATCH/do_edit_one.body"
 awk '/^do_edit_one\(\) \{/,/^\}$/' "$LOCKED" >"$EDITBODY"
 ok   "the edit body was extracted"        test -s "$EDITBODY"
 ok   "the diff reads the frozen copy"     \
-     grep -qF '--label "$lhs" --label "$rhs" "$f" "$stage"' "$EDITBODY"
+     grep -qF -- '--label "$lhs" --label "$rhs" "$f" "$stage"' "$EDITBODY"
 ok   "the install reads the frozen copy"  \
      grep -qF 'atomic_replace "$stage" "$f"' "$EDITBODY"
 FREEZELN="$(grep -n 'show_diff' "$EDITBODY" | head -1 | cut -d: -f1)"

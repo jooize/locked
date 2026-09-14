@@ -2827,7 +2827,7 @@ do_edit_one() {
   # The diff's two sides are named by role and by the subject path, because
   # the staged candidate lives at a private temp path that tells the reader
   # nothing. The label carries exactly the bytes the header showed before --
-  # the path -- so nothing new is disclosed, and show_diff's painter still
+  # the path -- so nothing new is disclosed, and the diff painter still
   # recognizes the headers by position.
   local stage label lhs rhs
   if [ -n "$OPT_FROM" ]; then
