@@ -20,7 +20,7 @@ node the user does not own binds every user-UID process.
 | Tier | Flag | Ownership | For | Effect |
 |---|---|---|---|---|
 | `content` | `uchg` | `_<user>-lock` | leaf files; leaf dirs (recursive) | total freeze: content, rename, delete. Edit = unlock, edit, lock. |
-| `placement` | `uappnd` | `_<user>-lock` + group-write; children inherit the lock group | shared parent dirs (`~/.config`, `~/Library`, ...) | new entries allowed; rename/delete/replace of existing entries denied; dir itself immovable. Unlock only for uninstall/replace ceremonies. |
+| `placement` | `uappnd` | `_<user>-lock` + group-write; children inherit the lock group | ancestor dirs *above* a leaf's own parent (`~/.config`, `~/Library`, ...) | new entries allowed; rename/delete/replace of existing entries denied; dir itself immovable. Unlock only for uninstall/replace ceremonies. |
 | `anchor` | `sappnd` (default) or `schg` | **unchanged** (stays the user) | nodes the OS identity-checks against the user's UID: `~`, `~/.ssh` and its files | system flags are root-only to set AND clear, so the flag binds all user processes while the user stays owner -- sshd StrictModes and every owner==user check keep passing. |
 
 Probed facts the tiers rest on:
@@ -63,13 +63,17 @@ Linux the equivalent would need setgid on the directory or an explicit
 ceremony:
 
 1. The leaf gets its requested tier (default: `content`).
-2. Every ancestor owned by the invoker gets `placement` -- except `$HOME`
-   itself, which gets `anchor` (`sappnd`; ownership must not change).
-3. Ancestors already in the pool (meta exists) are verified, not
+2. **The leaf's own parent is not provisioned; the chain begins at the
+   grandparent.** The anchor is the exception and stays in the chain
+   wherever it sits, `$HOME` as a leaf's own parent included.
+3. Every ancestor from there up that the invoker owns gets `placement` --
+   except `$HOME` and `~/.ssh`, which get `anchor` (`sappnd`; ownership
+   must not change).
+4. Ancestors already in the pool (meta exists) are verified, not
    re-provisioned. The walk stops at the first node owned by neither the
    invoker nor the lock account; that node must be root-owned with no
    group/other write (`/Users` on stock macOS) or the lock is refused.
-4. **Nothing is touched until the whole ceremony is derived.** Every
+5. **Nothing is touched until the whole ceremony is derived.** Every
    refusal is raised in that pass; then the diff witness, then the plan --
    one line per node, root-most first, the ones that need nothing shown as
    `already locked` -- and then one `[y/N]` for the lot. Declining changes
@@ -79,6 +83,79 @@ ceremony:
    protected. The only question left after the gate is the alarm a node
    raises when its identity changed during an unlock window: an anomaly,
    not a step in the plan.
+
+### Why the leaf's parent is left out
+
+A node is held in place by one of exactly two things: its own flag -- XNU
+refuses `unlink` and `rename` of a vnode carrying `IMMUTABLE` or `APPEND`
+-- or an append-only parent, since entries of such a directory cannot be
+removed or renamed. The leaf holds itself (`uchg`, or the anchor's system
+flag). The leaf's parent is held by the *grandparent's* `uappnd`. Every
+ancestor above that needs its own flag for its own entry, and that same
+flag pins the entry below it. So a placement seal on the leaf's parent
+added nothing at all to the leaf's protection.
+
+It did break the software that owns that directory. Claude Code takes an
+OAuth refresh lock with `mkdir ~/.claude/.oauth_refresh.lock` and releases
+it with `rmdir`; under `uappnd` the `rmdir` is refused, so the stale lock
+could never be cleared, token refresh failed, and the user was logged out
+at every expiry (observed 2026-09-15, the lock dir dated minutes after the
+seal). Every temp+rename save in that directory stranded its temp for the
+same reason.
+
+The rule applies to every leaf tier -- content file, content directory,
+symlink node, an explicit `--tier placement` directory -- and to one node
+it does not apply at all.
+
+**The anchor is exempt.** `~` and `~/.ssh` stay in the chain wherever they
+sit, including as a leaf's own parent, which every shell startup file
+(`~/.zshrc`, `~/.bashrc`, ...) makes them. An anchor never changes
+ownership and is never released, so it costs its owner nothing; and under
+this very rule its `sappnd` is what holds the leaf parents one level down
+-- `~/.claude`, `~/.config` -- in place. Skipping it would take the
+load-bearing node out of every chain below it. The release below therefore
+touches invoker-owned `placement` parents and nothing else.
+
+Two consequences follow:
+
+- **Shared ancestors still count.** A directory that is one leaf's parent
+  can be another leaf's grandparent-or-higher, and in *that* position its
+  `uappnd` is exactly what pins the entry below it. It stays `placement`
+  when the pool holds a still-locked record it is a proper ancestor of and
+  not the immediate parent of. The plan says why:
+  `kept: <dir> (placement; ancestor of <leaf>)`.
+- **A pre-rule seal is un-provisioned, not unlocked.** When `lock` finds
+  the leaf's parent recorded as placement and nothing keeps it, the plan
+  carries `release: <dir> (leaf parent, leaves the chain)` in root-most
+  order and the one gate covers it. The release clears the flag and
+  restores owner, group *and* mode from the record, then retires the
+  record with `via=leaf-parent`. That is deliberately unlike `unlock` of a
+  placement node, which keeps lock-account ownership and mode 770 because
+  the seal is coming back.
+
+Known cost, accepted: a non-root mount needs a user-owned mountpoint, so a
+user-owned leaf parent can be shadowed by a mount. `$HOME` -- anchor tier,
+never re-owned -- already can, so that whole class is closed by a
+mount-table check and not by this tier.
+
+#### The deployed pool, re-locked under the rule (2026-09-15)
+
+| Node | Tier before | After |
+|---|---|---|
+| `~` | anchor | anchor -- exempt, never released |
+| `~/.zshrc` and the other startup files | content | unchanged |
+| `~/.claude` | placement (unlocked) | **released** -- leaf parent of `~/.claude/settings.json`, nothing else's ancestor |
+| `~/.claude/settings.json` (symlink) | content | unchanged |
+| `~/.config` | placement | **kept** -- leaf parent of `~/.config/ghostty`, but a higher ancestor of `~/.config/agents/claude/settings/settings.json` |
+| `~/.config/agents`, `~/.config/agents/claude` | placement | unchanged -- neither is a leaf's parent |
+| `~/.config/agents/claude/settings` | placement | **released** |
+| `~/.config/ghostty` | content dir | unchanged |
+| `~/Library` | placement | **kept** -- leaf parent of `~/Library/LaunchAgents`, higher ancestor of `~/Library/Application Support/com.mitchellh.ghostty` |
+| `~/Library/Application Support` | placement | **released** |
+| `~/Library/LaunchAgents`, `~/Library/Application Support/com.mitchellh.ghostty` | content dir | unchanged |
+
+Order matters while migrating: a shared ancestor is only kept once the
+deeper leaf under it is on record, so re-lock the deepest leaves first.
 
 A **symlink argument names the link, not its target.** The parent is
 canonicalized and the link's own name is kept, so the link node itself is
@@ -164,6 +241,12 @@ sudo locked trash <dir>/<name>.tmp.*
 
 There is no automatic janitor, by design: a verb that deletes files it
 was never handed is not something `locked` does.
+
+The leaf-parent rule removes the common case: a sealed file's own
+directory is no longer sealed, so an atomic-save writer beside it renames
+normally and strands nothing. What remains is a directory sealed in its
+own right -- an explicit `--tier placement`, or one held as a higher
+ancestor -- with an atomic-save writer inside it.
 
 ### What the diff witness shows, and what it cannot
 

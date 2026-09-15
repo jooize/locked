@@ -14,19 +14,21 @@ Three tiers, named by what they protect:
 
 - `content` (`uchg`, lock-account-owned) -- leaf files, or leaf dirs
   recursively. Edit cycle: unlock, edit, lock.
-- `placement` (`uappnd`, lock-account-owned + group-write) -- shared parent
-  dirs (`~/.config`, `~/Library`, ...): new entries fine, replacing or
-  removing existing ones denied. Entries created under the seal take the
-  lock group, by BSD directory inheritance -- see [Group inheritance under
-  a placement seal](#group-inheritance-under-a-placement-seal).
+- `placement` (`uappnd`, lock-account-owned + group-write) -- ancestor dirs
+  *above* a locked leaf's own parent (`~/.config`, `~/Library`, ...): new
+  entries fine, replacing or removing existing ones denied. Entries created
+  under the seal take the lock group, by BSD directory inheritance -- see
+  [Group inheritance under a placement seal](#group-inheritance-under-a-placement-seal).
 - `anchor` (`sappnd` or `schg`, ownership unchanged) -- nodes the OS
   identity-checks against your UID (`~`, `~/.ssh`): the system flag binds
   every user process while sshd's owner checks keep passing.
 
 ## Workflow
 - `sudo locked lock <path>` -- adopt or relock. Derives and provisions the
-  whole ancestor chain (placement for user-owned parents, anchor for `~`),
-  stops only at a root-owned node. Nothing is touched until the whole
+  ancestor chain from the leaf's *grandparent* up (placement for user-owned
+  dirs, anchor for `~`), stops only at a root-owned node. The leaf's own
+  parent is not sealed unless it is the anchor -- see [The leaf's parent is
+  not in the chain](#the-leafs-parent-is-not-in-the-chain). Nothing is touched until the whole
   ceremony is derived: the snapshot diff, then the plan -- one line per
   node, root-most first -- then one question for all of it (`--yes` for
   scripted runs, `--dry-run` prints the plan and stops). Naming a symlink
@@ -232,12 +234,78 @@ Touch ID/password prompt names `/usr/local/sbin/locked unlock /nonexistent`; bin
 
 `sudo locked lock <path>` adopts any file or dir you own -- no manual
 chown. The first lock captures owner/group/mode as canonical, takes a
-baseline snapshot, and provisions the ancestor chain. It shows you the
-plan for the whole chain and asks once, before it has touched anything.
+baseline snapshot, and provisions the ancestor chain from the leaf's
+grandparent up -- the leaf's own parent is deliberately left alone unless
+it is the anchor, see below. It shows you the plan for the whole chain and
+asks once, before it has touched anything.
 
 A symlink is adopted as the link node itself: the link is what a process
 running as you could re-point, so that is what gets sealed. Its target is
 a separate node -- name it too if it should be sealed as well.
+
+## The leaf's parent is not in the chain
+
+`lock ~/.claude/settings.json` seals the file and walks the chain from `~`
+upward -- `~/.claude` itself is left exactly as it was: your ownership,
+your group, your mode, no flag.
+
+That is not a gap. A node is held in place by one of two things: its own
+flag, or an append-only parent. The file holds itself (`uchg`). `~/.claude`
+is held by `~`'s `sappnd`, which is what an anchor or placement seal on a
+directory does for every entry in it. A seal on `~/.claude` would have
+protected only the entries *inside* it that nothing else was protecting --
+and it broke the software that owns the directory. Claude Code takes its
+OAuth refresh lock with `mkdir ~/.claude/.oauth_refresh.lock` and releases
+it with `rmdir`; `uappnd` refuses the `rmdir`, so the stale lock could
+never be cleared and every token refresh failed. Temp+rename saves in the
+same directory stranded a temp file each time.
+
+**The anchor is exempt.** `~` and `~/.ssh` stay in the chain wherever they
+sit, including as a leaf's own parent -- which every shell startup file
+(`~/.zshrc`, `~/.bashrc`, ...) makes them. An anchor never changes
+ownership and is never released, so it costs you nothing, and its `sappnd`
+is exactly what holds `~/.claude` and `~/.config` in place under this very
+rule. Only invoker-owned `placement` parents are left out.
+
+Two things follow, both visible in the plan:
+
+- A directory that is one leaf's parent can be another leaf's
+  grandparent-or-higher. There it does real work, so it stays sealed, and
+  the plan says so: `kept: ~/.config/agents/claude (placement; ancestor of
+  ~/.config/agents/claude/settings/settings.json)`.
+- A directory sealed as placement before this rule is un-provisioned on
+  the next `lock` of a leaf under it. The plan carries
+  `release: ~/.claude (leaf parent, leaves the chain)`, and the one gate
+  covers it. The release goes all the way home -- flag off, owner, group
+  and mode back to what the record captured -- and retires the record with
+  `via=leaf-parent`. An `unlock` of a placement node does *not* do this: it
+  lifts the flag and keeps the lock-account identity, because there the
+  seal is coming back.
+
+The cost, stated: a non-root mount needs a user-owned mountpoint, so a
+user-owned leaf parent can be shadowed by a mount. `~` can already be, for
+the same reason -- the anchor tier never re-owns it -- so that class is a
+mount-table question, not a tier question.
+
+### What that does to a real pool
+
+One deployed pool, re-locked under the rule:
+
+| Node | Before | After |
+|---|---|---|
+| `~`, and the startup files in it | anchor, content | unchanged -- the anchor is exempt |
+| `~/.claude` | placement | **released** |
+| `~/.claude/settings.json` (a symlink) | content | unchanged |
+| `~/.config` | placement | **kept** (higher ancestor of `~/.config/agents/claude/settings/settings.json`) |
+| `~/.config/agents`, `~/.config/agents/claude` | placement | unchanged -- neither is a leaf's parent |
+| `~/.config/agents/claude/settings` | placement | **released** |
+| `~/.config/ghostty` | content dir | unchanged |
+| `~/Library` | placement | **kept** (higher ancestor of `~/Library/Application Support/com.mitchellh.ghostty`) |
+| `~/Library/Application Support` | placement | **released** |
+| `~/Library/LaunchAgents` | content dir | unchanged |
+
+Re-lock the deepest leaves first: a shared ancestor is only kept once the
+deeper leaf under it is on record.
 
 ## Snapshot layout
 ```
@@ -281,7 +349,7 @@ The `owner`/`group`/`mode` restore targets are captured on the first `lock` of a
 - An attacker that gets a single chmod through (somehow) is undone the next cycle.
 - To intentionally change the captured mode/owner, edit `.meta` directly: `sudo -u _jooize-lock vi /var/db/locked-snapshots/jooize/<encoded>.meta`. (Or delete the meta and re-lock to recapture.)
 
-**placement.** `unlock` clears `uappnd` and nothing else. The directory stays lock-account owned at mode 770 for the whole window, on purpose: the owner has to be the lock account because `uappnd` is a user flag its owner could clear, and the lock group's `rwx` is the one way you still reach into it. The recorded `owner`/`group`/`mode` are the pre-adoption identity, kept for a future un-provision, not a restore target for an unlock. `lock` re-applies the flag; a relock keeps the tier the record names and never asks for a tier change (there is no un-provision verb yet).
+**placement.** `unlock` clears `uappnd` and nothing else. The directory stays lock-account owned at mode 770 for the whole window, on purpose: the owner has to be the lock account because `uappnd` is a user flag its owner could clear, and the lock group's `rwx` is the one way you still reach into it. The recorded `owner`/`group`/`mode` are the pre-adoption identity, not a restore target for an unlock. `lock` re-applies the flag; a relock keeps the tier the record names and never asks for a tier change (there is no un-provision verb). The one place that identity *is* restored is the leaf-parent release above: that node is leaving the pool, so it goes all the way back.
 
 **anchor.** Ownership never changes, in either direction -- that is the tier's whole point. Only the system flag goes on and off.
 
@@ -290,6 +358,8 @@ The `owner`/`group`/`mode` restore targets are captured on the first `lock` of a
 Every entry created inside a placement-sealed directory carries the lock group, and so do their children. That is not `locked` doing anything: on macOS, as on every BSD, a new file or directory takes its group from the directory it is created in. (Linux does this only when the parent carries setgid.) A placement seal sets the directory to `_<user>-lock:_<user>-lock` mode 770, so everything born under it since is group `_<user>-lock`.
 
 Observed on one Mac's `~/Library/Application Support`: the 88 entries born before the seal are group `staff`, every entry born after it is group `_jooize-lock`, subdirectories included.
+
+A locked file's own parent directory is not sealed and so does not take the group: only ancestors from the grandparent up do, which is where new entries are usually created anyway.
 
 **Why the lock group and not `staff`.** The owner must become the lock account, because `uappnd` is a *user* flag and its owner can clear it -- leaving the directory yours would hand any process running as you the ability to unseal it. That leaves you outside a directory owned by someone else, so mode 700 would lock you out of your own `~/Library`. Group `rwx` for a group you are a member of is the door back in. `staff` with 770 would be the wrong group for that door: every local user is in `staff`.
 
