@@ -335,7 +335,8 @@ modes, so an older 700 deployment converges on its own.
   or `unlock`), `recursive`, `state` (`locked`/`unlocked`/`retired`/
   `suspended`). `verify` compares reality against this. Retired and
   suspended records carry provenance -- `via` (`rm`, `trash-finalized`,
-  or `assertion` for a human tombstone), `by`, `at`, and for a suspension
+  `assertion` for a human tombstone, or `leaf-parent` for a placement
+  node the chain rule released), `by`, `at`, and for a suspension
   `bin`, the trash destination: `verify` flags the original path
   reappearing (a Put Back of a formerly sealed node) and finalizes the
   suspension to a retirement once the bin entry is gone.
