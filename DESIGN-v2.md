@@ -20,7 +20,7 @@ node the user does not own binds every user-UID process.
 | Tier | Flag | Ownership | For | Effect |
 |---|---|---|---|---|
 | `content` | `uchg` | `_<user>-lock` | leaf files; leaf dirs (recursive) | total freeze: content, rename, delete. Edit = unlock, edit, lock. |
-| `placement` | `uappnd` | `_<user>-lock` + group-write; children inherit the lock group | ancestor dirs *above* a leaf's own parent (`~/.config`, `~/Library`, ...), derived from the leaves and never named | new entries allowed; rename/delete/replace of existing entries denied; dir itself immovable. Unlock only for uninstall/replace ceremonies. |
+| `placement` | `uappnd` | `_<user>-lock`; group and mode unchanged; one add-only ACL entry for the user | ancestor dirs *above* a leaf's own parent (`~/.config`, `~/Library`, ...), derived from the leaves and never named | new entries allowed; rename/delete/replace of existing entries denied; dir itself immovable. Unlock only for uninstall/replace ceremonies. |
 | `anchor` | `sappnd` (default) or `schg` | **unchanged** (stays the user) | nodes the OS identity-checks against the user's UID: `~`, `~/.ssh` and its files | system flags are root-only to set AND clear, so the flag binds all user processes while the user stays owner -- sshd StrictModes and every owner==user check keep passing. |
 
 Probed facts the tiers rest on:
@@ -39,6 +39,17 @@ Probed facts the tiers rest on:
 - ACLs were evaluated and rejected for the anchor problem: the owner can
   always rewrite their own node's ACL, so self-deny entries are advisory.
   Flags are primary.
+- On a node the user does NOT own, an ACL entry is binding: only the owner
+  or root may change an ACL. A placement dir's add-only entry (probed
+  2026-09-15, 41/0): adds work, new entries take the dir's group and no
+  ACL, grandchildren too; rename/delete/replace stay denied under the flag,
+  and a delete entry the user puts on their own file does not beat it; the
+  user cannot strip the entry, add delete_child, clear the flag or chmod.
+  With the flag off the entry alone still refuses a rename (no
+  delete_child), though a delete entry on the user's own file then does
+  delete it -- the flag stays the guard. `test -w` says yes.
+  `chmod +a` merges a new allow entry into an existing one for the same
+  principal, and `-a` removes rights from it (fails when none match).
 - `st_dev` is not a volume key: APFS assigns it at mount, in mount order.
   It changed across a reboot on 2026-09-09, and `/` and `~` share one this
   boot (firmlinks) while their volume UUIDs differ. Identity is volume UUID
@@ -46,16 +57,26 @@ Probed facts the tiers rest on:
   containing volume for any path or descriptor, and devfs answers with
   nothing, which is why the `st_dev` spelling survives as a fallback.
 
-## Group inheritance
+## Placement access: an ACL entry, not a group
 
-A new entry takes its parent directory's group on macOS, as on every BSD,
-so everything created under a placement seal carries the lock group. That
-is expected, not drift: the owner has to be the lock account (`uappnd` is
-a user flag its owner can clear), which leaves group `rwx` as the user's
-only way in. The mechanism, the rejected ACL alternative, and the access
-consequences are written out in the README section of the same name. On
-Linux the equivalent would need setgid on the directory or an explicit
-`chgrp`; `locked` is Darwin-only and does not handle it.
+The owner has to be the lock account (`uappnd` is a user flag its owner can
+clear), which leaves the user outside the directory. The way back in is one
+ACL entry naming the user: the rights the owner bits gave them, minus
+delete, delete_child and every write over the directory's own metadata, no
+inherit flags. Group and mode are left alone, and so are ACL entries already
+there (`~/Library` carries Apple's `group:everyone deny delete`). The record
+keeps the entry; verify checks it and the group; a release takes off that
+entry only. A candidate that already has an entry naming the user is
+refused, since `chmod +a` would merge the two.
+
+Before 0.14.0 the way in was group `rwx` for the lock group. A new entry
+takes its parent directory's group on macOS, as on every BSD, so everything
+created under a seal took the lock group, and everything under that; a
+sweep reset the strays and they came back. The README section "How you get
+into a placement directory" has the user-facing account. The 0.13.0 ->
+0.14.0 cut converted the live placement directories once, with a script
+kept outside the tool; a placement record without the entry is drift, and
+no lock plan reseals it.
 
 ## Chain-walking
 
@@ -139,11 +160,12 @@ record outside that union protects nothing.
 So every gated verb plans releases alongside its own work: `lock`, the new
 `unprotect`, `rm` (in its existing question, applied once the removal has
 happened), and the lock plan `mv` runs for each leaf it moved. A release
-clears the flag and restores owner, group *and* mode from the record, then
-retires the record with `via=unneeded`. That is deliberately unlike
-`unlock` of a placement node, which keeps lock-account ownership and mode
-770 because the seal is coming back. An anchor chain node loses only its
-flag. Each release row carries its reason:
+clears the flag, takes off the seal's ACL entry, and restores owner, group
+*and* mode from the record, then retires the record with `via=unneeded`.
+That is deliberately unlike `unlock` of a placement node, which keeps
+lock-account ownership and the entry because the seal is coming back.
+An anchor chain node loses only its flag. Each release row carries its
+reason:
 
 - `not needed: <dir above> keeps it in place` when the directory still
   holds a protected file -- without it, the row reads as if that file
@@ -270,8 +292,11 @@ is one command, and it takes a glob because `rm`, `trash`, `lock` and
 `unlock` all accept many paths in one batch:
 
 ```sh
-sudo locked trash <dir>/<name>.tmp.*
+sudo locked rm <dir>/<name>.tmp.*
 ```
+
+(`trash` is refused here: the trash service moves an entry as you, and a
+placement directory's ACL entry does not let you remove one.)
 
 There is no automatic janitor, by design: a verb that deletes files it
 was never handed is not something `locked` does.

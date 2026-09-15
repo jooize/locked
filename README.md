@@ -14,12 +14,13 @@ Three tiers, named by what they protect:
 
 - `content` (`uchg`, lock-account-owned) -- leaf files, or leaf dirs
   recursively. Edit cycle: unlock, edit, lock.
-- `placement` (`uappnd`, lock-account-owned + group-write) -- ancestor dirs
-  *above* a locked leaf's own parent (`~/.config`, `~/Library`, ...),
-  derived from the files you protect and never named: new entries fine,
-  replacing or removing existing ones denied. Entries created
-  under the seal take the lock group, by BSD directory inheritance -- see
-  [Group inheritance under a placement seal](#group-inheritance-under-a-placement-seal).
+- `placement` (`uappnd`, lock-account-owned, group and mode unchanged,
+  one ACL entry that lets you add) -- ancestor dirs *above* a locked
+  leaf's own parent (`~/.config`, `~/Library`, ...), derived from the
+  files you protect and never named: new entries fine, replacing or
+  removing existing ones denied. What you create there is ordinary: your
+  group, no ACL -- see
+  [How you get into a placement directory](#how-you-get-into-a-placement-directory).
 - `anchor` (`sappnd` or `schg`, ownership unchanged) -- nodes the OS
   identity-checks against your UID (`~`, `~/.ssh`): the system flag binds
   every user process while sshd's owner checks keep passing.
@@ -151,7 +152,7 @@ sudo ./locked setup
 ```
 Idempotent. Provisions everything in section "Prerequisites" below in one go:
 - Creates `_<user>-lock` group and user (prefers UID/GID 401 in the 400-499 service lane, falling back to the next free; `IsHidden 1`; shell `/usr/bin/false`). 401 is the lock slot; 402 is reserved for the Claude trust group `_<user>-readonly`.
-- Adds you to the lock group.
+- Adds you to the lock group, which is what lets `locked status` read your pool without sudo.
 - Writes `/etc/sudoers.d/locked` with the matching sudoers entry; validates via `visudo -c` before installing.
 - Self-installs the script to `/usr/local/sbin/locked` (root:wheel, mode 755), refusing if any ancestor up to `/` is user-writable.
 - Installs and loads the verify LaunchDaemon (`/Library/LaunchDaemons/locked.verify.plist`, every 900 s).
@@ -356,31 +357,29 @@ The `owner`/`group`/`mode` restore targets are captured on the first `lock` of a
 - An attacker that gets a single chmod through (somehow) is undone the next cycle.
 - To intentionally change the captured mode/owner, edit `.meta` directly: `sudo -u _jooize-lock vi /var/db/locked-snapshots/jooize/<encoded>.meta`. (Or `unprotect` it and `lock` it again: a fresh seal recaptures them.)
 
-**placement.** `unlock` clears `uappnd` and nothing else. The directory stays lock-account owned at mode 770 for the whole window, on purpose: the owner has to be the lock account because `uappnd` is a user flag its owner could clear, and the lock group's `rwx` is the one way you still reach into it. The recorded `owner`/`group`/`mode` are the pre-adoption identity, not a restore target for an unlock. The next `lock` of a file whose chain runs through it re-applies the flag. The one place that identity *is* restored is a release: once no protected file needs the directory it leaves the pool, so it goes all the way back.
+**placement.** `unlock` clears `uappnd` and nothing else. The directory stays lock-account owned, with its ACL entry, for the whole window, on purpose: the owner has to be the lock account because `uappnd` is a user flag its owner could clear, and the entry is the one way you still reach into it. The entry only adds, so even with the flag off you cannot rename or remove what is in the directory -- `locked rm` and `locked mv` do that, as root. The recorded `owner`/`group`/`mode` are the pre-adoption identity, not a restore target for an unlock. The next `lock` of a file whose chain runs through it re-applies the flag, and refuses if the entry is gone. The one place that identity *is* restored is a release: once no protected file needs the directory it leaves the pool, so it goes all the way back -- flag off, the seal's entry off, owner, group and mode as they were.
 
 **anchor.** Ownership never changes, in either direction -- that is the tier's whole point. Only the system flag goes on and off.
 
-## Group inheritance under a placement seal
+## How you get into a placement directory
 
-Every entry created inside a placement-sealed directory carries the lock group, and so do their children. That is not `locked` doing anything: on macOS, as on every BSD, a new file or directory takes its group from the directory it is created in. (Linux does this only when the parent carries setgid.) A placement seal sets the directory to `_<user>-lock:_<user>-lock` mode 770, so everything born under it since is group `_<user>-lock`.
+A placement seal gives the directory to the lock account, because `uappnd` is a *user* flag and its owner can clear it -- leaving the directory yours would hand any process running as you the ability to unseal it. That leaves you outside a directory someone else owns, so the seal adds one ACL entry that lets you back in:
 
-Observed on one Mac's `~/Library/Application Support`: the 88 entries born before the seal are group `staff`, every entry born after it is group `_jooize-lock`, subdirectories included.
-
-A locked file's own parent directory is not sealed and so does not take the group: only ancestors from the grandparent up do, which is where new entries are usually created anyway.
-
-**Why the lock group and not `staff`.** The owner must become the lock account, because `uappnd` is a *user* flag and its owner can clear it -- leaving the directory yours would hand any process running as you the ability to unseal it. That leaves you outside a directory owned by someone else, so mode 700 would lock you out of your own `~/Library`. Group `rwx` for a group you are a member of is the door back in. `staff` with 770 would be the wrong group for that door: every local user is in `staff`.
-
-**What it costs you.** Nothing, in practice. Under the usual umask 022 the group bits of a new entry are what other would have got anyway, and the lock account is not a login (`/usr/bin/false`, no home). A tool that creates group-writable entries (umask 002) would let the lock account write them, which only root can make use of.
-
-**The alternative, and why it is not taken.** Owner `_<user>-lock`, group `staff`, mode 700, plus a non-inherited ACL entry for you:
-
-```sh
-chmod +a "jooize allow list,search,add_file,add_subdirectory,readattr,readextattr,readsecurity" <dir>
+```
+user:jooize allow list,add_file,search,add_subdirectory,readattr,readextattr,readsecurity
 ```
 
-Children then keep `staff`. The costs are worse than the benefit: `verify` would have to diff ACLs rather than compare one mode word, `ls -l` shows a `+` on the directory forever, and backup and sync tools disagree about what to do with ACLs. The group inheritance is documented instead of engineered around.
+The rights are what the directory's owner bits gave you before the seal, minus anything that removes or renames an entry (`delete`, `delete_child`) or changes the directory itself (`writeattr`, `writeextattr`, `writesecurity`, `chown`). Only the owner or root can change an ACL, so you cannot strip or widen the entry, and it carries no inherit flags. The directory's group and mode stay what they were, and so do any ACL entries it already had: `~/Library` ships with Apple's `group:everyone deny delete`. The record keeps the entry, `verify` checks that it is there exactly, and a release takes off that entry and no other. `ls -le <dir>` shows it.
 
-On Linux the same design would need setgid on the directory, or an explicit `chgrp`, for the inheritance to happen at all. `locked` is Darwin-only and does not handle that case.
+**What you create there is ordinary.** On macOS, as on every BSD, a new file or directory takes its group from the directory it is created in, and the directory's group is still yours (usually `staff`). Nothing inherits the entry.
+
+**Why not a group.** Before 0.14.0 the way in was the lock group: the directory went to `_<user>-lock:_<user>-lock` with group `rwx`. By that same inheritance, everything created under a seal took the lock group, and so did everything created under that. On one Mac's `~/Library/Application Support`, the 88 entries from before the seal were `staff` and every entry after it `_jooize-lock`. A sweep reset them, and they came back. The ACL entry ends that by construction. What it costs: `ls -l` shows a `+` on the directory, and a tool that copies the directory together with its ACL copies the entry too.
+
+**Two things that follow.** `locked trash` of an entry directly inside a placement directory is refused, because the trash service moves the entry as you and the entry does not let you remove anything; `locked rm` works, and so does `locked mv` to somewhere you can trash from. And `test -w` on the directory still says yes, so apps that check before writing see no difference.
+
+A directory that already carries an ACL entry naming you is refused as a placement candidate: `chmod +a` would merge the seal's entry into yours, and no release could then tell them apart. Remove or reshape your entry first.
+
+`locked` is Darwin-only; the ACL syntax above is macOS's.
 
 ## Caveats
 
