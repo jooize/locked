@@ -20,7 +20,7 @@ node the user does not own binds every user-UID process.
 | Tier | Flag | Ownership | For | Effect |
 |---|---|---|---|---|
 | `content` | `uchg` | `_<user>-lock` | leaf files; leaf dirs (recursive) | total freeze: content, rename, delete. Edit = unlock, edit, lock. |
-| `placement` | `uappnd` | `_<user>-lock` + group-write; children inherit the lock group | ancestor dirs *above* a leaf's own parent (`~/.config`, `~/Library`, ...) | new entries allowed; rename/delete/replace of existing entries denied; dir itself immovable. Unlock only for uninstall/replace ceremonies. |
+| `placement` | `uappnd` | `_<user>-lock` + group-write; children inherit the lock group | ancestor dirs *above* a leaf's own parent (`~/.config`, `~/Library`, ...), derived from the leaves and never named | new entries allowed; rename/delete/replace of existing entries denied; dir itself immovable. Unlock only for uninstall/replace ceremonies. |
 | `anchor` | `sappnd` (default) or `schg` | **unchanged** (stays the user) | nodes the OS identity-checks against the user's UID: `~`, `~/.ssh` and its files | system flags are root-only to set AND clear, so the flag binds all user processes while the user stays owner -- sshd StrictModes and every owner==user check keep passing. |
 
 Probed facts the tiers rest on:
@@ -59,10 +59,12 @@ Linux the equivalent would need setgid on the directory or an explicit
 
 ## Chain-walking
 
-`locked lock <leaf>` derives and provisions the **entire chain** in one
-ceremony:
+You name what to protect; `locked lock <leaf>` derives and provisions the
+**entire chain** for it in one ceremony:
 
-1. The leaf gets its requested tier (default: `content`).
+1. The leaf's tier follows its path: `anchor` for `~` itself and anything
+   under `~/.ssh` (the OS identity-checks those, so their owner must never
+   change), `content` for everything else. There is no tier option.
 2. **The leaf's own parent is not provisioned; the chain begins at the
    grandparent.** The anchor is the exception and stays in the chain
    wherever it sits, `$HOME` as a leaf's own parent included.
@@ -76,13 +78,20 @@ ceremony:
 5. **Nothing is touched until the whole ceremony is derived.** Every
    refusal is raised in that pass; then the diff witness, then the plan --
    one line per node, root-most first, the ones that need nothing shown as
-   `already locked` -- and then one `[y/N]` for the lot. Declining changes
-   nothing at all. `--yes` answers that gate, `--dry-run` prints the plan
-   and stops before it. Each seal used to ask for itself, which meant
-   declining an ancestor left the leaf sealed under a parent nobody had
-   protected. The only question left after the gate is the alarm a node
-   raises when its identity changed during an unlock window: an anomaly,
-   not a step in the plan.
+   `already locked`, and any directory the pool no longer needs as a
+   `release` row with its reason -- and then one `[y/N]` for the lot. The
+   question names what it covers (`Seal <leaf> as listed (2 seals, 1
+   release)?`, or `Apply the plan for <leaf> (1 release)?` when the leaf's
+   chain is already whole). Declining changes nothing at all. `--yes`
+   answers that gate, `--dry-run` prints the plan and stops before it. Each
+   seal used to ask for itself, which meant declining an ancestor left the
+   leaf sealed under a parent nobody had protected. The only question left
+   after the gate is the alarm a node raises when its identity changed
+   during an unlock window: an anomaly, not a step in the plan.
+
+A chain directory is never named. `lock` refuses a path whose record is a
+placement chain node: protecting it as content would freeze everything
+inside it, which is a different seal altogether.
 
 ### Why the leaf's parent is left out
 
@@ -93,7 +102,9 @@ removed or renamed. The leaf holds itself (`uchg`, or the anchor's system
 flag). The leaf's parent is held by the *grandparent's* `uappnd`. Every
 ancestor above that needs its own flag for its own entry, and that same
 flag pins the entry below it. So a placement seal on the leaf's parent
-added nothing at all to the leaf's protection.
+added nothing at all to the leaf's protection. For the same reason the
+chain it leaves is the smallest one that holds the path: drop any node
+from the grandparent up and that level can be renamed away.
 
 It did break the software that owns that directory. Claude Code takes an
 OAuth refresh lock with `mkdir ~/.claude/.oauth_refresh.lock` and releases
@@ -103,65 +114,88 @@ at every expiry (observed 2026-09-15, the lock dir dated minutes after the
 seal). Every temp+rename save in that directory stranded its temp for the
 same reason.
 
-The rule applies to every leaf tier -- content file, content directory,
-symlink node, an explicit `--tier placement` directory -- and to one node
-it does not apply at all.
-
 **The anchor is exempt.** `~` and `~/.ssh` stay in the chain wherever they
 sit, including as a leaf's own parent, which every shell startup file
 (`~/.zshrc`, `~/.bashrc`, ...) makes them. An anchor never changes
-ownership and is never released, so it costs its owner nothing; and under
-this very rule its `sappnd` is what holds the leaf parents one level down
--- `~/.claude`, `~/.config` -- in place. Skipping it would take the
-load-bearing node out of every chain below it. The release below therefore
-touches invoker-owned `placement` parents and nothing else.
-
-Two consequences follow:
-
-- **Shared ancestors still count.** A directory that is one leaf's parent
-  can be another leaf's grandparent-or-higher, and in *that* position its
-  `uappnd` is exactly what pins the entry below it. It stays `placement`
-  when the pool holds a still-locked record it is a proper ancestor of and
-  not the immediate parent of. The plan says why:
-  `kept: <dir> (placement; ancestor of <leaf>)`.
-- **A pre-rule seal is un-provisioned, not unlocked.** When `lock` finds
-  the leaf's parent recorded as placement and nothing keeps it, the plan
-  carries `release: <dir> (leaf parent, leaves the chain)` in root-most
-  order and the one gate covers it. The release clears the flag and
-  restores owner, group *and* mode from the record, then retires the
-  record with `via=leaf-parent`. That is deliberately unlike `unlock` of a
-  placement node, which keeps lock-account ownership and mode 770 because
-  the seal is coming back.
+ownership, so it costs its owner nothing; and under this very rule its
+`sappnd` is what holds the leaf parents one level down -- `~/.claude`,
+`~/.config` -- in place. Skipping it would take the load-bearing node out
+of every chain below it.
 
 Known cost, accepted: a non-root mount needs a user-owned mountpoint, so a
 user-owned leaf parent can be shadowed by a mount. `$HOME` -- anchor tier,
 never re-owned -- already can, so that whole class is closed by a
 mount-table check and not by this tier.
 
-#### The deployed pool, re-locked under the rule (2026-09-15)
+## The pool is what you asked to protect
 
-| Node | Tier before | After |
+Every record carries a `role`. A **leaf** is a node you named with `lock`:
+that is the intent. A **chain** node is a directory sealed only because
+some leaf needs it. The chain nodes a pool needs are exactly the union of
+the chains of its live leaves (locked, unlocked, or suspended in the trash,
+since Put Back can return them to the path their chain pins), and a chain
+record outside that union protects nothing.
+
+So every gated verb plans releases alongside its own work: `lock`, the new
+`unprotect`, `rm` (in its existing question, applied once the removal has
+happened), and the lock plan `mv` runs for each leaf it moved. A release
+clears the flag and restores owner, group *and* mode from the record, then
+retires the record with `via=unneeded`. That is deliberately unlike
+`unlock` of a placement node, which keeps lock-account ownership and mode
+770 because the seal is coming back. An anchor chain node loses only its
+flag. Each release row carries its reason:
+
+- `not needed: <dir above> keeps it in place` when the directory still
+  holds a protected file -- without it, the row reads as if that file
+  needed it;
+- `no protected file needs it` otherwise.
+
+Seals stay with the verb's own leaves. A pool-wide re-seal would close the
+window an `unlock --chain` deliberately left open for another leaf.
+
+**Fails closed.** A release is never planned on incomplete knowledge: a
+live record with no role, or a live leaf whose chain cannot be derived
+(its parent is gone, say), empties the plan and a note says which one.
+
+`unprotect <leaf>` is the permanent counterpart of `lock`. `unlock` is the
+edit window and keeps the record, the snapshot and the chain; `unprotect`
+ends the protection -- flag off, the pre-lock identity back, the record
+retired with `via=unprotect` -- and releases the chain nodes nothing else
+needs, under one question (`Stop protecting <leaf> and release 2
+directories?`). Protecting that path again later is a first seal: a retired
+record is history, so the identity comes from the live node and the
+snapshot is taken fresh.
+
+`trash`, `tombstone` and `rekey` plan no releases. A trashed leaf still
+counts until verify finalizes it, and the other two are record repairs.
+The directories they leave unneeded are released by the next gated plan;
+until then the pool listing names them.
+
+The 0.12.0 -> 0.13.0 cut added the field; the live pool was converted once
+by hand (content -> leaf, placement -> chain, anchor directory -> chain,
+anchor file -> leaf). verify reports a live record without a role as drift.
+
+#### The deployed pool under the rule (2026-09-15)
+
+| Node | Role | Why |
 |---|---|---|
-| `~` | anchor | anchor -- exempt, never released |
-| `~/.zshrc` and the other startup files | content | unchanged |
-| `~/.claude` | placement (unlocked) | **released** -- leaf parent of `~/.claude/settings.json`, nothing else's ancestor |
-| `~/.claude/settings.json` (symlink) | content | unchanged |
-| `~/.config` | placement | **kept** -- leaf parent of `~/.config/ghostty`, but a higher ancestor of `~/.config/agents/claude/settings/settings.json` |
-| `~/.config/agents`, `~/.config/agents/claude` | placement | unchanged -- neither is a leaf's parent |
-| `~/.config/agents/claude/settings` | placement | **released** |
-| `~/.config/ghostty` | content dir | unchanged |
-| `~/Library` | placement | **kept** -- leaf parent of `~/Library/LaunchAgents`, higher ancestor of `~/Library/Application Support/com.mitchellh.ghostty` |
-| `~/Library/Application Support` | placement | **released** |
-| `~/Library/LaunchAgents`, `~/Library/Application Support/com.mitchellh.ghostty` | content dir | unchanged |
-
-Order matters while migrating: a shared ancestor is only kept once the
-deeper leaf under it is on record, so re-lock the deepest leaves first.
+| `~` | chain (anchor) | in every chain below it |
+| `~/.zshrc` and the other startup files | leaf | named |
+| `~/.claude` | none | leaf parent of `~/.claude/settings.json`, nothing else's ancestor |
+| `~/.claude/settings.json` (symlink) | leaf | named |
+| `~/.config` | chain | grandparent chain of `~/.config/agents/claude/settings/settings.json` |
+| `~/.config/agents`, `~/.config/agents/claude` | chain | same chain |
+| `~/.config/agents/claude/settings` | none | leaf parent only |
+| `~/.config/ghostty` | leaf | named |
+| `~/Library` | chain | grandparent of `~/Library/Application Support/com.mitchellh.ghostty` |
+| `~/Library/Application Support` | none | leaf parent only |
+| `~/Library/LaunchAgents`, `~/Library/Application Support/com.mitchellh.ghostty` | leaf | named |
 
 A **symlink argument names the link, not its target.** The parent is
 canonicalized and the link's own name is kept, so the link node itself is
 what gets sealed -- content tier, the only tier that applies to a link,
-since placement needs entries to place and every OS identity check
-resolves the path and judges the target. The link node is precisely what a
+since every OS identity check resolves the path and judges the target (a
+link under `~/.ssh` is therefore refused). The link node is precisely what a
 same-UID process can re-point, which is what sealing the target left open.
 The target keeps its own ownership and takes its own record if you name it
 too. A dangling link is sealed the same way: its target may arrive later,
@@ -244,9 +278,9 @@ was never handed is not something `locked` does.
 
 The leaf-parent rule removes the common case: a sealed file's own
 directory is no longer sealed, so an atomic-save writer beside it renames
-normally and strands nothing. What remains is a directory sealed in its
-own right -- an explicit `--tier placement`, or one held as a higher
-ancestor -- with an atomic-save writer inside it.
+normally and strands nothing. What remains is a chain directory -- one
+that is a higher ancestor of some protected file -- with an atomic-save
+writer of its own inside it.
 
 ### What the diff witness shows, and what it cannot
 
