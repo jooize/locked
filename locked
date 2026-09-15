@@ -1219,16 +1219,71 @@ verify_node() {
 
 # ---- chain derivation ------------------------------------------------------
 
+# ~ and ~/.ssh are identity-checked by the OS against the user's UID (sshd
+# StrictModes, ssh client config-ownership checks), so they must never leave
+# the user's ownership: anchor tier, not placement.
+tier_for_ancestor() {
+  if [ "$1" = "$user_home" ] || [ "$1" = "$user_home/.ssh" ]; then
+    echo anchor
+  else
+    echo placement
+  fi
+}
+
+# chain_skips_parent <leaf>: true when the leaf's own parent is left out of
+# the chain. Every walk asks this one question, so the derivation, the
+# unlock --chain release and the status print cannot drift apart.
+#
+# A node is held in place by one of exactly two things: its own flag -- XNU
+# refuses unlink and rename of a vnode carrying IMMUTABLE or APPEND -- or an
+# append-only parent, since entries of such a directory cannot be removed or
+# renamed. The leaf holds itself (uchg, or the anchor's system flag); the
+# leaf's parent is held by the grandparent's uappnd; every ancestor above
+# that needs its own flag for its own entry, and that same flag pins the
+# entry below it. So a placement seal on the leaf's parent added nothing at
+# all to the leaf's protection -- and it broke the software that owns that
+# directory. Claude Code takes its OAuth refresh lock with
+# `mkdir ~/.claude/.oauth_refresh.lock` and releases it with `rmdir`, which
+# uappnd refuses: the stale lock could never be cleared, token refresh
+# failed, and the user was logged out at every expiry (observed 2026-09-15,
+# the lock dir dated minutes after the seal). Every temp+rename save in that
+# directory stranded its temp for the same reason.
+#
+# The ANCHOR is the exception, and stays in the chain wherever it sits. It
+# never changes ownership and is never released, so it costs its owner
+# nothing; and under this very rule its sappnd is what holds the leaf
+# parents one level down -- ~/.claude, ~/.config -- in place. Skipping it
+# because a leaf happens to sit directly in ~ (every shell startup file
+# does) would take the load-bearing node out of every chain below it.
+#
+# Known cost, accepted: a non-root mount needs a user-owned mountpoint, so
+# a user-owned leaf parent can be shadowed by a mount. $HOME -- anchor
+# tier, never re-owned -- already can, so that whole class is closed by a
+# mount-table check and not by this tier.
+chain_skips_parent() { # <leaf>
+  [ "$(tier_for_ancestor "$(dirname "$1")")" != "anchor" ]
+}
+
 # chain_for <leaf>: prints user-owned/lock-owned ancestors nearest-first,
-# then validates the stop node (first foreign-owned ancestor) is root-owned.
-# Fails closed if it is not.
+# the leaf's own parent omitted per chain_skips_parent, then validates the
+# stop node (first foreign-owned ancestor) is root-owned. Fails closed if it
+# is not.
+#
+# The walk still STARTS at the parent even when that node is not printed:
+# the stop-node check has to see the first foreign-owned ancestor wherever
+# it sits, and on a leaf directly under /Users that is the parent itself.
 chain_for() {
-  local p owner
+  local p owner skip=0
   p="$(dirname "$1")"
+  if chain_skips_parent "$1"; then skip=1; fi
   while :; do
     owner="$(stat -f '%Su' "$p")"
     if [ "$owner" = "$inv" ] || [ "$owner" = "$lock_user" ]; then
-      printf '%s\n' "$p"
+      if [ "$skip" -eq 1 ]; then
+        skip=0
+      else
+        printf '%s\n' "$p"
+      fi
       [ "$p" = "/" ] && break
       p="$(dirname "$p")"
     else
@@ -1241,15 +1296,35 @@ chain_for() {
   done
 }
 
-# ~ and ~/.ssh are identity-checked by the OS against the user's UID (sshd
-# StrictModes, ssh client config-ownership checks), so they must never leave
-# the user's ownership: anchor tier, not placement.
-tier_for_ancestor() {
-  if [ "$1" = "$user_home" ] || [ "$1" = "$user_home/.ssh" ]; then
-    echo anchor
-  else
-    echo placement
-  fi
+# shared_ancestor_of <dir>: the first sealed node in the invoker's pool
+# that still needs <dir> as placement, printed; 1 when there is none.
+#
+# The leaf-parent rule takes a node out of the chain of the leaf directly
+# under it, but the same node can sit HIGHER above another sealed leaf --
+# ~/.config/agents/claude is the parent of ~/.config/agents/claude/CLAUDE.md
+# and the grandparent of ~/.config/agents/claude/settings/settings.json --
+# and in that position its uappnd is exactly what pins the entry below it.
+# So the test is the chain rule read backwards: <dir> is a PROPER ancestor
+# of some still-locked record, and not that record's immediate parent.
+#
+# Reads the pool directly rather than through pool_records_under: the
+# question is about one directory's ancestry, not about a subtree, and the
+# state field decides it. The case patterns quote $d, so a directory whose
+# name holds glob characters is matched literally.
+shared_ancestor_of() { # <dir>
+  local d="${1%/}" meta q
+  for meta in "$USER_SNAPSHOTS"/*.meta; do
+    [ "$(meta_field "$meta" state)" = "locked" ] || continue
+    q="$(decode "$(basename "$meta" .meta)")"
+    case "$q" in
+      "$d"/*) ;;
+      *) continue ;;
+    esac
+    [ "$(dirname "$q")" = "$d" ] && continue
+    printf '%s' "$q"
+    return 0
+  done
+  return 1
 }
 
 # ---- diff witness ----------------------------------------------------------
@@ -1946,6 +2021,39 @@ release_node() {
   log_action unlock "$f" ok
 }
 
+# release_leaf_parent <dir>: un-provision a placement node that the
+# leaf-parent rule has taken out of the chain. This is NOT an unlock: an
+# unlock keeps lock-account ownership and mode 770 because the seal is
+# coming back, and here it is not, so the node goes all the way home --
+# flag off, then owner, group and mode restored from the pre-adoption
+# identity the record captured. The record retires with the rule named as
+# its via, so the audit trail says which decision released it.
+#
+# A record left state=unlocked is the same migration: unlock cleared the
+# flag but deliberately kept the lock account and 770, so the identity
+# restore below is exactly what that node is still owed.
+release_leaf_parent() { # <dir>
+  local d="$1" owner group mode flag state
+  snap_paths "$d"
+  [ -f "$META" ] || return 0
+  owner="$(meta_field "$META" owner)"
+  group="$(meta_field "$META" group)"
+  mode="$(meta_field "$META" mode)"
+  flag="$(meta_field "$META" flag)"
+  state="$(meta_field "$META" state)"
+  if [ "$OPT_DRY" -eq 0 ]; then
+    # Flag first: it blocks chown and chmod. An unlocked record has none.
+    if [ "$state" = "locked" ]; then
+      fclear "$flag" "$d" || return 1
+    fi
+    run chown "${owner}:${group}" "$d" || return 1
+    run chmod "$mode" "$d" || return 1
+  fi
+  retire_record "$d" leaf-parent || return 1
+  echo "${C_GRN}✓${C_OFF} released: $d (leaf parent, no longer in the chain)"
+  log_action lock "$d" release-leaf-parent
+}
+
 # ---- mediated window -------------------------------------------------------
 
 # Absolute path with the PARENT canonicalized and the leaf name left as
@@ -2634,6 +2742,30 @@ do_lock_one() {
   local chain
   chain="$(chain_for "$f")" || return 1
 
+  # A leaf parent left out of the chain (the rule is argued at
+  # chain_skips_parent) may still hold a record. It is either a seal from
+  # before that rule, which this run un-provisions, or a node that earns
+  # its placement seal from HIGHER up -- some other sealed leaf sits more
+  # than one level below it, and its uappnd is what pins that leaf's
+  # parent. Both outcomes belong in the plan: one is a change the gate has
+  # to cover, the other is the reason a node a reader expects to leave is
+  # staying. An anchor parent is in the chain and takes neither.
+  local leaf_parent parent_action="" parent_keeper=""
+  leaf_parent="$(dirname "$f")"
+  snap_paths "$leaf_parent"
+  if chain_skips_parent "$f" && [ -f "$META" ] &&
+     [ "$(meta_field "$META" tier)" = "placement" ]; then
+    case "$(meta_field "$META" state)" in
+      locked|unlocked)
+        if parent_keeper="$(shared_ancestor_of "$leaf_parent")"; then
+          parent_action=kept
+        else
+          parent_action=release
+        fi
+        ;;
+    esac
+  fi
+
   # ---- plan ----------------------------------------------------------------
   #
   # Collected leaf first, then ancestors nearest-first: that is the order
@@ -2678,6 +2810,10 @@ EOF
     fi
     i=$((i + 1))
   done
+  # Un-provisioning the leaf's parent is a change like any other: it is
+  # what the gate below is being asked about, and a run that has nothing
+  # else to do still has this.
+  [ "$parent_action" = "release" ] && changes=$((changes + 1))
 
   # A chain that is already whole asks nothing: there is no change to
   # consent to, and a gate over an empty set trains the eye to say yes.
@@ -2698,9 +2834,27 @@ EOF
   # prompt's stream, so redirecting stdout can never separate the gate from
   # the list it is about. Already-locked rows are dim -- they are context,
   # not offer.
+  #
+  # The leaf's parent sits between the chain and the leaf, so its line goes
+  # in at exactly that point: root-most ordering is preserved and the row
+  # reads where a reader looks for it. It carries its reason rather than a
+  # bare action word -- a node leaving the chain, or staying in it for
+  # somebody else, is the one plan row that is not self-explanatory.
   echo "${E_B}plan for $f (tier $leaf_tier):${E_OFF}" >&2
   i=$((n - 1))
   while [ "$i" -ge 0 ]; do
+    if [ "$i" -eq 0 ]; then
+      case "$parent_action" in
+        kept)
+          printf '%s  kept: %s (placement; ancestor of %s)%s\n' \
+            "$E_DIM" "$leaf_parent" "$parent_keeper" "$E_OFF" >&2
+          ;;
+        release)
+          printf '  release: %s (leaf parent, leaves the chain)\n' \
+            "$leaf_parent" >&2
+          ;;
+      esac
+    fi
     if [ "${plan_actions[$i]}" = "already locked" ]; then
       printf '%s  %-*s  %s%s\n' "$E_DIM" "$w" "${plan_actions[$i]}" \
         "${plan_paths[$i]}" "$E_OFF" >&2
@@ -2730,8 +2884,13 @@ EOF
 
   # ---- apply ---------------------------------------------------------------
   #
-  # Leaf first, then ancestors nearest-first (the plan's own order), and no
-  # further questions: the gate above answered for all of them.
+  # The leaf's parent first: while it is still uappnd, nothing may be
+  # renamed or unlinked inside it, and the seals below are free to do
+  # either. Then leaf, then ancestors nearest-first (the plan's own order),
+  # and no further questions: the gate above answered for all of them.
+  if [ "$parent_action" = "release" ]; then
+    release_leaf_parent "$leaf_parent" || return $?
+  fi
   i=0
   while [ "$i" -lt "$n" ]; do
     if [ "${plan_actions[$i]}" != "already locked" ]; then
@@ -2755,6 +2914,16 @@ do_unlock_one() {
   if [ "$OPT_CHAIN" -eq 1 ]; then
     local chain a
     chain="$(chain_for "$f")" || return 1
+    # A skipped leaf parent may still hold a placement record -- it is a
+    # higher ancestor of some other sealed leaf. Its uappnd is exactly what
+    # a rename into this directory trips over, which is the whole reason
+    # --chain exists, so it is released here too. A parent with no record
+    # falls through the meta test below; an anchor parent is already in the
+    # chain and must not be listed twice.
+    if chain_skips_parent "$f"; then
+      chain="$(dirname "$f")
+$chain"
+    fi
     # Chain on fd 3, stdin left alone, for the reason given in do_lock_one.
     while IFS= read -r a <&3; do
       [ -n "$a" ] || continue
@@ -3483,12 +3652,12 @@ status_row() { # <path> [brief]
   return 1
 }
 
-# The `chain for` block: ancestors root-first, then the leaf, one
-# status_row each. Sets CHAIN_ANY=1 when any node on it holds a record.
-# Returns 1 if any node drifted.
+# The `chain for` block: ancestors root-first, then the leaf's parent, then
+# the leaf, one status_row each. Sets CHAIN_ANY=1 when any node on it holds
+# a record. Returns 1 if any node drifted.
 CHAIN_ANY=0
 print_chain() { # <path> [brief]
-  local f="$1" brief="${2:-}" chain nodes=() a rc=0
+  local f="$1" brief="${2:-}" chain nodes=() a rc=0 parent
   CHAIN_ANY=0
   set_pal
   echo "${P_B}chain for $f:${P_OFF}"
@@ -3496,7 +3665,11 @@ print_chain() { # <path> [brief]
     :
   else
     echo "  ${P_RED}✗${P_OFF} chain stop node is not root-owned (see: ${P_CYN}sudo locked lock $f${P_OFF})"
-    chain="$(dirname "$f")"
+    if chain_skips_parent "$f"; then
+      chain="$(dirname "$(dirname "$f")")"
+    else
+      chain="$(dirname "$f")"
+    fi
   fi
   # Root-first for readability.
   while IFS= read -r a; do
@@ -3504,13 +3677,38 @@ print_chain() { # <path> [brief]
   done <<EOF
 $chain
 EOF
-  nodes=(${nodes[@]+"${nodes[@]}"} "$f")
-  for a in "${nodes[@]}"; do
-    status_row "$a" "$brief" || rc=1
-    if [ "$STATUS_ROW_POOL" -eq 1 ]; then
-      CHAIN_ANY=1
+  if [ "${#nodes[@]}" -gt 0 ]; then
+    for a in "${nodes[@]}"; do
+      status_row "$a" "$brief" || rc=1
+      if [ "$STATUS_ROW_POOL" -eq 1 ]; then
+        CHAIN_ANY=1
+      fi
+    done
+  fi
+  # A leaf parent left out of the chain (the rule is argued at
+  # chain_skips_parent) is still the node a reader looks for first, so it
+  # prints as context: dim, with the reason, and never a "!" -- there is
+  # nothing on it to be out of order. A parent that DOES hold a record is a
+  # pool node like any other -- it is kept as a higher ancestor of another
+  # leaf, or it is a pre-rule seal awaiting the next lock -- so it gets the
+  # ordinary row, drift and all. An anchor parent is in the chain above and
+  # has already printed.
+  parent="$(dirname "$f")"
+  if [ "$parent" != "$f" ] && chain_skips_parent "$f"; then
+    snap_paths "$parent"
+    if [ -f "$META" ]; then
+      status_row "$parent" "$brief" || rc=1
+      if [ "$STATUS_ROW_POOL" -eq 1 ]; then
+        CHAIN_ANY=1
+      fi
+    else
+      echo "    ${P_DIM}-${P_OFF}  $parent ${P_DIM}(leaf parent, not in the chain)${P_OFF}"
     fi
-  done
+  fi
+  status_row "$f" "$brief" || rc=1
+  if [ "$STATUS_ROW_POOL" -eq 1 ]; then
+    CHAIN_ANY=1
+  fi
   return "$rc"
 }
 
