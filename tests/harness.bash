@@ -2492,6 +2492,61 @@ ok   "and is left where it was"                test -d "$CONV_LEGACY/.stray"
 rm -rf -- "$CONV_LEGACY"
 ok   "with the legacy root gone, runs pass"    locked_conv verify --quiet
 
+# ---- 8. one root run at a time ---------------------------------------------
+#
+# Every root run holds the run lock from the convergence to its exit. The
+# holder here is a stand-in that takes the lock on fd 9 the way locked does
+# and then execs sleep, so the sleeping process IS the holder: killing it
+# is killing the holder, with no child left behind to keep fd 9 open.
+
+note "== run lock: root runs take turns =="
+RUNLOCK="$CONV_STATE/.run.lock"
+RUNLOG="$SCRATCH/runlock.log"
+check "the run lock is root's, 600"            "root 600" "$(stat -f '%Su %OLp' "$RUNLOCK")"
+hold_run_lock() { # <seconds>: hold the run lock in the background; $! is the holder
+  (
+    exec 9>>"$RUNLOCK"
+    /usr/bin/perl -MFcntl=:flock -e 'open(my $fh, ">&=", 9) or exit 2; flock($fh, LOCK_EX) or exit 2'
+    printf 'harness holder' >"$RUNLOCK"
+    exec sleep "$1"
+  ) &
+}
+locked_conv_logged() { # <args...>: locked_conv, output to RUNLOG
+  locked_conv "$@" >"$RUNLOG" 2>&1
+}
+holder_has_lock() { # until the stand-in has written its name, 10 s at most
+  local i=0
+  until grep -qF 'harness holder' "$RUNLOCK"; do
+    i=$((i + 1))
+    [ "$i" -lt 100 ] || return 1
+    sleep 0.1
+  done
+}
+
+hold_run_lock 2
+HOLDER=$!
+ok   "the stand-in holder takes the lock"      holder_has_lock
+T0="$(date +%s)"
+ok   "a run that finds the lock held succeeds" locked_conv_logged verify --quiet
+T1="$(date +%s)"
+wait "$HOLDER" || true
+ok   "after saying whose lock it waits for"    grep -qF 'waiting for another locked run to finish (harness holder)' "$RUNLOG"
+ok   "and only once the holder let go"         test "$((T1 - T0))" -ge 1
+
+hold_run_lock 600
+HOLDER=$!
+ok   "a second stand-in takes the lock"        holder_has_lock
+kill -9 "$HOLDER"
+wait "$HOLDER" 2>/dev/null || true
+ok   "a killed holder leaves no lock behind"   locked_conv_logged verify --quiet
+deny "so the next run does not wait"           grep -qF 'waiting for another locked run' "$RUNLOG"
+
+chmod 644 "$RUNLOCK"
+refuse "a run lock others can read refuses"    "$RUNLOCK is not a root-owned 600 file" \
+       locked_conv verify --quiet
+chmod 600 "$RUNLOCK"
+ok   "at 600 again, runs pass"                 locked_conv verify --quiet
+
 # ---- summary ---------------------------------------------------------------
 
 echo

@@ -1083,6 +1083,7 @@ fi
 # the pool. Layout (root converges it below):
 #
 #   $LOCKED_STATE_ROOT/      root:wheel 711
+#     .run.lock              root:wheel 600 (one root run at a time; see run_lock_take)
 #     <user>/                root:_<user>-lock 750
 #       pool/                _<user>-lock:_<user>-lock 750 (records, snapshots)
 #       verify               root:_<user>-lock 640 (the last verify run)
@@ -1132,6 +1133,64 @@ convert_legacy_layout() {
   log_action convert "$LOCKED_LEGACY_ROOT" removed
 }
 
+# One root run at a time. Every root invocation -- a ceremony, the timer's
+# verify, a verify by hand -- holds this lock from the convergence below
+# until it exits. Without it, verify could read a record or a node halfway
+# through a ceremony and report drift that is not there; two ceremonies
+# could plan against one pool at once, so one releases a chain node the
+# other's new leaf needs; and an older verify that finished last would
+# overwrite a newer run's status. A run that finds the lock held says whose
+# it is and waits.
+#
+# flock(2), not a lock dir: the kernel drops the lock when its last
+# descriptor closes, so a killed run never leaves one behind. bash cannot
+# flock, so perl takes the lock on fd 9, which this shell keeps open: the
+# lock belongs to the open file, not to the perl process, and outlives it.
+# The file is created 600 under umask 077 in a dir only root writes to, so
+# no process running as the user can ever open it -- flock needs only a
+# read descriptor, and one opened early could stall every root run for
+# good. A child that runs as the user closes fd 9 (the editor), since a
+# child that outlived us would keep the lock held.
+LOCKED_RUN_LOCK="$LOCKED_STATE_ROOT/.run.lock"
+
+flock_fd9() { # <try|wait>: 0 locked, 1 held by another run (try only), 2 error
+  /usr/bin/perl -MFcntl=:flock -e '
+    open(my $fh, ">&=", 9) or exit 2;
+    my $op = LOCK_EX;
+    $op |= LOCK_NB if $ARGV[0] eq "try";
+    exit 0 if flock($fh, $op);
+    exit($!{EWOULDBLOCK} ? 1 : 2);' -- "$1"
+}
+
+run_lock_take() {
+  local mask rc=0 holder=""
+  mask="$(umask)"
+  umask 077
+  exec 9>>"$LOCKED_RUN_LOCK" || { umask "$mask"; return 1; }
+  umask "$mask"
+  # Exactly root 600: a group or other READ bit is already enough to hold
+  # the lock. Only root writes this dir, so anything else is root's doing;
+  # stop rather than converge, since a descriptor opened while the mode was
+  # wider would survive a chmod.
+  if [ -L "$LOCKED_RUN_LOCK" ] || [ ! -f "$LOCKED_RUN_LOCK" ] ||
+     [ "$(stat -f '%Su %OLp' "$LOCKED_RUN_LOCK")" != "root 600" ]; then
+    echo "${E_RED}${E_B}ERROR:${E_OFF} $LOCKED_RUN_LOCK is not a root-owned 600 file; look at it, remove it, and run again" >&2
+    return 1
+  fi
+  flock_fd9 try || rc=$?
+  if [ "$rc" -eq 1 ]; then
+    holder="$(head -c 200 "$LOCKED_RUN_LOCK" | LC_ALL=C tr -cd '[:print:]')" || holder=""
+    echo "waiting for another locked run to finish${holder:+ ($holder)}" >&2
+    rc=0
+    flock_fd9 wait || rc=$?
+  fi
+  if [ "$rc" -ne 0 ]; then
+    echo "${E_RED}${E_B}ERROR:${E_OFF} could not take the run lock $LOCKED_RUN_LOCK" >&2
+    return 1
+  fi
+  printf 'pid %s: locked %s' "$$" "$action" >"$LOCKED_RUN_LOCK"
+}
+
 if [ "$EUID" -eq 0 ]; then
   # Root converges the layout on every invocation, so a deployment made by
   # an older version migrates itself with no separate command.
@@ -1144,6 +1203,7 @@ if [ "$EUID" -eq 0 ]; then
   # its entries, so the verify status in it is exactly as trustworthy as
   # the root job that writes it.
   install -d -m 711 -o root -g wheel "$LOCKED_STATE_ROOT"
+  run_lock_take || exit 1
   convert_legacy_layout || exit 1
   if [ -n "$USER_DIR" ]; then
     install -d -m 750 -o root -g "$lock_user" "$USER_DIR"
@@ -3565,7 +3625,8 @@ do_edit_one() {
 
     local editor
     editor="${OPT_EDITOR:-${SUDO_EDITOR:-${VISUAL:-${EDITOR:-vi}}}}"
-    if ! sudo -u "$inv" -- "$editor" "$copy"; then
+    # 9>&-: the editor must not inherit the run lock (see run_lock_take).
+    if ! sudo -u "$inv" -- "$editor" "$copy" 9>&-; then
       echo "editor exited nonzero; nothing installed: $f" >&2
       rm -rf -- "$editdir"
       return 1
