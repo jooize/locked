@@ -38,8 +38,10 @@ let
   # Anchor-line rewrites, failing the eval loudly if an anchor ever
   # changes shape in the script: INSTALL_TARGET's default becomes the
   # system-profile path (stable across generations, always resolving to
-  # the current build), and LOCKED_HELPER's default becomes the store
-  # path of the helper built above.
+  # the current build), LOCKED_HELPER's default becomes the store path of
+  # the helper built above, and LOCKED_VERIFY_INTERVAL's default becomes
+  # verifyInterval, so every verify run -- the timer's or a manual one --
+  # records the period readers judge its age against.
   #
   # Deliberate non-rewrites, unlike pinned's module: the shebang is
   # already /bin/bash in the repo (see the script's own header -- sudo
@@ -56,6 +58,10 @@ let
     {
       from = '': "''${LOCKED_HELPER:=/usr/local/sbin/locked-helper}"'';
       to = '': "''${LOCKED_HELPER:=${helper}/bin/locked-helper}"'';
+    }
+    {
+      from = '': "''${LOCKED_VERIFY_INTERVAL:=900}"'';
+      to = '': "''${LOCKED_VERIFY_INTERVAL:=${toString cfg.verifyInterval}}"'';
     }
   ];
   scriptText =
@@ -124,8 +130,8 @@ let
       /usr/bin/dscl . -create "/Users/${lockAccount}" IsHidden 1
       /usr/bin/dscacheutil -flushcache
     fi
-    # Membership is what reads the user's own pool (unprivileged
-    # `locked status`); asserted on every activation.
+    # Membership is what reads the user's own pool and verify status
+    # (unprivileged `locked status`); asserted on every activation.
     /usr/sbin/dseditgroup -o edit -a "${cfg.user}" -t user "${lockAccount}" 2>/dev/null || true
   '';
 in
@@ -201,7 +207,11 @@ in
     verifyInterval = lib.mkOption {
       type = lib.types.int;
       default = 900;
-      description = "Seconds between verify daemon runs.";
+      description = ''
+        Seconds between verify daemon runs. Every verify run records it in
+        the user's status file (/var/db/locked/<user>/verify), and readers
+        treat a result older than three intervals as stale.
+      '';
     };
 
     package = lib.mkOption {

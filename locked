@@ -58,11 +58,19 @@ VERSION=0.14.0
 # every call. As a test seam it behaves like the others -- settable when
 # the script is run directly as root, dead under sudo's env_reset.
 : "${LOCKED_HELPER:=/usr/local/sbin/locked-helper}"
-: "${SNAPSHOTS_ROOT:=/var/db/locked-snapshots}"
+# Everything locked keeps: one root-owned dir per user under it, holding
+# that user's pool and the result of the last verify run (see the root
+# convergence block below for the shape).
+: "${LOCKED_STATE_ROOT:=/var/db/locked}"
+# Where 0.14.0 and earlier kept the pools. Read once, by the one-shot
+# conversion in the root convergence block; nothing else looks here.
+: "${LOCKED_LEGACY_ROOT:=/var/db/locked-snapshots}"
 : "${LOCKED_LOCK_ACCOUNT:=}"
 : "${LOCKED_USER_HOME:=}"
-: "${LOCKED_ALERT_DIR:=}"
 : "${LOCKED_VERIFY_PLIST:=/Library/LaunchDaemons/locked.verify.plist}"
+# The verify timer's period. The nix module rewrites this default to its
+# verifyInterval option (keep the exact `: "${VAR:=...}"` shape), so a manual
+# `sudo locked verify` records the same interval the timer runs at.
 : "${LOCKED_VERIFY_INTERVAL:=900}"
 
 # ---- palette ---------------------------------------------------------------
@@ -190,7 +198,8 @@ usage: sudo locked <action> [options] [args]
       Read-only: works without sudo for your own pool.
   verify [--quiet]
       Re-check every locked node against its meta. Exit 0 clean, 5 on
-      drift. Raises/clears the locked--drift alert file per user.
+      drift. Records the result per user in $LOCKED_STATE_ROOT/<user>/verify,
+      which status shows and other tools may read.
   setup
       Provision lock user/group, digest-pinned sudoers, verify timer;
       self-install to \$INSTALL_TARGET. Refused on nix-managed installs
@@ -673,7 +682,7 @@ meta_field() {
 # filename, which is what makes rekey_record a rename and nothing more.
 #
 # Staging is keyed to the destination's OWN pool dir, not to the invoker's:
-# verify walks every user's pool, so USER_SNAPSHOTS and $lock_user are the
+# verify walks every user's pool, so USER_POOL and $lock_user are the
 # wrong answer there. The pool dir is installed owner and group = that
 # user's lock account, so reading it back is exactly the identity the
 # metas already carry.
@@ -865,9 +874,8 @@ do_setup() {
   else
     used_gids="$(dscl . -list /Groups PrimaryGroupID | awk '{print $2}')"
     gid=
-    # Prefer 401 deterministically (the reserved lock slot; the Claude trust
-    # group _jooize-readonly takes 402). Fall back to the first free in the
-    # 400-499 service lane if 401 is somehow taken.
+    # Prefer 401 deterministically (the reserved lock slot). Fall back to
+    # the first free in the 400-499 service lane if 401 is taken.
     for id in 401 $(seq 400 499); do
       if ! printf '%s\n' "$used_gids" | grep -qx "$id"; then
         gid="$id"; break
@@ -1071,41 +1079,93 @@ if [ -n "$lock_user" ]; then
   }
 fi
 
-USER_SNAPSHOTS=""
+# The per-user state dir, the pool inside it, and the verify status beside
+# the pool. Layout (root converges it below):
+#
+#   $LOCKED_STATE_ROOT/      root:wheel 711
+#     <user>/                root:_<user>-lock 750
+#       pool/                _<user>-lock:_<user>-lock 750 (records, snapshots)
+#       verify               root:_<user>-lock 640 (the last verify run)
+USER_DIR=""
+USER_POOL=""
 if [ -n "$inv" ]; then
-  USER_SNAPSHOTS="$SNAPSHOTS_ROOT/$inv"
+  USER_DIR="$LOCKED_STATE_ROOT/$inv"
+  USER_POOL="$USER_DIR/pool"
 fi
 
+# One-shot conversion from the 0.14.0 layout, where each pool was
+# $LOCKED_LEGACY_ROOT/<user> and there was no per-user dir around it. Each
+# pool moves by rename into <user>/pool, then the emptied legacy root goes.
+# It runs from the root convergence block, so the first root invocation
+# after a deploy converts every user's pool -- the verify timer's own
+# RunAtLoad run included -- and no verify ever walks an empty new layout
+# while the records still sit at the old path. Nothing here merges: a pool
+# at both paths refuses, and so does a move that would cross filesystems
+# (mv would copy, dropping the atomic rename).
+# TODO(0.16.0): remove, together with LOCKED_LEGACY_ROOT, once no 0.14.0
+# layout remains.
+convert_legacy_layout() {
+  [ -e "$LOCKED_LEGACY_ROOT" ] || return 0
+  local old name acct dest
+  for old in "$LOCKED_LEGACY_ROOT"/*/; do
+    old="${old%/}"
+    name="$(basename "$old")"
+    acct="${LOCKED_LOCK_ACCOUNT:-$(lock_account_for "$name")}"
+    dest="$LOCKED_STATE_ROOT/$name"
+    if [ -e "$dest/pool" ]; then
+      echo "${E_RED}${E_B}ERROR:${E_OFF} a pool exists at both $old and $dest/pool; move one by hand" >&2
+      return 1
+    fi
+    if [ "$(stat -f '%d' "$old")" != "$(stat -f '%d' "$LOCKED_STATE_ROOT")" ]; then
+      echo "${E_RED}${E_B}ERROR:${E_OFF} $old and $LOCKED_STATE_ROOT are on different filesystems; refusing a copying move" >&2
+      return 1
+    fi
+    install -d -m 750 -o root -g "$acct" "$dest" || return 1
+    mv -- "$old" "$dest/pool" || return 1
+    echo "moved $old to $dest/pool" >&2
+    log_action convert "$old" "moved-to-$dest/pool"
+  done
+  rmdir -- "$LOCKED_LEGACY_ROOT" || {
+    echo "${E_RED}${E_B}ERROR:${E_OFF} $LOCKED_LEGACY_ROOT still holds entries after the move; look before removing it" >&2
+    return 1
+  }
+  log_action convert "$LOCKED_LEGACY_ROOT" removed
+}
+
 if [ "$EUID" -eq 0 ]; then
-  # Root converges the pool's shape on every invocation, so a deployment
-  # made by an older version migrates itself with no separate command.
-  # 711 on the root dir is execute-only traversal: a user can reach the one
-  # subdir whose name they already know and cannot enumerate who else has a
-  # pool. 750 on the per-user dir hands read to the owning lock group --
+  # Root converges the layout on every invocation, so a deployment made by
+  # an older version migrates itself with no separate command.
+  # 711 on the state root is execute-only traversal: a user can reach the
+  # one dir whose name they already know and cannot enumerate who else has
+  # one. 750 on the per-user dir hands read to the owning lock group --
   # which the invoking user is a member of -- and to nobody else, so
-  # another user's pool is refused by the kernel, not by our checks.
-  install -d -m 711 -o root -g wheel "$SNAPSHOTS_ROOT"
-  if [ -n "$USER_SNAPSHOTS" ]; then
-    install -d -m 750 -o "$lock_user" -g "$lock_user" "$USER_SNAPSHOTS"
+  # another user's pool and status are refused by the kernel, not by our
+  # checks. The per-user dir is root's: only root adds, renames or removes
+  # its entries, so the verify status in it is exactly as trustworthy as
+  # the root job that writes it.
+  install -d -m 711 -o root -g wheel "$LOCKED_STATE_ROOT"
+  convert_legacy_layout || exit 1
+  if [ -n "$USER_DIR" ]; then
+    install -d -m 750 -o root -g "$lock_user" "$USER_DIR"
+    install -d -m 750 -o "$lock_user" -g "$lock_user" "$USER_POOL"
     # Metas are the one class that goes group-readable (see write_meta);
     # sweep the ones an older version wrote at 600. nullglob makes the
     # array empty rather than literal when the pool has none yet.
-    pool_metas=("$USER_SNAPSHOTS"/*.meta)
+    pool_metas=("$USER_POOL"/*.meta)
     if [ "${#pool_metas[@]}" -gt 0 ]; then
       chmod 640 "${pool_metas[@]}" || exit 1
     fi
   fi
-elif [ -e "$SNAPSHOTS_ROOT" ] && [ ! -x "$SNAPSHOTS_ROOT" ]; then
-  # A deployment that predates the 711 root dir is not traversable for a
-  # plain user, and a nonexistent pool dir would then look identical to an
-  # empty pool. Say what is actually wrong; one sudo run fixes it.
-  echo "cannot read $SNAPSHOTS_ROOT (run 'sudo locked status' once to converge its mode)" >&2
+elif [ -e "$LOCKED_STATE_ROOT" ] && [ ! -x "$LOCKED_STATE_ROOT" ]; then
+  # A state root the caller cannot traverse would make every pool look
+  # empty. Say what is actually wrong; one sudo run converges the mode.
+  echo "cannot read $LOCKED_STATE_ROOT (run 'sudo locked status' once to converge its mode)" >&2
   exit 1
-elif [ -d "$USER_SNAPSHOTS" ] && { [ ! -r "$USER_SNAPSHOTS" ] || [ ! -x "$USER_SNAPSHOTS" ]; }; then
+elif [ -d "$USER_DIR" ] && { [ ! -r "$USER_DIR" ] || [ ! -x "$USER_DIR" ]; }; then
   # Unprivileged status skips the provisioning above deliberately rather
   # than letting a non-root `install -d -o` fail: nothing on this path may
-  # create or modify anything. An unreadable pool dir is the privacy wall
-  # working as designed (the caller is not in that lock group, or is
+  # create or modify anything. An unreadable per-user dir is the privacy
+  # wall working as designed (the caller is not in that lock group, or is
   # probing someone else's pool) -- fail closed on one line instead of
   # letting every later glob and stat fail separately.
   echo "cannot read pool for $inv (not a member of $lock_user?)" >&2
@@ -1133,7 +1193,7 @@ fi
 # cp -Rp and keep the per-file residuals; that is the one TODO left open.
 atomic_replace() {
   local src="$1" dst="$2" owner="$3" mode="$4"
-  local stage_dir="$USER_SNAPSHOTS/.staging"
+  local stage_dir="$USER_POOL/.staging"
   install -d -m 700 -o "$lock_user" -g "$lock_user" "$stage_dir" || return 1
   local src_id tmp
   src_id="$(node_id "$src")" || return 1
@@ -1179,7 +1239,7 @@ atomic_replace() {
 # Directory snapshots: whole-tree copy under .snapdir, staged then swapped.
 snapshot_tree() {
   local src="$1" snapdir="$2"
-  local stage_dir="$USER_SNAPSHOTS/.staging"
+  local stage_dir="$USER_POOL/.staging"
   install -d -m 700 -o "$lock_user" -g "$lock_user" "$stage_dir"
   local tmp
   tmp="$(mktemp -d "${stage_dir}/tree.XXXXXX")" || return 1
@@ -1203,10 +1263,10 @@ snapshot_tree() {
 # Per-path snapshot locations.
 snap_paths() { # sets ENC SNAP SNAPDIR ATTIC META for path $1
   ENC="$(encode "$1")"
-  SNAP="$USER_SNAPSHOTS/${ENC}.snap"
-  SNAPDIR="$USER_SNAPSHOTS/${ENC}.snapdir"
-  ATTIC="$USER_SNAPSHOTS/${ENC}.attic"
-  META="$USER_SNAPSHOTS/${ENC}.meta"
+  SNAP="$USER_POOL/${ENC}.snap"
+  SNAPDIR="$USER_POOL/${ENC}.snapdir"
+  ATTIC="$USER_POOL/${ENC}.attic"
+  META="$USER_POOL/${ENC}.meta"
 }
 
 # A pre-0.6.0 record names its node by st_dev, a number the kernel may have
@@ -1488,7 +1548,7 @@ plan_releases() {
   local exclude="$1" add="$2" meta q st role leaves="" needed="" c cands l held
   RELEASE_PATHS=()
   RELEASE_REASONS=()
-  for meta in "$USER_SNAPSHOTS"/*.meta; do
+  for meta in "$USER_POOL"/*.meta; do
     [ -f "$meta" ] || continue
     record_live "$meta" || continue
     q="$(decode "$(basename "$meta" .meta)")"
@@ -1525,7 +1585,7 @@ EOF
   # comment inside the substitution: /bin/bash 3.2 ends a $( ... ) at the
   # first unbalanced paren it scans, a case pattern's included.
   cands="$(
-    for meta in "$USER_SNAPSHOTS"/*.meta; do
+    for meta in "$USER_POOL"/*.meta; do
       [ -f "$meta" ] || continue
       [ "$(meta_field "$meta" role)" = "chain" ] || continue
       st="$(meta_field "$meta" state)"
@@ -2714,7 +2774,7 @@ rekey_record() { # <oldpath> <newpath>
   newenc="$(encode "$new")"
   [ "$oldenc" != "$newenc" ] || return 0
   for suffix in meta snap snapdir attic; do
-    if [ -e "$USER_SNAPSHOTS/$newenc.$suffix" ]; then
+    if [ -e "$USER_POOL/$newenc.$suffix" ]; then
       echo "${E_RED}${E_B}ERROR:${E_OFF} a record already exists for $new; refusing to merge into it" >&2
       return 1
     fi
@@ -2724,8 +2784,8 @@ rekey_record() { # <oldpath> <newpath>
     return 0
   fi
   for suffix in meta snap snapdir attic; do
-    src="$USER_SNAPSHOTS/$oldenc.$suffix"
-    dst="$USER_SNAPSHOTS/$newenc.$suffix"
+    src="$USER_POOL/$oldenc.$suffix"
+    dst="$USER_POOL/$newenc.$suffix"
     if [ -e "$src" ]; then
       mv -f -- "$src" "$dst" || return 1
     fi
@@ -2763,11 +2823,11 @@ subtree_gate() { # <verb> <target>
   local verb="$1" target="$2" udir uname own other descendants="" p foreign=0
   SUBTREE_NODES=()
 
-  for udir in "$SNAPSHOTS_ROOT"/*/; do
+  for udir in "$LOCKED_STATE_ROOT"/*/; do
     uname="$(basename "$udir")"
     case "$uname" in .*) continue ;; esac
     [ "$uname" = "$inv" ] && continue
-    other="$(pool_records_under "$udir" "$target")"
+    other="$(pool_records_under "${udir}pool" "$target")"
     [ -n "$other" ] || continue
     if [ "$foreign" -eq 0 ]; then
       echo "${E_RED}${E_B}refusing $verb $target:${E_OFF} it holds locked records that are not yours" >&2
@@ -2784,7 +2844,7 @@ subtree_gate() { # <verb> <target>
     return 1
   fi
 
-  own="$(pool_records_under "$USER_SNAPSHOTS" "$target" | sort -r)"
+  own="$(pool_records_under "$USER_POOL" "$target" | sort -r)"
   [ -n "$own" ] || return 0
   while IFS= read -r p; do
     [ -n "$p" ] || continue
@@ -3414,7 +3474,7 @@ unprotect_leaf() {
 # The staging file both edit paths freeze their candidate into: a fresh
 # name in the lock account's mode-700 dir, out of the invoker's reach.
 stage_new() {
-  local stage_dir="$USER_SNAPSHOTS/.staging"
+  local stage_dir="$USER_POOL/.staging"
   install -d -m 700 -o "$lock_user" -g "$lock_user" "$stage_dir" || return 1
   mktemp "${stage_dir}/edit.XXXXXX"
 }
@@ -4300,21 +4360,24 @@ status_unpriv_note() {
 }
 
 # status with no path: list every node in the invoking user's pool, so the
-# whole locked surface is visible at a glance. Reporting only -- unlike
-# verify it never writes alert files and drift does not change the exit
-# code, so looking never turns into an enforcement action.
+# whole locked surface is visible at a glance, then what the last verify
+# run found. Reporting only -- unlike verify it never writes the status
+# file and drift does not change the exit code, so looking never turns
+# into an enforcement action.
 do_status_pool() {
   local listing meta n
   # Sorted by DECODED path, so the listing reads in filesystem order rather
   # than in the encoding's order (%2F sorts nothing like /).
   listing="$(
-    for meta in "$USER_SNAPSHOTS"/*.meta; do
+    for meta in "$USER_POOL"/*.meta; do
       printf '%s\n' "$(decode "$(basename "$meta" .meta)")"
     done | sort
   )"
   set_pal
   if [ -z "$listing" ]; then
     echo "pool for $inv is empty"
+    echo
+    verify_summary "$USER_DIR"
     return 0
   fi
   echo "${P_B}pool for $inv:${P_OFF}"
@@ -4340,63 +4403,169 @@ EOF
     done
     echo "      The next sudo locked lock, unprotect or rm releases them."
   fi
+  echo
+  verify_summary "$USER_DIR"
+  return 0
+}
+
+# ---- verify status -----------------------------------------------------------
+#
+# Each verify run leaves one file per user, <state root>/<user>/verify, for
+# anything that wants the result without root: status below, a statusline,
+# a login check. locked names no consumer; a reader knows this path.
+#
+#   at=2026-09-15T20:15:00Z    when the run started (UTC)
+#   interval=900               seconds between timer runs; older than a few
+#                              intervals means the timer has stopped
+#   records=26                 pool records the run walked
+#   drifted=2                  of those, how many drifted
+#   drift=/Users/you/...       one line per drifted path, at most
+#                              VERIFY_PATHS_MAX; drifted= is the count
+#
+# One file, replaced whole by a rename, so a reader always gets a single
+# run's answer and never half of one. Only root writes it: the file and the
+# dir it sits in are root's, and the lock group -- the user -- can read
+# both and change neither. Paths come from the user's own file names, so
+# every byte outside printable ASCII, and the backslash itself, is written
+# as \xHH: each line is printable ASCII, and no file name can end a line
+# early and add a key of its own.
+VERIFY_PATHS_MAX=20
+
+verify_escape() { # <path>: printable ASCII, \xHH for every other byte
+  # Bytes, not characters: without -C perl reads its argument as octets, so
+  # a multi-byte character becomes one \xHH per byte.
+  /usr/bin/perl -e '$_ = $ARGV[0]; s/([^\x20-\x5b\x5d-\x7e])/sprintf("\\x%02x", ord($1))/ge; print' -- "$1"
+}
+
+write_verify_status() { # <userdir> <lock group> <at> <records> [drifted path...]
+  local dir="$1" group="$2" at="$3" records="$4"
+  shift 4
+  local tmp p n=0
+  tmp="$(mktemp "$dir/.verify.XXXXXX")" || return 1
+  {
+    printf 'at=%s\n' "$at"
+    printf 'interval=%s\n' "$LOCKED_VERIFY_INTERVAL"
+    printf 'records=%s\n' "$records"
+    printf 'drifted=%s\n' "$#"
+    for p in "$@"; do
+      n=$((n + 1))
+      [ "$n" -le "$VERIFY_PATHS_MAX" ] || break
+      printf 'drift=%s\n' "$(verify_escape "$p")"
+    done
+  } >"$tmp" || { rm -f -- "$tmp"; return 1; }
+  chown "root:$group" "$tmp" || { rm -f -- "$tmp"; return 1; }
+  chmod 640 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$dir/verify" || { rm -f -- "$tmp"; return 1; }
+}
+
+fmt_age() { # <seconds>: how long ago, in the largest whole unit
+  local s="$1"
+  if [ "$s" -lt 60 ]; then echo "just now"
+  elif [ "$s" -lt 3600 ]; then echo "$((s / 60)) min ago"
+  elif [ "$s" -lt 172800 ]; then echo "$((s / 3600)) h ago"
+  else echo "$((s / 86400)) days ago"
+  fi
+}
+
+# One block for status: what the last verify run found, from the file above.
+# A run older than three intervals is stale -- the timer has stopped or the
+# machine has not been awake to run it -- and says so, because a clean
+# answer from yesterday is not a clean answer now.
+verify_summary() { # <userdir>
+  local f="$1/verify" line at="" interval="" drifted="" epoch now age when
+  local paths=()
+  set_pal
+  if [ ! -e "$f" ]; then
+    echo "${P_B}last verify:${P_OFF} ${P_DIM}-${P_OFF}  none recorded ${P_DIM}(the timer writes $f)${P_OFF}"
+    return 0
+  fi
+  if [ -L "$f" ] || [ ! -f "$f" ] || [ ! -r "$f" ]; then
+    echo "${P_B}last verify:${P_OFF} ${P_RED}✗${P_OFF}  cannot read $f"
+    return 0
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      at=*)       at="${line#at=}" ;;
+      interval=*) interval="${line#interval=}" ;;
+      drifted=*)  drifted="${line#drifted=}" ;;
+      drift=*)    paths+=("${line#drift=}") ;;
+    esac
+  done <"$f"
+  case "$interval" in ''|*[!0-9]*) interval="" ;; esac
+  case "$drifted" in ''|*[!0-9]*) drifted="" ;; esac
+  if [ -z "$interval" ] || [ -z "$drifted" ]; then
+    echo "${P_B}last verify:${P_OFF} ${P_RED}✗${P_OFF}  $f is malformed"
+    return 0
+  fi
+  epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$at" +%s 2>/dev/null)" || {
+    echo "${P_B}last verify:${P_OFF} ${P_RED}✗${P_OFF}  $f is malformed"
+    return 0
+  }
+  now="$(date +%s)"
+  age=$((now - epoch))
+  [ "$age" -ge 0 ] || age=0
+  if [ "$age" -lt 72000 ]; then
+    when="$(date -r "$epoch" +%H:%M)"
+  else
+    when="$(date -r "$epoch" '+%Y-%m-%d %H:%M')"
+  fi
+  if [ "$drifted" -eq 0 ]; then
+    echo "${P_B}last verify:${P_OFF} ${P_GRN}✓${P_OFF}  clean ${P_DIM}($when, $(fmt_age "$age"))${P_OFF}"
+  else
+    echo "${P_B}last verify:${P_OFF} ${P_RED}✗${P_OFF}  $drifted drifted ${P_DIM}($when, $(fmt_age "$age"))${P_OFF}"
+    for line in ${paths[@]+"${paths[@]}"}; do
+      echo "      $line"
+    done
+    [ "$drifted" -le "${#paths[@]}" ] || echo "      ${P_DIM}and $((drifted - ${#paths[@]})) more${P_OFF}"
+    echo "      details: ${P_CYN}sudo locked verify${P_OFF}"
+  fi
+  if [ "$age" -gt $((3 * interval)) ]; then
+    echo "${P_YEL}note:${P_OFF} that run is stale; the timer runs every ${interval}s"
+  fi
   return 0
 }
 
 do_verify() {
-  local total_drift=0 udir uname ulock uhome alerts drift_count
-  for udir in "$SNAPSHOTS_ROOT"/*/; do
+  local total_drift=0 status_failed=0 udir uname ulock records at
+  local meta fpath out
+  local drifted=()
+  # One start time for every user's status: the moment the answer is as of.
+  at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  for udir in "$LOCKED_STATE_ROOT"/*/; do
+    udir="${udir%/}"
     uname="$(basename "$udir")"
-    case "$uname" in .staging|.*) continue ;; esac
+    case "$uname" in .*) continue ;; esac
     ulock="${LOCKED_LOCK_ACCOUNT:-$(lock_account_for "$uname")}"
-    uhome="${LOCKED_USER_HOME:-$(home_for "$uname")}"
-    drift_count=0
-    local meta fpath out
-    for meta in "$udir"*.meta; do
+    records=0
+    drifted=()
+    for meta in "$udir"/pool/*.meta; do
+      records=$((records + 1))
       fpath="$(decode "$(basename "$meta" .meta)")"
       if out="$(verify_node "$fpath" "$meta" "$ulock")"; then
         [ "$OPT_QUIET" -eq 1 ] || [ -z "$out" ] || printf '%s\n' "$out"
       else
         printf '%s\n' "$out"
-        drift_count=$((drift_count + 1))
+        drifted+=("$fpath")
       fi
     done
-    if [ -n "$uhome" ]; then
-      alerts="${LOCKED_ALERT_DIR:-$uhome/.local/state/agents/claude/alerts}"
-      write_or_clear_alert "$uname" "$alerts" "$drift_count"
+    if ! write_verify_status "$udir" "$ulock" "$at" "$records" ${drifted[@]+"${drifted[@]}"}; then
+      echo "${E_RED}${E_B}ERROR:${E_OFF} could not write $udir/verify" >&2
+      status_failed=1
     fi
-    total_drift=$((total_drift + drift_count))
+    total_drift=$((total_drift + ${#drifted[@]}))
   done
   if [ "$total_drift" -gt 0 ]; then
     echo "${E_RED}${E_B}verify: $total_drift node(s) drifted${E_OFF}" >&2
     log_action verify "" "drift-$total_drift"
     return 5
   fi
+  if [ "$status_failed" -eq 1 ]; then
+    log_action verify "" status-write-failed
+    return 1
+  fi
   [ "$OPT_QUIET" -eq 1 ] || echo "${C_GRN}verify: all locked nodes clean${C_OFF}"
   log_action verify "" ok
   return 0
-}
-
-# Alert file handling runs AS THE USER (sudo -u): a planted symlink anywhere
-# under the user-writable alert path then redirects a user-UID write, not a
-# root one -- no escalation surface. Slug grammar: locked--drift.
-write_or_clear_alert() {
-  local uname="$1" alerts="$2" drift_count="$3"
-  local afile="$alerts/locked--drift"
-  if [ "$drift_count" -gt 0 ]; then
-    local ts line
-    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    line="$ts locked verify: $drift_count node(s) drifted; run: sudo locked verify"
-    run sudo -u "$uname" /bin/sh -c '
-      umask 022
-      mkdir -p "$1" || exit 1
-      printf "%s\n" "$2" >"$1/.locked--drift.tmp" && mv -f "$1/.locked--drift.tmp" "$1/locked--drift"
-    ' alertwrite "$alerts" "$line" || echo "warning: could not write alert for $uname" >&2
-  else
-    if sudo -u "$uname" /bin/sh -c 'test -e "$1"' alertclear "$afile" 2>/dev/null; then
-      run sudo -u "$uname" rm -f -- "$afile" || echo "warning: could not clear alert for $uname" >&2
-    fi
-  fi
 }
 
 # ---- dispatch --------------------------------------------------------------

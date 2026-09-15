@@ -9,9 +9,10 @@
 #
 # No global state is touched: the lock account is stood in by the existing
 # `daemon` user (the account's identity is irrelevant to flag mechanics;
-# what matters is that the invoker does not own the node), snapshots and
-# fake home live in a scratch dir, and the cleanup trap clears all flags
-# before removing it. Ancestry fixtures live in a second scratch under
+# what matters is that the invoker does not own the node), the state root
+# (pools and verify status), the legacy root the layout conversion reads
+# and the fake home live in a scratch dir, and the cleanup trap clears all
+# flags before removing it. Ancestry fixtures live in a second scratch under
 # /var/db (the 1777 /private/tmp would itself fail the walk), and the
 # window helper this harness builds lives in a third one there for the same
 # reason; both are removed by the trap. Add rights on placement dirs come
@@ -48,22 +49,33 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Environment for every locked invocation: scratch snapshots, daemon as the
-# stand-in lock account, fake home, scratch alert dir. These seams only work
-# because we execute the script directly as root -- sudo's env_reset strips
-# them on real invocations.
+# Environment for every locked invocation: a scratch state root, daemon as
+# the stand-in lock account, fake home. These seams only work because we
+# execute the script directly as root -- sudo's env_reset strips them on
+# real invocations.
 LOCK_ACCT=daemon
 FAKE_HOME="$SCRATCH/home"
-ALERTS="$SCRATCH/alerts"
-SNAPROOT="$SCRATCH/snapshots"
+STATEROOT="$SCRATCH/state"
+
+# Every root invocation runs the one-shot layout conversion, which MOVES
+# whatever it finds at the legacy root. Left at its default, one invocation
+# that forgot the seam would move the machine's real pool into this scratch
+# dir, and the cleanup trap would delete it. Exported rather than passed per
+# call, so every child -- env blocks, expect's spawn -- inherits it whatever
+# its own command line says; the check makes a regression here fatal.
+export LOCKED_LEGACY_ROOT="$SCRATCH/legacy"
+export LOCKED_STATE_ROOT="$STATEROOT"
+case "$LOCKED_LEGACY_ROOT" in
+  "$SCRATCH"/*) ;;
+  *) echo "LOCKED_LEGACY_ROOT is outside the scratch dir; refusing to run" >&2; exit 1 ;;
+esac
 
 locked() {
-  env SNAPSHOTS_ROOT="$SNAPROOT" \
+  env LOCKED_STATE_ROOT="$STATEROOT" \
       INSTALL_TARGET="$SCRATCH/not-installed" \
       LOCKED_HELPER="$HELPER" \
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$FAKE_HOME" \
-      LOCKED_ALERT_DIR="$ALERTS" \
       SUDO_USER="$INV" \
       /bin/bash "$LOCKED" "$@"
 }
@@ -132,7 +144,6 @@ locked_notty() {
 }
 
 install -d -o "$INV" -g staff "$FAKE_HOME"
-install -d -o "$INV" -g staff "$ALERTS"
 install -d -o "$INV" -g staff "$SCRATCH/raw"   # user-owned container for raw probes
 
 # ---- 0. window helper ------------------------------------------------------
@@ -347,21 +358,40 @@ check "content back to unlock-time"      "version 2" "$(head -1 "$CFG")"
 check "reverted file still uchg"         "uchg" "$(flags_of "$CFG")"
 ok   "verify clean after revert"         locked verify
 
-note "== cli: drift detection + alert + repair =="
-chflags -- nouchg "$CFG"                 # simulate an attacker-with-root / forgotten relock
-chown "$INV" "$CFG"
+note "== cli: drift detection + verify status + repair =="
+# A second drifted node whose name needs escaping in the status file: a
+# non-ASCII character (two bytes) and a backslash.
+ESCF="$FAKE_HOME/caf"$'\303\251'"\\x.txt"
+as_user /bin/sh -c 'echo e > "$1"' sh "$ESCF"
+ok   "lock a file whose name needs escaping" locked lock --yes "$ESCF"
+chflags -- nouchg "$CFG" "$ESCF"         # simulate an attacker-with-root / forgotten relock
+chown "$INV" "$CFG" "$ESCF"
 if locked verify >/dev/null 2>&1; then
   FAIL=$((FAIL + 1)); note "  FAIL  verify should exit nonzero on drift"
 else
   rc=$?
   check "verify exit code 5 on drift"    "5" "$rc"
 fi
-ok   "alert file raised"                 test -s "$ALERTS/locked--drift"
-check "alert file owned by user"         "$INV" "$(owner_of "$ALERTS/locked--drift")"
-ok   "repair: unlock drifted node"       locked unlock "$CFG"
-ok   "repair: relock"                    locked lock --yes "$CFG"
+VSTAT="$STATEROOT/$INV/verify"
+vstat() { sed -n "s/^$1=//p" "$VSTAT" | head -1; }
+check "status file is root's, group-readable" "root $LOCK_ACCT 640" \
+      "$(stat -f '%Su %Sg %OLp' "$VSTAT")"
+check "status counts both drifted nodes" "2" "$(vstat drifted)"
+ok   "status names the drifted path"     grep -qxF "drift=$CFG" "$VSTAT"
+ok   "a non-ASCII name and a backslash are escaped" \
+     grep -qxF "drift=$FAKE_HOME/caf\\xc3\\xa9\\x5cx.txt" "$VSTAT"
+check "every status line is printable ASCII" "" "$(LC_ALL=C grep -n '[^ -~]' "$VSTAT")"
+check "status records the timer interval" "900" "$(vstat interval)"
+ok   "status time is UTC ISO 8601"       grep -qE '^at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$VSTAT"
+VTMP=("$STATEROOT/$INV"/.verify.*)
+check "no temp file is left beside it"   "0" "${#VTMP[@]}"
+deny "nothing is written under the user's home" test -e "$FAKE_HOME/.local/state"
+ok   "repair: unlock drifted nodes"      locked unlock "$CFG" "$ESCF"
+ok   "repair: relock"                    locked lock --yes "$CFG" "$ESCF"
+ok   "unprotect the escaped one"         locked unprotect --yes "$ESCF"
 ok   "verify clean after repair"         locked verify
-deny "alert cleared after clean verify"  test -e "$ALERTS/locked--drift"
+check "status says clean after repair"   "0" "$(vstat drifted)"
+deny "and names no path"                 grep -q '^drift=' "$VSTAT"
 
 note "== cli: content-tier directory (recursive) =="
 CD="$FAKE_HOME/cfgdir"
@@ -450,7 +480,7 @@ refuse "no tty and no --yes is refused"   "--yes not given" \
        locked_notty edit --from "$PROP" "$CFG"
 check "the declined target is unchanged"  "version 4" "$(head -1 "$CFG")"
 check "the staging dir is left empty"     "0" \
-      "$(ls -A "$SNAPROOT/$INV/.staging" | wc -l | tr -d ' ')"
+      "$(ls -A "$STATEROOT/$INV/pool/.staging" | wc -l | tr -d ' ')"
 
 # The freeze property itself: that a swap of the proposal between the diff
 # and the install changes nothing. There is no pause in the flow a test can
@@ -482,7 +512,7 @@ refuse "a symlinked proposal is refused"  "cannot read as" \
 check "the target is unchanged"           "version 4" "$(head -1 "$CFG")"
 check "the target is still sealed"        "uchg" "$(flags_of "$CFG")"
 check "staging is left empty"             "0" \
-      "$(ls -A "$SNAPROOT/$INV/.staging" | wc -l | tr -d ' ')"
+      "$(ls -A "$STATEROOT/$INV/pool/.staging" | wc -l | tr -d ' ')"
 deny "no root-only bytes reached the target" grep -qF secret "$CFG"
 
 # The editor runs as the invoker, so it can leave a symlink behind just as
@@ -499,7 +529,7 @@ refuse "a symlink left by the editor is refused" "cannot read the edited copy" \
 check "the target is unchanged"           "version 4" "$(head -1 "$CFG")"
 check "the target is still sealed"        "uchg" "$(flags_of "$CFG")"
 check "staging is left empty"             "0" \
-      "$(ls -A "$SNAPROOT/$INV/.staging" | wc -l | tr -d ' ')"
+      "$(ls -A "$STATEROOT/$INV/pool/.staging" | wc -l | tr -d ' ')"
 deny "no root-only bytes reached the target" grep -qF secret "$CFG"
 
 note "== cli: an edit carries the sealed file's xattrs, not the candidate's =="
@@ -720,7 +750,7 @@ ok   "lock --dry-run --yes"              locked lock --dry-run --yes "$DR"
 check "dry-run left owner"               "$INV" "$(owner_of "$DR")"
 check "dry-run left flags"               "" "$(flags_of "$DR")"
 deny "dry-run wrote no meta or snapshot" \
-     /bin/sh -c "ls '$SNAPROOT/$INV' | grep -q dryrun"
+     /bin/sh -c "ls '$STATEROOT/$INV/pool' | grep -q dryrun"
 
 note "== cli: chain stop node whose group is not wheel =="
 # The real ~ walk stops at /Users, which macOS ships root:admin 755. The
@@ -730,16 +760,16 @@ note "== cli: chain stop node whose group is not wheel =="
 # user, one home, one pool. The needed set a release plan is drawn from is
 # derived against the home's anchor, so two homes sharing one pool is a
 # state no real install reaches -- and one whose releases would be wrong.
-# pool_for_home names the pool after the home's root-owned stop directory.
-pool_for_home() { printf '%s/pools/%s' "$SCRATCH" "$(basename "$(dirname "$1")")"; }
+# state_for_home names the home's state root after its root-owned stop
+# directory.
+state_for_home() { printf '%s/states/%s' "$SCRATCH" "$(basename "$(dirname "$1")")"; }
 locked_home() { # <home> <args...>: locked with a different LOCKED_USER_HOME
   local h="$1"; shift
-  env SNAPSHOTS_ROOT="$(pool_for_home "$h")" \
+  env LOCKED_STATE_ROOT="$(state_for_home "$h")" \
       INSTALL_TARGET="$SCRATCH/not-installed" \
       LOCKED_HELPER="$HELPER" \
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$h" \
-      LOCKED_ALERT_DIR="$ALERTS" \
       SUDO_USER="$INV" \
       /bin/bash "$LOCKED" "$@"
 }
@@ -776,7 +806,7 @@ set timeout 15
 # run is optional, so this same pattern still matches the uncolored prompt
 # (NO_COLOR, or a redirected stderr).
 set ynp {\[(\x1b\[[0-9;]*m)*y(\x1b\[[0-9;]*m)*/(\x1b\[[0-9;]*m)*N(\x1b\[[0-9;]*m)*\]}
-spawn env SNAPSHOTS_ROOT=$(pool_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME LOCKED_ALERT_DIR=$ALERTS SUDO_USER=$INV /bin/bash $LOCKED lock $TTYCFG
+spawn env LOCKED_STATE_ROOT=$(state_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME SUDO_USER=$INV /bin/bash $LOCKED lock $TTYCFG
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
@@ -813,7 +843,7 @@ EOF
   TTYEXP2="$SCRATCH/tty-decline.exp"
   cat >"$TTYEXP2" <<EOF
 set timeout 15
-spawn env SNAPSHOTS_ROOT=$(pool_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME LOCKED_ALERT_DIR=$ALERTS SUDO_USER=$INV /bin/bash $LOCKED lock $TTYDEC
+spawn env LOCKED_STATE_ROOT=$(state_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME SUDO_USER=$INV /bin/bash $LOCKED lock $TTYDEC
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
@@ -839,7 +869,7 @@ EOF
   TTYEXP3="$SCRATCH/tty-unprotect.exp"
   cat >"$TTYEXP3" <<EOF
 set timeout 15
-spawn env SNAPSHOTS_ROOT=$(pool_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME LOCKED_ALERT_DIR=$ALERTS SUDO_USER=$INV /bin/bash $LOCKED unprotect $TTYCFG
+spawn env LOCKED_STATE_ROOT=$(state_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME SUDO_USER=$INV /bin/bash $LOCKED unprotect $TTYCFG
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
@@ -874,14 +904,17 @@ locked status >"$POOL" 2>&1
 ok   "listing marks the unlocked node"   grep -qF "!  $CD (content, unlocked)" "$POOL"
 ok   "relock dir after the listing"      locked lock --yes "$CD"
 
+check "the listing ends with the last verify" "last verify: ✓  clean" "$(tail -1 "$POOL" | sed 's/ (.*//')"
+
 note "== cli: pool permissions =="
-# Root re-applies these on every invocation (which is also how an older 700
-# deployment migrates itself). They are what makes unprivileged status
-# possible without exposing either the user list or any file content.
-check "snapshots root is 711"            "711" "$(stat -f '%OLp' "$SNAPROOT")"
-check "per-user pool dir is 750"         "750" "$(stat -f '%OLp' "$SNAPROOT/$INV")"
-POOL_METAS=("$SNAPROOT/$INV"/*.meta)
-POOL_SNAPS=("$SNAPROOT/$INV"/*.snap)
+# Root re-applies these on every invocation. They are what makes
+# unprivileged status possible without exposing either the user list or
+# any file content, and what keeps the verify status root's alone.
+check "state root is root's, traverse-only" "root wheel 711" "$(stat -f '%Su %Sg %OLp' "$STATEROOT")"
+check "per-user dir is root's, lock group"  "root $LOCK_ACCT 750" "$(stat -f '%Su %Sg %OLp' "$STATEROOT/$INV")"
+check "pool is the lock account's"          "$LOCK_ACCT $LOCK_ACCT 750" "$(stat -f '%Su %Sg %OLp' "$STATEROOT/$INV/pool")"
+POOL_METAS=("$STATEROOT/$INV/pool"/*.meta)
+POOL_SNAPS=("$STATEROOT/$INV/pool"/*.snap)
 if [ "${#POOL_METAS[@]}" -gt 0 ] && [ "${#POOL_SNAPS[@]}" -gt 0 ]; then
   check "meta is group-readable 640"     "640" "$(stat -f '%OLp' "${POOL_METAS[0]}")"
   check "snapshot content stays 600"     "600" "$(stat -f '%OLp' "${POOL_SNAPS[0]}")"
@@ -898,17 +931,15 @@ install -m 755 -o root -g wheel "$LOCKED" "$SCRIPT_COPY"
 
 locked_as() { # <user> <args...>: run locked unprivileged AS <user>.
   # The seams ride the command line because sudo's env_reset drops inherited
-  # variables (the alert writer hands its data across the same way).
-  # SUDO_USER is deliberately not passed: sudo sets it to root here, and the
+  # variables. SUDO_USER is deliberately not passed: sudo sets it to root here, and the
   # non-root branch must ignore it and derive the invoker from the real uid.
   local u="$1"; shift
   sudo -u "$u" /usr/bin/env \
-      SNAPSHOTS_ROOT="$SNAPROOT" \
+      LOCKED_STATE_ROOT="$STATEROOT" \
       INSTALL_TARGET="$SCRATCH/not-installed" \
       LOCKED_HELPER="$HELPER" \
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$FAKE_HOME" \
-      LOCKED_ALERT_DIR="$ALERTS" \
       /bin/bash "$SCRIPT_COPY" "$@"
 }
 
@@ -929,9 +960,46 @@ refuse "same refusal for status with a path"            "cannot read pool for $I
 ok   "unprivileged status as the lock account"  locked_as "$LOCK_ACCT" status
 locked_as "$LOCK_ACCT" status >"$POOL" 2>&1
 ok   "it lists the lock account's OWN pool"     grep -qF "pool for $LOCK_ACCT is empty" "$POOL"
+ok   "with no verify run recorded for it"       grep -qF "last verify: -  none recorded" "$POOL"
 
 check "unprivileged status wrote nothing"       "" \
-      "$(/usr/bin/find "$SNAPROOT" -newer "$MARKER" -print)"
+      "$(/usr/bin/find "$STATEROOT" -newer "$MARKER" -print)"
+
+note "== cli: unprivileged status reads the verify status =="
+# The lock account stands in for a user reading their own status through
+# the lock group. Its per-user dir is a fixture in the shape root converges
+# to; the files are what a verify run would write.
+VFX="$STATEROOT/$LOCK_ACCT"
+install -d -m 750 -o root -g "$LOCK_ACCT" "$VFX"
+vfixture() { # <line>...: the fixture status file, root's and group-readable
+  printf '%s\n' "$@" >"$VFX/verify"
+  chown "root:$LOCK_ACCT" "$VFX/verify"
+  chmod 640 "$VFX/verify"
+}
+NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+vfixture "at=$NOW_ISO" "interval=900" "records=3" "drifted=0"
+locked_as "$LOCK_ACCT" status >"$POOL" 2>&1
+ok   "a clean run reads as clean"               grep -qF "last verify: ✓  clean" "$POOL"
+deny "and not as stale"                         grep -qF "stale" "$POOL"
+
+vfixture "at=$NOW_ISO" "interval=900" "records=3" "drifted=3" \
+         "drift=/a/one" "drift=/a/caf\\xc3\\xa9"
+locked_as "$LOCK_ACCT" status >"$POOL" 2>&1
+ok   "drift reads as drift, with its count"     grep -qF "last verify: ✗  3 drifted" "$POOL"
+ok   "the recorded paths are listed as written" grep -qF "      /a/caf\\xc3\\xa9" "$POOL"
+ok   "the uncapped remainder is counted"        grep -qF "and 1 more" "$POOL"
+
+vfixture "at=2026-01-01T00:00:00Z" "interval=900" "records=3" "drifted=0"
+locked_as "$LOCK_ACCT" status >"$POOL" 2>&1
+ok   "an old clean run still says what it found" grep -qF "last verify: ✓  clean" "$POOL"
+ok   "and that it is stale"                     grep -qF "note: that run is stale; the timer runs every 900s" "$POOL"
+
+vfixture "at=$NOW_ISO" "interval=soon" "drifted=0"
+locked_as "$LOCK_ACCT" status >"$POOL" 2>&1
+ok   "a malformed status says so"               grep -qF "last verify: ✗  $VFX/verify is malformed" "$POOL"
+
+rm -f -- "$VFX/verify"
+rmdir -- "$VFX"
 
 # ---- 3. nix deploy guards --------------------------------------------------
 #
@@ -946,12 +1014,11 @@ chmod 755 "$ANC"
 
 locked_it() { # <install_target> <args...>: locked with a specific INSTALL_TARGET
   local it="$1"; shift
-  env SNAPSHOTS_ROOT="$SNAPROOT" \
+  env LOCKED_STATE_ROOT="$STATEROOT" \
       INSTALL_TARGET="$it" \
       LOCKED_HELPER="$HELPER" \
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$FAKE_HOME" \
-      LOCKED_ALERT_DIR="$ALERTS" \
       SUDO_USER="$INV" \
       /bin/bash "$LOCKED" "$@"
 }
@@ -1057,20 +1124,20 @@ OUTF="$SCRATCH/mediated-out.txt"
 
 # Pool-file locations, mirroring locked's encode()/snap_paths().
 enc_path() { printf '%s' "$1" | sed -e 's|%|%25|g' -e 's|/|%2F|g'; }
-# The pool a fixture path's records live in: an alternate home's own (see
-# pool_for_home), or the main one.
-pool_of() { # <path>
+# The state root a fixture path's records live under: an alternate home's
+# own (see state_for_home), or the main one.
+state_of() { # <path>
   local rest
   case "$1" in
     "$SCRATCH"/usersdir/*|"$SCRATCH"/ttyusers/*|"$SCRATCH"/lpusers/*|"$SCRATCH"/wpusers/*|"$SCRATCH"/aclusers/*)
       rest="${1#"$SCRATCH"/}"
-      printf '%s/pools/%s' "$SCRATCH" "${rest%%/*}"
+      printf '%s/states/%s' "$SCRATCH" "${rest%%/*}"
       ;;
-    *) printf '%s' "$SNAPROOT" ;;
+    *) printf '%s' "$STATEROOT" ;;
   esac
 }
-meta_path() { printf '%s' "$(pool_of "$1")/$INV/$(enc_path "$1").meta"; }
-snap_path() { printf '%s' "$(pool_of "$1")/$INV/$(enc_path "$1").snap"; }
+meta_path() { printf '%s' "$(state_of "$1")/$INV/pool/$(enc_path "$1").meta"; }
+snap_path() { printf '%s' "$(state_of "$1")/$INV/pool/$(enc_path "$1").snap"; }
 meta_get() { # <path> <field>: empty when there is no record
   local m
   m="$(meta_path "$1")"
@@ -1352,12 +1419,11 @@ mkfake() { # <name> <sh line>...: install a stand-in helper, print its path
 }
 locked_fake() { # <helper> <args...>: locked with a stand-in LOCKED_HELPER
   local h="$1"; shift
-  env SNAPSHOTS_ROOT="$SNAPROOT" \
+  env LOCKED_STATE_ROOT="$STATEROOT" \
       INSTALL_TARGET="$SCRATCH/not-installed" \
       LOCKED_HELPER="$h" \
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$FAKE_HOME" \
-      LOCKED_ALERT_DIR="$ALERTS" \
       SUDO_USER="$INV" \
       /bin/bash "$LOCKED" "$@"
 }
@@ -1427,17 +1493,17 @@ as_user /bin/sh -c "echo t > '$TRD/t.txt'"
 # An empty SUDO_USER is answered by the sudo guard, before do_trash_one's
 # own no-invoker check ever runs; this is what the case actually produces.
 refuse "trash without an invoking user"        "must be invoked via sudo" \
-       env SNAPSHOTS_ROOT="$SNAPROOT" INSTALL_TARGET="$SCRATCH/not-installed" \
+       env LOCKED_STATE_ROOT="$STATEROOT" INSTALL_TARGET="$SCRATCH/not-installed" \
            LOCKED_HELPER="$HELPER" LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
-           LOCKED_USER_HOME="$FAKE_HOME" LOCKED_ALERT_DIR="$ALERTS" SUDO_USER= \
+           LOCKED_USER_HOME="$FAKE_HOME" SUDO_USER= \
            /bin/bash "$LOCKED" trash --yes "$TRD/t.txt"
 refuse "trash refuses a root invoker"          "the invoker is root" \
-       env SNAPSHOTS_ROOT="$SNAPROOT" INSTALL_TARGET="$SCRATCH/not-installed" \
+       env LOCKED_STATE_ROOT="$STATEROOT" INSTALL_TARGET="$SCRATCH/not-installed" \
            LOCKED_HELPER="$HELPER" LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
-           LOCKED_USER_HOME="$FAKE_HOME" LOCKED_ALERT_DIR="$ALERTS" SUDO_USER=root \
+           LOCKED_USER_HOME="$FAKE_HOME" SUDO_USER=root \
            /bin/bash "$LOCKED" trash --yes "$TRD/t.txt"
 ok   "the file survived both refusals"         test -f "$TRD/t.txt"
-rmdir -- "$SNAPROOT/root" 2>/dev/null || true
+rmdir -- "$STATEROOT/root/pool" "$STATEROOT/root" 2>/dev/null || true
 
 NWD="$MED/nowrite"
 install -d -o "$LOCK_ACCT" -g "$LOCK_ACCT" -m 700 "$NWD"
@@ -1881,7 +1947,7 @@ ok   "verify clean after the plan round"       locked verify --quiet
 # chain record nothing needs any more is released by the next gated plan:
 # lock, unprotect, rm, or the lock plan mv runs for a moved leaf.
 #
-# Each home below has its own pool (see pool_for_home).
+# Each home below has its own state root (see state_for_home).
 
 note "== chain: the leaf's own parent is left alone =="
 LPSTOP="$SCRATCH/lpusers"
@@ -2375,6 +2441,56 @@ ok   "unprotect releases the 700 dir"          grep -qF "released: $ACL7" "$ACOU
 check "back to the invoker, unflagged"         "$INV staff 700 -" "$(stat -f '%Su %Sg %OLp %Sf' "$ACL7")"
 check "with only Apple's entry left"           "group:everyone deny delete" "$(acl_h "$ACL7")"
 ok   "verify clean after the releases"         locked_home "$ACHOME" verify --quiet
+
+# ---- 7. one-shot layout conversion -----------------------------------------
+#
+# 0.14.0 kept each pool at <legacy root>/<user>; the first root invocation
+# of 0.15.0 moves it to <state root>/<user>/pool. Own roots here, so the
+# conversion cannot meet the pools every section above built.
+
+note "== conversion: legacy pools move into the new layout =="
+CONV_STATE="$SCRATCH/conv-state"
+CONV_LEGACY="$SCRATCH/conv-legacy"
+locked_conv() { # <args...>: a root run as launchd makes it, no invoker
+  env LOCKED_STATE_ROOT="$CONV_STATE" \
+      LOCKED_LEGACY_ROOT="$CONV_LEGACY" \
+      INSTALL_TARGET="$SCRATCH/not-installed" \
+      LOCKED_HELPER="$HELPER" \
+      LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
+      LOCKED_USER_HOME="$FAKE_HOME" \
+      SUDO_USER= \
+      /bin/bash "$LOCKED" "$@"
+}
+legacy_pool() { # <user>: a 0.14.0-shaped pool with one record file in it
+  install -d -m 711 -o root -g wheel "$CONV_LEGACY"
+  install -d -m 750 -o "$LOCK_ACCT" -g "$LOCK_ACCT" "$CONV_LEGACY/$1" "$CONV_LEGACY/$1/.staging"
+  install -m 600 -o "$LOCK_ACCT" -g "$LOCK_ACCT" /dev/null "$CONV_LEGACY/$1/x.snap"
+}
+legacy_pool "$INV"
+legacy_pool other
+POOL_INO="$(stat -f '%i' "$CONV_LEGACY/$INV")"
+ok   "verify converts every user's pool"       locked_conv verify --quiet
+deny "the legacy root is gone"                 test -e "$CONV_LEGACY"
+check "the pool moved, not copied"             "$POOL_INO" "$(stat -f '%i' "$CONV_STATE/$INV/pool")"
+check "and kept its owner and mode"            "$LOCK_ACCT $LOCK_ACCT 750" "$(stat -f '%Su %Sg %OLp' "$CONV_STATE/$INV/pool")"
+ok   "with its contents"                       test -f "$CONV_STATE/$INV/pool/x.snap"
+check "the new per-user dir is root's"         "root $LOCK_ACCT 750" "$(stat -f '%Su %Sg %OLp' "$CONV_STATE/$INV")"
+ok   "the other user's pool moved too"         test -f "$CONV_STATE/other/pool/x.snap"
+ok   "and the same run wrote both statuses"    test -f "$CONV_STATE/$INV/verify" -a -f "$CONV_STATE/other/verify"
+ok   "a second run finds nothing to convert"   locked_conv verify --quiet
+
+note "== conversion: nothing merges, nothing is left behind silently =="
+legacy_pool "$INV"
+refuse "a pool at both paths refuses"          "a pool exists at both $CONV_LEGACY/$INV and $CONV_STATE/$INV/pool" \
+       locked_conv verify --quiet
+ok   "and moves nothing"                       test -f "$CONV_LEGACY/$INV/x.snap"
+rm -rf -- "${CONV_LEGACY:?}/$INV"
+install -d -m 700 -o root -g wheel "$CONV_LEGACY/.stray"
+refuse "a stray entry keeps the legacy root"   "$CONV_LEGACY still holds entries after the move" \
+       locked_conv verify --quiet
+ok   "and is left where it was"                test -d "$CONV_LEGACY/.stray"
+rm -rf -- "$CONV_LEGACY"
+ok   "with the legacy root gone, runs pass"    locked_conv verify --quiet
 
 # ---- summary ---------------------------------------------------------------
 
