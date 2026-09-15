@@ -336,17 +336,30 @@ either fails closed or approves blind; there is no third behaviour. A
 diff is only a witness while a human is reading it, so the mutating verbs
 belong in a real terminal.
 
-## Detection layer: `locked verify` + alerts
+## Detection layer: `locked verify` + the verify status
 
 Flags deny with silent EPERM -- the attacker sees the failure, the user
 does not. `locked verify` re-checks every locked chain (existence, owner,
 group, mode, full flag word, recursive-tree spot checks) and exits
 nonzero on drift; it also catches a ceremony that forgot to relock. A
-root LaunchDaemon runs it on a timer; failures raise
-`~/.local/state/agents/claude/alerts/locked--drift` (one timestamped
-ASCII line, statusline renders it as a red row), cleared on clean
-re-verify. The alert file is staged in the root-owned snapshots dir and
-renamed into place so a planted symlink is replaced, never followed.
+root LaunchDaemon runs it on a timer, and each run records its result per
+user in `/var/db/locked/<user>/verify`: when it ran, the timer's interval,
+how many records it walked, how many drifted, and which (escaped to
+printable ASCII, capped). locked names no consumer. `locked status` shows
+it, and any other reader -- a statusline, a login check -- knows the path.
+
+The status is root's alone. The per-user dir is root-owned 750 with the
+lock group, so the user reads it through their membership and no process
+running as the user can write, replace or remove anything in it; the file
+is replaced whole by a rename from a temp in that dir, so a reader gets
+one run's complete answer. The run's start time is in the file because a
+timer can stop: a reader that finds the result older than a few intervals
+reports it as stale rather than clean. (Until 0.15.0 the result was an
+alert file written as the user under their home, which any process
+running as the user could delete.)
+
+What this does not cover: a reader sees drift only as of the last run, up
+to one interval late, and while the machine sleeps nothing runs.
 EndpointSecurity/eslogger EPERM-monitoring is explicitly later.
 
 ## Kept from v1

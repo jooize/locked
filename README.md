@@ -76,8 +76,9 @@ Three tiers, named by what they protect:
   constraint. No `sudo` needed.
 - `locked status [<path>]` -- verify and print the full chain for each
   path. With no path, lists every node in your pool (tier, flag, and any
-  drift) so you can see at a glance what is currently locked; reporting
-  only, so it exits 0 even on drift and never touches the alert file.
+  drift) so you can see at a glance what is currently locked, then what
+  the last `verify` run found and when; reporting only, so it exits 0
+  even on drift and never writes the verify status.
   The one action that needs no `sudo`: it is read-only, and it shows your
   own pool only -- another user's pool is unreadable to you. One caveat,
   printed by the tool itself: without root the recursive interior of a
@@ -85,8 +86,10 @@ Three tiers, named by what they protect:
   status gives leaf checks only there; `sudo locked status` is the
   authoritative view.
 - `sudo locked verify` -- re-check every locked node against its meta;
-  exit 5 on drift; raises/clears the `locked--drift` statusline alert. A
-  launchd timer (installed by setup) runs this every 15 minutes.
+  exit 5 on drift. A launchd timer (installed by setup) runs this every
+  15 minutes and records each result in `/var/db/locked/<user>/verify`
+  (see [State layout](#state-layout)), where `locked status` and any
+  other reader find it without `sudo`.
 - `sudo locked setup` -- one-shot install + provision (see below).
 
 Tests: `sudo /bin/bash tests/harness.bash` (scratch-dir only; stands in
@@ -312,22 +315,38 @@ mount-table question, not a tier question.
 | `~/Library/Application Support` | no | only that directory's parent |
 | `~/Library/LaunchAgents` | content dir | you protect it |
 
-## Snapshot layout
+## State layout
 ```
-/var/db/locked-snapshots/             mode 711  root:wheel
-└── jooize/                            mode 750  _jooize-lock
-    ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.snap   mode 600  _jooize-lock
-    ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.attic  mode 600
-    └── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.meta   mode 640
+/var/db/locked/                        mode 711  root:wheel
+└── jooize/                            mode 750  root:_jooize-lock
+    ├── pool/                          mode 750  _jooize-lock:_jooize-lock
+    │   ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.snap   mode 600
+    │   ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.attic  mode 600
+    │   └── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.meta   mode 640
+    └── verify                         mode 640  root:_jooize-lock
 ```
-The root dir is execute-only (711): you can reach the one pool whose name
-you already know, but the user list is not enumerable. Your own pool dir is
-group-readable (750) by `_jooize-lock`, which you are a member of, so
-`locked status` works without `sudo`; another user's pool belongs to a
-different lock group and the kernel refuses it. Only `.meta` follows -- it
-records identity and lock state, not content -- while `.snap`, `.attic` and
-`.staging` keep their 600/700 shapes. Every root invocation re-applies these
-modes, so an older 700 deployment converges on its own.
+The root dir is execute-only (711): you can reach the one dir whose name
+you already know, but the user list is not enumerable. Your own dir and
+pool are group-readable (750) by `_jooize-lock`, which you are a member
+of, so `locked status` works without `sudo`; another user's belong to a
+different lock group and the kernel refuses them. In the pool only `.meta`
+follows -- it records identity and lock state, not content -- while
+`.snap`, `.attic` and `.staging` keep their 600/700 shapes. Every root
+invocation re-applies these modes.
+
+`verify` is the result of the last verify run, one `key=value` per line:
+`at` (UTC start time), `interval` (the timer's period in seconds; a result
+older than three intervals is stale), `records`, `drifted` (the count),
+then one `drift=<path>` line per drifted path, at most 20. Every byte of a
+path outside printable ASCII, and the backslash, is written as `\xHH`, so
+each line is printable ASCII and no file name can add a line of its own.
+The file is replaced whole by a rename in a dir only root can write: a
+reader always gets one run's complete answer, and nothing running as you
+can change or remove it.
+
+Up to 0.14.0 each pool sat at `/var/db/locked-snapshots/<user>`. The first
+root invocation of 0.15.0 moves every pool into `<user>/pool` by rename and
+removes the emptied old root; it refuses to merge a pool found at both.
 
 - `.snap` -- pre-edit baseline, overwritten on each unlock (`.snapdir` for
   content-tier directories).
@@ -355,7 +374,7 @@ The `owner`/`group`/`mode` restore targets are captured on the first `lock` of a
 **content.** `unlock`, `lock` and `revert` chown and chmod the node back to the recorded values. So:
 - Accidental `chmod 666 ~/.ssh/authorized_keys` while unlocked -- next lock restores the captured mode.
 - An attacker that gets a single chmod through (somehow) is undone the next cycle.
-- To intentionally change the captured mode/owner, edit `.meta` directly: `sudo -u _jooize-lock vi /var/db/locked-snapshots/jooize/<encoded>.meta`. (Or `unprotect` it and `lock` it again: a fresh seal recaptures them.)
+- To intentionally change the captured mode/owner, edit `.meta` directly: `sudo -u _jooize-lock vi /var/db/locked/jooize/pool/<encoded>.meta`. (Or `unprotect` it and `lock` it again: a fresh seal recaptures them.)
 
 **placement.** `unlock` clears `uappnd` and nothing else. The directory stays lock-account owned, with its ACL entry, for the whole window, on purpose: the owner has to be the lock account because `uappnd` is a user flag its owner could clear, and the entry is the one way you still reach into it. The entry only adds, so even with the flag off you cannot rename or remove what is in the directory -- `locked rm` and `locked mv` do that, as root. The recorded `owner`/`group`/`mode` are the pre-adoption identity, not a restore target for an unlock. The next `lock` of a file whose chain runs through it re-applies the flag, and refuses if the entry is gone. The one place that identity *is* restored is a release: once no protected file needs the directory it leaves the pool, so it goes all the way back -- flag off, the seal's entry off, owner, group and mode as they were.
 
@@ -404,7 +423,7 @@ and does not guarantee is written out in
 ## Atomicity and TOCTOU
 
 Snapshot/attic/restore writes go through `atomic_replace`:
-1. The helper copies the source into `/var/db/locked-snapshots/<user>/.staging/replace.XXXXXX` (lock-account-owned, mode 700 -- invisible to user UID) from a file descriptor it opened `O_NOFOLLOW` and identity-checked against the volume uuid and inode `locked` expected -- a source swapped between resolution and open is refused, not copied.
+1. The helper copies the source into `/var/db/locked/<user>/pool/.staging/replace.XXXXXX` (lock-account-owned, mode 700 -- invisible to user UID) from a file descriptor it opened `O_NOFOLLOW` and identity-checked against the volume uuid and inode `locked` expected -- a source swapped between resolution and open is refused, not copied.
 2. `chown` and `chmod` the staged temp file.
 3. Verify staging and destination are on the same filesystem (`stat -f '%d'`).
 4. `mv -f` -- atomic same-filesystem rename.
