@@ -124,8 +124,8 @@ let
       /usr/bin/dscl . -create "/Users/${lockAccount}" IsHidden 1
       /usr/bin/dscacheutil -flushcache
     fi
-    # Membership grants add-rights in placement-tier dirs; asserted on
-    # every activation.
+    # Membership is what reads the user's own pool (unprivileged
+    # `locked status`); asserted on every activation.
     /usr/sbin/dseditgroup -o edit -a "${cfg.user}" -t user "${lockAccount}" 2>/dev/null || true
   '';
 in
@@ -138,9 +138,9 @@ in
       description = ''
         The human operator: granted sudo for the locked binary
         (digest-pinned, no NOPASSWD) and made a member of the lock group,
-        which carries add-rights in placement-tier directories. The lock
-        account and group are named _<user>-lock, matching the script's
-        own derivation.
+        which can read the user's own pool records. The lock account and
+        group are named _<user>-lock, matching the script's own
+        derivation.
       '';
     };
 

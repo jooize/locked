@@ -14,9 +14,9 @@
 # before removing it. Ancestry fixtures live in a second scratch under
 # /var/db (the 1777 /private/tmp would itself fail the walk), and the
 # window helper this harness builds lives in a third one there for the same
-# reason; both are removed by the trap. Group-write add-rights on placement
-# dirs depend on membership in the real _<user>-lock group and are exercised
-# at ceremony time, not here.
+# reason; both are removed by the trap. Add rights on placement dirs come
+# from an ACL entry naming the invoker, not from a group, so the daemon
+# stand-in exercises them here too (section 6).
 #
 # One thing this harness cannot keep entirely to itself: if the trash
 # service is reachable from the terminal running it, the trash probe below
@@ -296,9 +296,10 @@ ok   "empty pool listing says so"        grep -qF "pool for $INV is empty" "$POO
 note "== cli: content-tier file lock provisions the chain =="
 as_user mkdir -- "$FAKE_HOME/sub"
 # 777 throughout this file's fixtures: where a dir IS adopted as placement,
-# the invoker keeps write via the OTHER bits (with the daemon stand-in they
-# are not in the lock group), so every denial stays attributable to a flag
-# rather than to ordinary permissions. This one is the leaf's own parent,
+# the invoker keeps full write via the OTHER bits (the seal's ACL entry
+# adds, never removes), so every denial stays attributable to a flag
+# rather than to ordinary permissions. Section 6 seals 755 and 700 dirs
+# instead, where the ACL entry is the only way in. This one is the leaf's own parent,
 # which the chain never provisions -- see section 5 at the end of the
 # file -- so it simply stays the invoker's.
 chmod 777 "$FAKE_HOME/sub"
@@ -1045,9 +1046,9 @@ refuse "setup refused when nix-managed" "nix-managed" locked_it "$SETUP_IT" setu
 #
 # Fixtures live under MED, whose stop node is SCRATCH (root:wheel 755).
 # Placement dirs are created 777 so the invoker keeps write through the
-# OTHER bits: with the daemon stand-in they are not in the lock group, and
+# OTHER bits: the seal's ACL entry grants add rights only, and
 # do_trash_one's parent-writability pre-check must pass for the ordinary
-# cases the way it does for a real placement dir's group write.
+# cases. A real 755 placement dir refuses trash; section 6 shows it.
 
 note "== mediated: fixtures =="
 MED="$SCRATCH/med"
@@ -1061,7 +1062,7 @@ enc_path() { printf '%s' "$1" | sed -e 's|%|%25|g' -e 's|/|%2F|g'; }
 pool_of() { # <path>
   local rest
   case "$1" in
-    "$SCRATCH"/usersdir/*|"$SCRATCH"/ttyusers/*|"$SCRATCH"/lpusers/*|"$SCRATCH"/wpusers/*)
+    "$SCRATCH"/usersdir/*|"$SCRATCH"/ttyusers/*|"$SCRATCH"/lpusers/*|"$SCRATCH"/wpusers/*|"$SCRATCH"/aclusers/*)
       rest="${1#"$SCRATCH"/}"
       printf '%s/pools/%s' "$SCRATCH" "${rest%%/*}"
       ;;
@@ -1678,10 +1679,11 @@ check "recorded as a chain node"               "chain" "$(meta_get "$PLD" role)"
 check "and the leaf as a leaf"                 "leaf" "$(meta_get "$PLL" role)"
 ok   "unlock the placement dir"                locked unlock "$PLD"
 check "the unlocked dir keeps the lock account" "$LOCK_ACCT" "$(owner_of "$PLD")"
-check "and keeps its placement mode"           "770" "$(stat -f '%OLp' "$PLD")"
-# An entry born under the seal carries the lock group by BSD inheritance,
-# and a content-tier relock would refuse the tree for exactly that. This is
-# the 2026-09-09 failure: unlock said placement, lock assumed content.
+check "and keeps its own mode"                 "750" "$(stat -f '%OLp' "$PLD")"
+# A tree under the dir whose group differs from the leaf's would make a
+# content-tier relock refuse it as mixed ownership. Before 0.14.0 every
+# entry born under a seal did differ -- it took the lock group -- and this
+# is the 2026-09-09 failure: unlock said placement, lock assumed content.
 mkdir -p -- "$PLD/sub"
 chgrp wheel "$PLD/sub"
 locked lock --yes "$PLL" >"$OUTF" 2>&1 || true
@@ -2238,6 +2240,141 @@ check "Library stays for the ghostty prefs"    "uappnd" "$(flags_of "$WPHOME/Lib
 check "the home stays the anchor"              "sappnd" "$(flags_of "$WPHOME")"
 check "the link is still sealed as itself"     "uchg" "$(flags_of "$WPHOME/.claude/settings.json")"
 ok   "verify clean after the unprotect"        locked_home "$WPHOME" verify --quiet
+
+# ---- 6. placement: the way in is one ACL entry -------------------------------
+#
+# A placement seal hands the directory to the lock account, keeps its group
+# and mode, and lets the invoker back in through one ACL entry: add rights,
+# never delete or delete_child, no inherit flags. The entry names the
+# invoker's uid, so unlike the lock-group door it replaced it works with
+# the daemon stand-in -- and these fixtures are 755 and 700, with no group
+# or other write, so every add below goes through the entry and nothing
+# else. The 700 dir carries Apple's own ~/Library entry, which lock must
+# keep and release must leave.
+
+note "== placement: sealed with an ACL entry, group and mode kept =="
+ACSTOP="$SCRATCH/aclusers"
+install -d -m 755 -o root -g wheel "$ACSTOP"
+ACHOME="$ACSTOP/home"
+install -d -o "$INV" -g staff -m 755 "$ACHOME"
+ACD="$ACHOME/cfg"          # the ~/.config shape
+ACL7="$ACHOME/Library"     # the ~/Library shape
+install -d -o "$INV" -g staff -m 755 "$ACD" "$ACD/app"
+install -d -o "$INV" -g staff -m 700 "$ACL7" "$ACL7/prefs"
+chmod +a "group:everyone deny delete" "$ACL7"
+as_user /bin/sh -c "echo a > '$ACD/app/a.conf'; echo p > '$ACL7/prefs/p.plist'"
+ACE="user:$INV allow list,add_file,search,add_subdirectory,readattr,readextattr,readsecurity"
+ACOUT="$SCRATCH/acl.out"
+acl_h() { /bin/ls -ledq -- "$1" | sed -e 1d -e 's/^ *[0-9][0-9]*: //'; }
+acl_has_h() { local e; e="$(acl_h "$1")"; printf '%s\n' "$e" | grep -qxF -- "$2"; }
+
+ok   "lock a leaf under the 755 dir"           locked_home "$ACHOME" lock --yes "$ACD/app/a.conf"
+ok   "lock a leaf under the 700 dir"           locked_home "$ACHOME" lock --yes "$ACL7/prefs/p.plist"
+check "the 755 dir: lock account, group and mode kept" \
+      "$LOCK_ACCT staff 755 uappnd" "$(stat -f '%Su %Sg %OLp %Sf' "$ACD")"
+check "the 700 dir: the same"                  \
+      "$LOCK_ACCT staff 700 uappnd" "$(stat -f '%Su %Sg %OLp %Sf' "$ACL7")"
+check "the record carries the entry"           "$ACE" "$(meta_get "$ACD" acl)"
+check "and the record the dir's own mode"      "755" "$(meta_get "$ACD" lockmode)"
+ok   "the 755 dir carries the entry"           acl_has_h "$ACD" "$ACE"
+ok   "the 700 dir carries it too"              acl_has_h "$ACL7" "$ACE"
+ok   "next to Apple's entry, which stays"      acl_has_h "$ACL7" "group:everyone deny delete"
+ok   "verify clean after both seals"           locked_home "$ACHOME" verify --quiet
+
+note "== placement: the entry adds, and entries keep their group =="
+ok   "the invoker adds a file"                 as_user /bin/sh -c "echo n > '$ACD/new.txt'"
+check "which takes the dir's group"            "staff" "$(stat -f '%Sg' "$ACD/new.txt")"
+check "and no ACL"                             "" "$(acl_h "$ACD/new.txt")"
+ok   "the invoker adds a directory"            as_user mkdir -- "$ACD/newdir"
+check "which takes the dir's group too"        "staff" "$(stat -f '%Sg' "$ACD/newdir")"
+check "and no ACL"                             "" "$(acl_h "$ACD/newdir")"
+ok   "and a grandchild inside it"              as_user /bin/sh -c "echo g > '$ACD/newdir/g.txt'"
+check "the grandchild as well"                 "staff" "$(stat -f '%Sg' "$ACD/newdir/g.txt")"
+ok   "the invoker lists the 700 dir"           as_user ls -- "$ACL7"
+ok   "and adds inside it"                      as_user /bin/sh -c "echo n > '$ACL7/new.plist'"
+deny "another user cannot list the 700 dir"    sudo -u nobody ls -- "$ACL7"
+
+note "== placement: what the invoker still cannot do =="
+deny "rename an entry"                         as_user mv -- "$ACD/new.txt" "$ACD/renamed.txt"
+deny "remove one"                              as_user rm -f -- "$ACD/new.txt"
+deny "strip the entry"                         as_user chmod -a "$ACE" "$ACD"
+deny "widen it"                                as_user chmod +a "user:$INV allow delete_child" "$ACD"
+deny "clear the flag"                          as_user chflags nouappnd "$ACD"
+deny "chmod the dir"                           as_user chmod 777 "$ACD"
+check "and the entry is exactly as sealed"     "$ACE" "$(acl_h "$ACD")"
+
+note "== placement: an unlock keeps the entry, and a relock needs it =="
+ok   "unlock the 755 dir"                      locked_home "$ACHOME" unlock "$ACD"
+check "the unlocked dir keeps owner, group and mode" \
+      "$LOCK_ACCT staff 755 -" "$(stat -f '%Su %Sg %OLp %Sf' "$ACD")"
+ok   "and the entry"                           acl_has_h "$ACD" "$ACE"
+deny "with the flag off, the entry alone still refuses a rename" \
+     as_user mv -- "$ACD/new.txt" "$ACD/renamed.txt"
+ok   "the file is where it was"                test -f "$ACD/new.txt"
+chmod -a "$ACE" "$ACD"
+refuse "a relock without the entry is refused" "no longer carries its ACL entry" \
+       locked_home "$ACHOME" lock --yes "$ACD/app/a.conf"
+check "and leaves the dir unflagged"           "" "$(flags_of "$ACD")"
+chmod +a "$ACE" "$ACD"
+locked_home "$ACHOME" lock --yes "$ACD/app/a.conf" >"$ACOUT" 2>&1 || true
+ok   "with the entry back, the plan relocks it" grep -qF "relocked: $ACD (placement)" "$ACOUT"
+check "the relocked dir is uappnd again"       "uappnd" "$(flags_of "$ACD")"
+ok   "verify clean after the relock"           locked_home "$ACHOME" verify --quiet
+
+note "== placement: verify reads the entry and the group =="
+chflags nouappnd "$ACD"; chmod -a "$ACE" "$ACD"; chflags uappnd "$ACD"
+if locked_home "$ACHOME" verify >"$ACOUT" 2>&1; then vrc=0; else vrc=$?; fi
+check "a missing entry is drift"               "5" "$vrc"
+ok   "and the drift names the entry"           grep -qF "ACL entry missing or changed" "$ACOUT"
+chflags nouappnd "$ACD"; chmod +a "$ACE,delete_child" "$ACD"; chflags uappnd "$ACD"
+if locked_home "$ACHOME" verify >"$ACOUT" 2>&1; then vrc=0; else vrc=$?; fi
+check "a widened entry is drift"               "5" "$vrc"
+chflags nouappnd "$ACD"; chmod -a "user:$INV allow delete_child" "$ACD"; chflags uappnd "$ACD"
+ok   "verify clean with the entry as sealed"   locked_home "$ACHOME" verify --quiet
+chflags nouappnd "$ACD"; chgrp wheel "$ACD"; chflags uappnd "$ACD"
+if locked_home "$ACHOME" verify >"$ACOUT" 2>&1; then vrc=0; else vrc=$?; fi
+check "a changed group is drift"               "5" "$vrc"
+ok   "and the drift names it"                  grep -qF "group wheel, expected staff" "$ACOUT"
+chflags nouappnd "$ACD"; chgrp staff "$ACD"; chflags uappnd "$ACD"
+ACDM="$(meta_path "$ACD")"
+sed '/^acl=/d' "$ACDM" >"$ACDM.tmp"
+mv -f "$ACDM.tmp" "$ACDM"
+chown "$LOCK_ACCT:$LOCK_ACCT" "$ACDM"
+chmod 640 "$ACDM"
+if locked_home "$ACHOME" verify >"$ACOUT" 2>&1; then vrc=0; else vrc=$?; fi
+check "a placement record without the entry is drift" "5" "$vrc"
+ok   "and says it predates 0.14.0"             grep -qF "written before locked 0.14.0" "$ACOUT"
+printf 'acl=%s\n' "$ACE" >>"$ACDM"
+ok   "verify clean with the record whole"      locked_home "$ACHOME" verify --quiet
+
+note "== placement: trash needs rights the entry does not give =="
+refuse "trash out of a placement dir is refused" "cannot write $ACD" \
+       locked_home "$ACHOME" trash --yes "$ACD/new.txt"
+ok   "the file is still there"                 test -f "$ACD/new.txt"
+locked_home "$ACHOME" why "$ACD/new.txt" >"$ACOUT" 2>&1 || true
+ok   "why still offers rm"                     grep -qF "sudo locked rm $ACD/new.txt" "$ACOUT"
+deny "and no longer offers trash"              grep -qF "sudo locked trash $ACD/new.txt" "$ACOUT"
+
+note "== placement: an entry of yours already there refuses the seal =="
+ACM="$ACHOME/mine"
+install -d -o "$INV" -g staff -m 755 "$ACM" "$ACM/in"
+chmod +a "user:$INV allow list" "$ACM"
+as_user /bin/sh -c "echo m > '$ACM/in/m.txt'"
+refuse "the seal would merge into it"          "already carries an ACL entry for $INV" \
+       locked_home "$ACHOME" lock --yes "$ACM/in/m.txt"
+check "the dir is untouched"                   "$INV staff 755 -" "$(stat -f '%Su %Sg %OLp %Sf' "$ACM")"
+check "and so is its entry"                    "user:$INV allow list" "$(acl_h "$ACM")"
+
+note "== placement: a release takes off the seal's entry and nothing else =="
+locked_home "$ACHOME" unprotect --yes "$ACD/app/a.conf" >"$ACOUT" 2>&1 || true
+ok   "unprotect releases the 755 dir"          grep -qF "released: $ACD" "$ACOUT"
+check "back to the invoker, unflagged"         "$INV staff 755 -" "$(stat -f '%Su %Sg %OLp %Sf' "$ACD")"
+check "with no ACL left"                       "" "$(acl_h "$ACD")"
+locked_home "$ACHOME" unprotect --yes "$ACL7/prefs/p.plist" >"$ACOUT" 2>&1 || true
+ok   "unprotect releases the 700 dir"          grep -qF "released: $ACL7" "$ACOUT"
+check "back to the invoker, unflagged"         "$INV staff 700 -" "$(stat -f '%Su %Sg %OLp %Sf' "$ACL7")"
+check "with only Apple's entry left"           "group:everyone deny delete" "$(acl_h "$ACL7")"
+ok   "verify clean after the releases"         locked_home "$ACHOME" verify --quiet
 
 # ---- summary ---------------------------------------------------------------
 
