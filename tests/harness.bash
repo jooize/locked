@@ -1291,7 +1291,12 @@ mkfake() { # <name> <sh line>...: install a stand-in helper, print its path
   local name="$1" tmp
   shift
   tmp="$SCRATCH/fake-build"
-  { echo '#!/bin/sh'; printf '%s\n' "$@"; } >"$tmp"
+  # A stand-in replaces only the window verb. `id` goes to the real helper:
+  # locked asks for an unrecorded parent's identity before the window opens,
+  # and a scripted body run there would act outside the window under test.
+  { echo '#!/bin/sh'
+    echo "[ \"\$1\" = id ] && exec '$HELPER' \"\$@\""
+    printf '%s\n' "$@"; } >"$tmp"
   install -m 755 -o root -g wheel "$tmp" "$HELPERDIR/$name"
   rm -f -- "$tmp"
   printf '%s' "$HELPERDIR/$name"
