@@ -82,7 +82,7 @@ ok() {   # ok <desc> <cmd...>: expect success; prints the output on failure
     PASS=$((PASS + 1)); note "  ok    $desc"
   else
     FAIL=$((FAIL + 1)); note "  FAIL  $desc (expected success)"
-    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/        | /'
+    if [ -n "$out" ]; then printf '%s\n' "$out" | sed 's/^/        | /'; fi
   fi
 }
 deny() { # deny <desc> <cmd...>: expect failure; prints the output on surprise
@@ -90,7 +90,7 @@ deny() { # deny <desc> <cmd...>: expect failure; prints the output on surprise
   local out
   if out="$("$@" 2>&1)"; then
     FAIL=$((FAIL + 1)); note "  FAIL  $desc (expected denial)"
-    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/        | /'
+    if [ -n "$out" ]; then printf '%s\n' "$out" | sed 's/^/        | /'; fi
   else
     PASS=$((PASS + 1)); note "  ok    $desc"
   fi
@@ -109,12 +109,12 @@ refuse() { # <desc> <needle> <cmd...>: expect failure WITH the named message,
   local out
   if out="$("$@" 2>&1)"; then
     FAIL=$((FAIL + 1)); note "  FAIL  $desc (expected refusal)"
-    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/        | /'
+    if [ -n "$out" ]; then printf '%s\n' "$out" | sed 's/^/        | /'; fi
   elif printf '%s\n' "$out" | grep -qF -e "$needle"; then
     PASS=$((PASS + 1)); note "  ok    $desc"
   else
     FAIL=$((FAIL + 1)); note "  FAIL  $desc (refused, but not with '$needle')"
-    [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/        | /'
+    if [ -n "$out" ]; then printf '%s\n' "$out" | sed 's/^/        | /'; fi
   fi
 }
 
