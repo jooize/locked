@@ -299,8 +299,8 @@ as_user mkdir -- "$FAKE_HOME/sub"
 # the invoker keeps write via the OTHER bits (with the daemon stand-in they
 # are not in the lock group), so every denial stays attributable to a flag
 # rather than to ordinary permissions. This one is the leaf's own parent,
-# which the chain no longer provisions -- see the leaf-parent section at the
-# end of the file -- so it simply stays the invoker's.
+# which the chain never provisions -- see section 5 at the end of the
+# file -- so it simply stays the invoker's.
 chmod 777 "$FAKE_HOME/sub"
 CFG="$FAKE_HOME/sub/we ird %config.txt"   # space + percent stress the encoding
 as_user /bin/sh -c "printf 'version 1\n' > '$CFG'"
@@ -527,13 +527,14 @@ note "== cli: ~/.ssh class -- anchor only, ownership never changes =="
 as_user mkdir -m 700 -- "$FAKE_HOME/.ssh"
 SSHCFG="$FAKE_HOME/.ssh/config"
 as_user /bin/sh -c "printf 'Host example\n' > '$SSHCFG'"
-deny "content tier refused under ~/.ssh" locked lock --yes --tier content "$SSHCFG"
-ok   "lock defaults to anchor"           locked lock --yes "$SSHCFG"
+refuse "there is no --tier to ask for"   "unknown option: --tier" \
+       locked lock --yes --tier content "$SSHCFG"
+ok   "lock takes the anchor tier here"   locked lock --yes "$SSHCFG"
 check "ssh config owner stays user"      "$INV" "$(owner_of "$SSHCFG")"
 check "ssh config flag defaults schg"    "schg" "$(flags_of "$SSHCFG")"
-# ~/.ssh is this leaf's own parent, and the leaf-parent rule exempts the
-# anchor: an anchor node never changes ownership, is never released, and
-# its sappnd is what holds the entries one level down.
+# ~/.ssh is this leaf's own parent, and an anchor stays in the chain
+# wherever it sits: it never changes ownership, and its sappnd is what
+# holds the entries one level down.
 check "ssh dir auto-anchored sappnd"     "sappnd" "$(flags_of "$FAKE_HOME/.ssh")"
 check "ssh dir owner stays user"         "$INV" "$(owner_of "$FAKE_HOME/.ssh")"
 deny "user write to schg ssh config"     as_user /bin/sh -c "echo evil >> '$SSHCFG'"
@@ -724,9 +725,15 @@ note "== cli: chain stop node whose group is not wheel =="
 # The real ~ walk stops at /Users, which macOS ships root:admin 755. The
 # stop-node check pins the owner and the mode, not the group name, so this
 # shape must lock exactly like a root:wheel stop node does.
+# Each alternate home gets its own pool, as it would in production: one
+# user, one home, one pool. The needed set a release plan is drawn from is
+# derived against the home's anchor, so two homes sharing one pool is a
+# state no real install reaches -- and one whose releases would be wrong.
+# pool_for_home names the pool after the home's root-owned stop directory.
+pool_for_home() { printf '%s/pools/%s' "$SCRATCH" "$(basename "$(dirname "$1")")"; }
 locked_home() { # <home> <args...>: locked with a different LOCKED_USER_HOME
   local h="$1"; shift
-  env SNAPSHOTS_ROOT="$SNAPROOT" \
+  env SNAPSHOTS_ROOT="$(pool_for_home "$h")" \
       INSTALL_TARGET="$SCRATCH/not-installed" \
       LOCKED_HELPER="$HELPER" \
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
@@ -768,7 +775,7 @@ set timeout 15
 # run is optional, so this same pattern still matches the uncolored prompt
 # (NO_COLOR, or a redirected stderr).
 set ynp {\[(\x1b\[[0-9;]*m)*y(\x1b\[[0-9;]*m)*/(\x1b\[[0-9;]*m)*N(\x1b\[[0-9;]*m)*\]}
-spawn env SNAPSHOTS_ROOT=$SNAPROOT INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME LOCKED_ALERT_DIR=$ALERTS SUDO_USER=$INV /bin/bash $LOCKED lock $TTYCFG
+spawn env SNAPSHOTS_ROOT=$(pool_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME LOCKED_ALERT_DIR=$ALERTS SUDO_USER=$INV /bin/bash $LOCKED lock $TTYCFG
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
@@ -777,7 +784,7 @@ expect {
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
-  "2 nodes to change"
+  "(2 seals)"
 }
 expect {
   timeout { exit 1 }
@@ -805,11 +812,11 @@ EOF
   TTYEXP2="$SCRATCH/tty-decline.exp"
   cat >"$TTYEXP2" <<EOF
 set timeout 15
-spawn env SNAPSHOTS_ROOT=$SNAPROOT INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME LOCKED_ALERT_DIR=$ALERTS SUDO_USER=$INV /bin/bash $LOCKED lock $TTYDEC
+spawn env SNAPSHOTS_ROOT=$(pool_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME LOCKED_ALERT_DIR=$ALERTS SUDO_USER=$INV /bin/bash $LOCKED lock $TTYDEC
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
-  "1 node to change"
+  "(1 seal)"
 }
 send "n\r"
 expect {
@@ -825,6 +832,31 @@ EOF
   check "the declined leaf keeps its owner"    "$INV" "$(owner_of "$TTYDEC")"
   check "the declined leaf carries no flag"    "" "$(flags_of "$TTYDEC")"
   check "the home anchor is still sealed"      "sappnd" "$(flags_of "$TTYHOME")"
+
+  # The unprotect gate names what else goes. Nothing else under this home
+  # is protected, so the anchor would be released along with the file.
+  TTYEXP3="$SCRATCH/tty-unprotect.exp"
+  cat >"$TTYEXP3" <<EOF
+set timeout 15
+spawn env SNAPSHOTS_ROOT=$(pool_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME LOCKED_ALERT_DIR=$ALERTS SUDO_USER=$INV /bin/bash $LOCKED unprotect $TTYCFG
+expect {
+  timeout { exit 1 }
+  eof     { exit 1 }
+  "and release 1 directory"
+}
+send "n\r"
+expect {
+  timeout { exit 1 }
+  eof
+}
+catch wait result
+exit [lindex \$result 3]
+EOF
+  TTYURC=0
+  /usr/bin/expect -f "$TTYEXP3" >/dev/null 2>&1 || TTYURC=$?
+  check "the unprotect gate names the release; n declines" "2" "$TTYURC"
+  check "the declined unprotect left the file sealed" "uchg" "$(flags_of "$TTYCFG")"
+  check "and left the anchor sealed"            "sappnd" "$(flags_of "$TTYHOME")"
 else
   note "  skip  interactive plan gate (no expect on this machine)"
 fi
@@ -1024,8 +1056,20 @@ OUTF="$SCRATCH/mediated-out.txt"
 
 # Pool-file locations, mirroring locked's encode()/snap_paths().
 enc_path() { printf '%s' "$1" | sed -e 's|%|%25|g' -e 's|/|%2F|g'; }
-meta_path() { printf '%s' "$SNAPROOT/$INV/$(enc_path "$1").meta"; }
-snap_path() { printf '%s' "$SNAPROOT/$INV/$(enc_path "$1").snap"; }
+# The pool a fixture path's records live in: an alternate home's own (see
+# pool_for_home), or the main one.
+pool_of() { # <path>
+  local rest
+  case "$1" in
+    "$SCRATCH"/usersdir/*|"$SCRATCH"/ttyusers/*|"$SCRATCH"/lpusers/*|"$SCRATCH"/wpusers/*)
+      rest="${1#"$SCRATCH"/}"
+      printf '%s/pools/%s' "$SCRATCH" "${rest%%/*}"
+      ;;
+    *) printf '%s' "$SNAPROOT" ;;
+  esac
+}
+meta_path() { printf '%s' "$(pool_of "$1")/$INV/$(enc_path "$1").meta"; }
+snap_path() { printf '%s' "$(pool_of "$1")/$INV/$(enc_path "$1").snap"; }
 meta_get() { # <path> <field>: empty when there is no record
   local m
   m="$(meta_path "$1")"
@@ -1124,12 +1168,16 @@ POOLF="$MED/pool-leaf.txt"
 as_user /bin/sh -c "echo p > '$POOLF'"
 ok   "lock a content leaf in the mediated area" locked lock --yes "$POOLF"
 deny "the leaf's own parent is not provisioned" test -f "$(meta_path "$MED")"
-# MED is every fixture's grandparent from here down, so it is sealed in
-# its own right -- the chain would only have reached it from a leaf two
-# levels below. Named directly, it keeps mode 777 through the adoption,
-# which is what leaves the invoker write via the OTHER bits.
-ok   "seal the mediated area as placement"     locked lock --yes --tier placement "$MED"
+# MED is every fixture's grandparent from here down. A chain directory is
+# never named, only derived, so a keeper leaf two levels below it seals it
+# and keeps it needed for the rest of the file. The adoption keeps mode
+# 777, which is what leaves the invoker write via the OTHER bits.
+install -d -o "$INV" -g staff -m 755 "$MED/keeper"
+as_user /bin/sh -c "echo k > '$MED/keeper/keep.txt'"
+ok   "a keeper leaf seals the mediated area"   locked lock --yes "$MED/keeper/keep.txt"
 check "the mediated area became placement"     "uappnd" "$(flags_of "$MED")"
+check "as a chain node"                        "chain" "$(meta_get "$MED" role)"
+check "and kept its mode"                      "777" "$(stat -f '%OLp' "$MED")"
 ok   "locked rm on a pool node"                locked rm --yes "$POOLF"
 deny "the pool node is gone"                   test -e "$POOLF"
 check "its record is retired"                  "retired" "$(meta_get "$POOLF" state)"
@@ -1416,10 +1464,10 @@ note "== trash: record side-effects (stand-in helpers) =="
 TRB="$TRD/withbin.txt"
 as_user /bin/sh -c "echo b > '$TRB'"
 ok   "lock the bin-location fixture"           locked lock --yes "$TRB"
-# TRB is a direct child, so that lock took TRD out of the chain: the
-# subtree records that kept it there were retired just above. The fakes
-# below are measured against a sealed parent, so the flag goes back by
-# hand -- idempotent, so this holds either way.
+# The rm --recursive above released TRD: once its subtree records were
+# retired, no protected file needed it. TRB is a direct child, whose own
+# parent the chain never seals. The fakes below are measured against a
+# sealed parent, so the flag goes on by hand.
 chflags -- uappnd "$TRD"
 FBIN="$MED/fakebin"
 install -d -o "$INV" -g staff -m 755 "$FBIN"
@@ -1506,7 +1554,7 @@ RETIRED="$VD/retired.txt"
 as_user /bin/sh -c "echo r > '$RETIRED'"
 put_meta "$RETIRED" \
   "owner=$INV" "group=staff" "mode=644" "lockmode=444" \
-  "tier=content" "flag=uchg" "flagsym=uchg" "id=1.1" "recursive=0" \
+  "tier=content" "flag=uchg" "flagsym=uchg" "id=1.1" "recursive=0" "role=leaf" \
   "state=retired" "via=rm" "by=$INV" "at=2026-08-25T00:00:00Z"
 locked verify >"$OUTF" 2>&1 || true
 deny "a retired record says nothing in verify" grep -qF "$RETIRED" "$OUTF"
@@ -1515,7 +1563,7 @@ ok   "verify is clean with a retired record"   locked verify --quiet
 FINALIZE="$VD/finalize.txt"
 put_meta "$FINALIZE" \
   "owner=$INV" "group=staff" "mode=644" "lockmode=444" \
-  "tier=content" "flag=uchg" "flagsym=uchg" "id=1.2" "recursive=0" \
+  "tier=content" "flag=uchg" "flagsym=uchg" "id=1.2" "recursive=0" "role=leaf" \
   "state=suspended" "by=$INV" "at=2026-08-25T00:00:00Z" "bin=$VD/bin/gone.txt"
 locked verify >"$OUTF" 2>&1 || true
 ok   "a vanished bin entry finalizes the suspension" \
@@ -1528,7 +1576,7 @@ STILL="$VD/still-binned.txt"
 as_user /bin/sh -c "echo s > '$VD/bin/still-binned.txt'"
 put_meta "$STILL" \
   "owner=$INV" "group=staff" "mode=644" "lockmode=444" \
-  "tier=content" "flag=uchg" "flagsym=uchg" "id=1.3" "recursive=0" \
+  "tier=content" "flag=uchg" "flagsym=uchg" "id=1.3" "recursive=0" "role=leaf" \
   "state=suspended" "by=$INV" "at=2026-08-25T00:00:00Z" \
   "bin=$VD/bin/still-binned.txt"
 locked verify >"$OUTF" 2>&1 || true
@@ -1539,7 +1587,7 @@ BACK="$VD/back.txt"
 as_user /bin/sh -c "echo b > '$BACK'"
 put_meta "$BACK" \
   "owner=$INV" "group=staff" "mode=644" "lockmode=444" \
-  "tier=content" "flag=uchg" "flagsym=uchg" "id=1.4" "recursive=0" \
+  "tier=content" "flag=uchg" "flagsym=uchg" "id=1.4" "recursive=0" "role=leaf" \
   "state=suspended" "by=$INV" "at=2026-08-25T00:00:00Z" "bin=$VD/bin/back.txt"
 if locked verify >"$OUTF" 2>&1; then vrc=0; else vrc=$?; fi
 check "a reappearance drifts"                  "5" "$vrc"
@@ -1618,13 +1666,16 @@ ok   "the drift names the identity"            grep -qF "(node replaced)" "$OUTF
 put_id "$IDL" "$("$HELPER" id "$IDL" | tr ':' '.')"
 ok   "verify clean once the record is right again" locked verify --quiet
 
-note "== lock: a relock keeps the tier the record names =="
+note "== lock: a chain directory reseals as placement through its leaf =="
 PLD="$MED/placearea"
 install -d -o "$INV" -g staff -m 750 "$PLD"
-# Named directly, because a leaf inside it would no longer provision it:
-# the chain leaves a leaf's own parent alone.
-ok   "adopt a dir as placement"                locked lock --yes --tier placement "$PLD"
+install -d -o "$INV" -g staff -m 755 "$PLD/inner"
+PLL="$PLD/inner/leaf.txt"
+as_user /bin/sh -c "echo p > '$PLL'"
+ok   "a leaf two levels down seals the dir"    locked lock --yes "$PLL"
 check "the dir was adopted as placement"       "placement" "$(meta_get "$PLD" tier)"
+check "recorded as a chain node"               "chain" "$(meta_get "$PLD" role)"
+check "and the leaf as a leaf"                 "leaf" "$(meta_get "$PLL" role)"
 ok   "unlock the placement dir"                locked unlock "$PLD"
 check "the unlocked dir keeps the lock account" "$LOCK_ACCT" "$(owner_of "$PLD")"
 check "and keeps its placement mode"           "770" "$(stat -f '%OLp' "$PLD")"
@@ -1633,20 +1684,20 @@ check "and keeps its placement mode"           "770" "$(stat -f '%OLp' "$PLD")"
 # the 2026-09-09 failure: unlock said placement, lock assumed content.
 mkdir -p -- "$PLD/sub"
 chgrp wheel "$PLD/sub"
-locked lock --yes "$PLD" >"$OUTF" 2>&1 || true
-ok   "the relock keeps the recorded tier"      grep -qF "relocked: $PLD (placement)" "$OUTF"
+locked lock --yes "$PLL" >"$OUTF" 2>&1 || true
+ok   "the leaf's plan relocks it as placement" grep -qF "relocked: $PLD (placement)" "$OUTF"
 deny "and never mentions mixed ownership"      grep -qF "mixed ownership" "$OUTF"
 deny "and never calls the placement mode drift" grep -qF "mode drifted" "$OUTF"
 check "the relocked dir is uappnd again"       "uappnd" "$(flags_of "$PLD")"
-refuse "a tier change on a recorded node is refused" "recorded as tier placement" \
-       locked lock --yes --tier content "$PLD"
+refuse "naming a chain directory is refused"  "sealed as a chain directory" \
+       locked lock --yes "$PLD"
 check "the refusal changed nothing"            "uappnd" "$(flags_of "$PLD")"
 check "the recorded tier still stands"          "placement" "$(meta_get "$PLD" tier)"
 
 note "== identity: a legacy record re-seals without an alarm =="
 ok   "unlock for the legacy re-seal"           locked unlock "$PLD"
 put_id "$PLD" "999.$(stat -f '%i' "$PLD")"
-locked lock --yes "$PLD" >"$OUTF" 2>&1 || true
+locked lock --yes "$PLL" >"$OUTF" 2>&1 || true
 ok   "the re-seal says the record was upgraded" grep -qF "identity record upgraded" "$OUTF"
 deny "and raises no REPLACED alarm"            grep -qF "REPLACED" "$OUTF"
 check "the re-sealed record is in volume form" "vol" "$(id_form_of "$(meta_get "$PLD" id)")"
@@ -1754,14 +1805,15 @@ check "the unlocked dangling link is back to the invoker" "$INV" "$(owner_of "$D
 check "and carries no flag"                    "" "$(flags_of "$DNG")"
 check "and still points where it did"          "$DNGT" "$(readlink "$DNG")"
 
-LNK2="$LNKD/link2.txt"
+# Under ~/.ssh the path takes the anchor tier, and a link cannot: the OS
+# checks resolve the path, so they judge the target and never the link.
+LNK2="$FAKE_HOME/.ssh/link2"
 as_user ln -s "$LNKT" "$LNK2"
-refuse "--tier placement on a link is refused" "does not apply to a link" \
-       locked lock --yes --tier placement "$LNK2"
-refuse "--tier anchor on a link is refused"    "does not apply to a link" \
-       locked lock --yes --tier anchor "$LNK2"
+refuse "a link under ~/.ssh is refused"        "does not apply to a link" \
+       locked lock --yes "$LNK2"
 check "the refused link keeps its owner"       "$INV" "$(owner_of "$LNK2")"
 deny "and got no record"                       test -f "$(meta_path "$LNK2")"
+ok   "the refused link leaves through rm"      locked rm --yes "$LNK2"
 
 note "== lock: the plan is derived first and gated once =="
 # Every seal used to ask for itself, so declining an ancestor left the leaf
@@ -1796,7 +1848,9 @@ deny "and got no record"                       test -f "$(meta_path "$PLANF")"
 check "the grandparent was not touched either" "" "$(flags_of "$PLAND")"
 check "and the grandparent keeps its owner"    "$INV" "$(owner_of "$PLAND")"
 
-ok   "seal the grandparent on its own"         locked lock --yes --tier placement "$PLAND"
+install -d -o "$INV" -g staff -m 777 "$PLAND/other"
+as_user /bin/sh -c "echo o > '$PLAND/other/o.txt'"
+ok   "another leaf's chain seals the grandparent" locked lock --yes "$PLAND/other/o.txt"
 locked_notty lock "$PLANF" >"$OUTF" 2>&1 || true
 ok   "the plan shows the sealed ancestor"      grep -q "already locked  *$PLAND" "$OUTF"
 ok   "and still offers the leaf"               grep -q "seal content  *$PLANF" "$OUTF"
@@ -1815,16 +1869,17 @@ ok   "a whole chain asks nothing"              grep -qF "already locked: $PLANF"
 deny "and prints no plan"                      grep -qF "plan for" "$OUTF"
 ok   "verify clean after the plan round"       locked verify --quiet
 
-# ---- 5. the leaf-parent rule -----------------------------------------------
+# ---- 5. the pool is what you asked to protect --------------------------------
 #
-# A node is held in place by its own flag or by an append-only parent, and
-# by nothing else. The leaf holds itself; the leaf's parent is held by the
-# grandparent. So a placement seal on the leaf's own parent added nothing
-# to the leaf's protection, while it refused every rmdir and temp+rename
-# the owning software performs inside that directory. The chain therefore
-# skips it -- except where that parent is an ANCHOR, which never changes
-# ownership, is never released, and whose sappnd is what holds the leaf
-# parents one level below it.
+# You name the leaves; every chain directory is derived from them. A node is
+# held in place by its own flag or by an append-only parent and by nothing
+# else, so the chain starts at the leaf's grandparent -- the leaf's own
+# parent is held by the grandparent's uappnd -- except where that parent is
+# the ANCHOR, whose sappnd is what holds the entries one level below it. A
+# chain record nothing needs any more is released by the next gated plan:
+# lock, unprotect, rm, or the lock plan mv runs for a moved leaf.
+#
+# Each home below has its own pool (see pool_for_home).
 
 note "== chain: the leaf's own parent is left alone =="
 LPSTOP="$SCRATCH/lpusers"
@@ -1838,20 +1893,24 @@ install -d -o "$INV" -g staff -m 755 "$LPB"
 LPF="$LPB/leaf.txt"
 as_user /bin/sh -c "echo lp > '$LPF'"
 LPB_BEFORE="$(stat -f '%Su %Sg %OLp' "$LPB")"
+LPF_ID0="$(stat -f '%Su:%Sg %OLp' "$LPF")"
 LPOUT="$SCRATCH/leafparent.out"
 
 locked_home "$LPHOME" lock --yes "$LPF" >"$LPOUT" 2>&1 || true
 check "the three-deep leaf is sealed"          "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$LPF")"
+check "recorded as a leaf"                     "leaf" "$(meta_get "$LPF" role)"
 check "the leaf parent is exactly as it was"   "$LPB_BEFORE" "$(stat -f '%Su %Sg %OLp' "$LPB")"
 check "and carries no flag"                    "" "$(flags_of "$LPB")"
 deny  "and got no record"                      test -f "$(meta_path "$LPB")"
 check "the grandparent is placement"           "uappnd" "$(flags_of "$LPA")"
 check "and went to the lock account"           "$LOCK_ACCT" "$(owner_of "$LPA")"
+check "recorded as a chain node"               "chain" "$(meta_get "$LPA" role)"
 check "the home above it is anchored"          "sappnd" "$(flags_of "$LPHOME")"
 check "the home keeps its owner"               "$INV" "$(owner_of "$LPHOME")"
+check "the anchor is a chain node too"         "chain" "$(meta_get "$LPHOME" role)"
 ok   "the plan listed the grandparent"         grep -q "seal placement  *$LPA\$" "$LPOUT"
 deny "and never listed the leaf parent"        grep -q "seal placement  *$LPB\$" "$LPOUT"
-ok   "verify clean after the three-deep lock"  locked verify --quiet
+ok   "verify clean after the three-deep lock"  locked_home "$LPHOME" verify --quiet
 
 note "== chain: what the leaf parent still refuses, and what it allows =="
 # Denials first, each with its flag-vs-noflag control below it.
@@ -1859,7 +1918,7 @@ deny "the invoker cannot move the leaf parent" as_user mv -- "$LPB" "$LPB.moved"
 deny "the invoker cannot move the leaf"        as_user mv -- "$LPF" "$LPB/moved.txt"
 deny "the invoker cannot remove the leaf"      as_user rm -f -- "$LPF"
 deny "and cannot write it"                     as_user /bin/sh -c "echo evil >> '$LPF'"
-# The point of the whole rule: the directory still works for its owner.
+# The point of the rule: the directory still works for its owner.
 ok   "a file is created inside the leaf parent" as_user /bin/sh -c "echo x > '$LPB/scratch.txt'"
 ok   "and removed again"                       as_user rm -f -- "$LPB/scratch.txt"
 ok   "a dir is created inside it"              as_user mkdir -- "$LPB/.oauth_refresh.lock"
@@ -1876,67 +1935,58 @@ check "the grandparent is sealed again"        "uappnd" "$(flags_of "$LPA")"
 ok   "unlock the leaf for the control"         locked_home "$LPHOME" unlock "$LPF"
 ok   "the unlocked leaf moves"                 as_user mv -- "$LPF" "$LPB/moved.txt"
 ok   "and moves back"                          as_user mv -- "$LPB/moved.txt" "$LPF"
-ok   "the unlocked leaf takes a write"         as_user /bin/sh -c "echo lp2 > '$LPF'"
 ok   "relock the leaf"                         locked_home "$LPHOME" lock --yes "$LPF"
 check "the leaf is sealed again"               "uchg" "$(flags_of "$LPF")"
-ok   "verify clean after the controls"         locked verify --quiet
+ok   "verify clean after the controls"         locked_home "$LPHOME" verify --quiet
 
-note "== chain: a pre-rule placement parent is released =="
-# Before the rule, every invoker-owned ancestor was sealed, the leaf's own
-# parent included. A lock under such a node un-provisions it: flag off,
-# then owner, group and mode back to what the record captured. That is not
-# an unlock -- an unlock keeps lock-account ownership because the seal is
-# coming back, and here it is not.
-MIGD="$LPA/mig"
-install -d -o "$INV" -g staff -m 777 "$MIGD"
-MIGB="$(stat -f '%Su %Sg %OLp' "$MIGD")"
-MIGF="$MIGD/leaf.txt"
-as_user /bin/sh -c "echo m > '$MIGF'"
-ok   "seal the parent as placement (old shape)" \
-     locked_home "$LPHOME" lock --yes --tier placement "$MIGD"
-check "it is lock-account owned"               "$LOCK_ACCT" "$(owner_of "$MIGD")"
-check "and carries uappnd"                     "uappnd" "$(flags_of "$MIGD")"
-locked_home "$LPHOME" lock --yes "$MIGF" >"$LPOUT" 2>&1 || true
-ok   "the plan announced the release"          \
-     grep -qF "release: $MIGD (leaf parent, leaves the chain)" "$LPOUT"
-check "the leaf is sealed"                     "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$MIGF")"
-check "the parent's identity is restored"      "$MIGB" "$(stat -f '%Su %Sg %OLp' "$MIGD")"
-check "its flag is gone"                       "" "$(flags_of "$MIGD")"
-check "its record is retired"                  "retired" "$(meta_get "$MIGD" state)"
-check "retired via the leaf-parent rule"       "leaf-parent" "$(meta_get "$MIGD" via)"
-check "retired by the invoker"                 "$INV" "$(meta_get "$MIGD" by)"
-ok   "the retirement carries a timestamp"      test -n "$(meta_get "$MIGD" at)"
-ok   "the released dir works for its owner"    as_user mkdir -- "$MIGD/d"
-ok   "including rmdir"                         as_user rmdir -- "$MIGD/d"
-ok   "verify clean after the release"          locked verify --quiet
+note "== unprotect: the file goes home, and so does the chain nothing else needs =="
+locked_home "$LPHOME" unprotect --dry-run "$LPF" >"$LPOUT" 2>&1 || true
+ok   "the plan names the file and its identity" grep -qF "$LPF (back to $LPF_ID0)" "$LPOUT"
+ok   "the plan releases the grandparent"       grep -q "^  release  *$LPA (no protected file needs it)" "$LPOUT"
+ok   "and the home anchor"                     grep -q "^  release  *$LPHOME (no protected file needs it)" "$LPOUT"
+LPR_A="$(grep -n "release  *$LPA " "$LPOUT" | cut -d: -f1)"
+LPR_H="$(grep -n "release  *$LPHOME " "$LPOUT" | cut -d: -f1)"
+ok   "releases read root-most first"           test "$LPR_H" -lt "$LPR_A"
+ok   "the dry run says nothing changed"        grep -qF "dry run: nothing changed" "$LPOUT"
+check "the dry run left the file sealed"       "uchg" "$(flags_of "$LPF")"
+check "and the grandparent"                    "uappnd" "$(flags_of "$LPA")"
+LPRC=0
+locked_home "$LPHOME" unprotect "$LPF" </dev/null >"$LPOUT" 2>&1 || LPRC=$?
+check "without a tty or --yes it declines"     "2" "$LPRC"
+check "and the record is untouched"            "locked" "$(meta_get "$LPF" state)"
 
-note "== chain: an UNLOCKED placement parent is released too =="
-# unlock keeps a placement node's lock-account identity and its mode on
-# purpose. The leaf-parent rule is the one place that does not, so the
-# release has to handle that record shape as well -- no flag to clear,
-# everything else the same.
-MIG2="$LPA/mig2"
-install -d -o "$INV" -g staff -m 777 "$MIG2"
-MIG2B="$(stat -f '%Su %Sg %OLp' "$MIG2")"
-MIG2F="$MIG2/leaf.txt"
-as_user /bin/sh -c "echo m2 > '$MIG2F'"
-ok   "seal it as placement"                    locked_home "$LPHOME" lock --yes --tier placement "$MIG2"
-ok   "then unlock it"                          locked_home "$LPHOME" unlock "$MIG2"
-check "the unlocked node keeps the lock account" "$LOCK_ACCT" "$(owner_of "$MIG2")"
-check "and carries no flag"                    "" "$(flags_of "$MIG2")"
-check "and its record says unlocked"           "unlocked" "$(meta_get "$MIG2" state)"
-locked_home "$LPHOME" lock --yes "$MIG2F" >"$LPOUT" 2>&1 || true
-ok   "the plan announced the release"          \
-     grep -qF "release: $MIG2 (leaf parent, leaves the chain)" "$LPOUT"
-check "the parent's identity is restored"      "$MIG2B" "$(stat -f '%Su %Sg %OLp' "$MIG2")"
-check "its record is retired"                  "retired" "$(meta_get "$MIG2" state)"
-check "retired via the leaf-parent rule"       "leaf-parent" "$(meta_get "$MIG2" via)"
-ok   "verify clean after the unlocked release" locked verify --quiet
+locked_home "$LPHOME" unprotect --yes "$LPF" >"$LPOUT" 2>&1 || true
+ok   "the file is unprotected"                 grep -qF "✓ unprotected: $LPF (back to $LPF_ID0)" "$LPOUT"
+check "it is the invoker's again"              "$LPF_ID0" "$(stat -f '%Su:%Sg %OLp' "$LPF")"
+check "with no flag"                           "" "$(flags_of "$LPF")"
+check "its record is retired"                  "retired" "$(meta_get "$LPF" state)"
+check "via unprotect"                          "unprotect" "$(meta_get "$LPF" via)"
+ok   "the grandparent is released"             grep -qF "✓ released: $LPA (back to $INV:staff 777)" "$LPOUT"
+check "back to its own identity"               "$INV staff 777" "$(stat -f '%Su %Sg %OLp' "$LPA")"
+check "with no flag"                           "" "$(flags_of "$LPA")"
+check "its record retired as unneeded"         "unneeded" "$(meta_get "$LPA" via)"
+ok   "the anchor is released"                  grep -qF "✓ released: $LPHOME (sappnd cleared)" "$LPOUT"
+check "the home carries no flag"               "" "$(flags_of "$LPHOME")"
+check "and never changed owner"                "$INV" "$(owner_of "$LPHOME")"
+deny "one result line per release"             grep -qF "record retired:" "$LPOUT"
+ok   "verify clean after unprotect"            locked_home "$LPHOME" verify --quiet
+refuse "unprotecting it again says so"         "not protected" \
+       locked_home "$LPHOME" unprotect --yes "$LPF"
 
-note "== chain: a shared ancestor keeps its placement seal =="
-# One leaf's parent can be another leaf's grandparent, and THERE its
-# uappnd is exactly what pins the entry below it. So it stays, and the
-# plan says on whose behalf.
+note "== lock: a path protected again starts fresh =="
+as_user /bin/sh -c "echo lp3 > '$LPF'"
+locked_home "$LPHOME" lock --yes "$LPF" >"$LPOUT" 2>&1 || true
+ok   "the plan seals the file anew"            grep -q "seal content  *$LPF\$" "$LPOUT"
+deny "and never calls it a relock"             grep -q "relock content" "$LPOUT"
+ok   "the witness starts from what it holds"   grep -qF "adopting into pool (no prior snapshot): $LPF" "$LPOUT"
+ok   "the snapshot is the new content"         cmp -s "$(snap_path "$LPF")" "$LPF"
+check "the record is live again"               "locked" "$(meta_get "$LPF" state)"
+ok   "the grandparent is sealed anew"          grep -q "seal placement  *$LPA\$" "$LPOUT"
+check "and carries its flag"                   "uappnd" "$(flags_of "$LPA")"
+check "the home is anchored again"             "sappnd" "$(flags_of "$LPHOME")"
+ok   "verify clean after the fresh seal"       locked_home "$LPHOME" verify --quiet
+
+note "== chain: a directory another leaf needs is kept, and says why when it goes =="
 SHD="$LPA/shared"
 install -d -o "$INV" -g staff -m 777 "$SHD"
 SHDEEP="$SHD/deep"
@@ -1944,40 +1994,114 @@ install -d -o "$INV" -g staff -m 777 "$SHDEEP"
 SH1="$SHD/near.txt"        # SHD is this leaf's own parent
 SH2="$SHDEEP/far.txt"      # SHD is this leaf's grandparent
 as_user /bin/sh -c "echo n > '$SH1'; echo f > '$SH2'"
-ok   "lock the deeper leaf first"              locked_home "$LPHOME" lock --yes "$SH2"
+ok   "lock the deeper leaf"                    locked_home "$LPHOME" lock --yes "$SH2"
 check "its grandparent took placement"         "uappnd" "$(flags_of "$SHD")"
-ok   "now lock the shallow leaf"               locked_home "$LPHOME" lock --yes "$SH1"
-check "the shallow leaf is sealed"             "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$SH1")"
-check "the shared node kept its flag"          "uappnd" "$(flags_of "$SHD")"
-check "and its record is still locked"         "locked" "$(meta_get "$SHD" state)"
-ok   "unlock the shallow leaf"                 locked_home "$LPHOME" unlock "$SH1"
 locked_home "$LPHOME" lock --yes "$SH1" >"$LPOUT" 2>&1 || true
-ok   "the re-lock plan says the node is kept"  \
-     grep -qF "kept: $SHD (placement; ancestor of $SH2)" "$LPOUT"
-deny "and never offers to release it"          grep -qF "release: $SHD" "$LPOUT"
-check "the shared node is still sealed"        "uappnd" "$(flags_of "$SHD")"
-check "and still lock-account owned"           "$LOCK_ACCT" "$(owner_of "$SHD")"
-ok   "verify clean with a shared ancestor"     locked verify --quiet
+check "the shallow leaf is sealed"             "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$SH1")"
+deny "its plan never offers to release the shared node" grep -q "release  *$SHD " "$LPOUT"
+check "the shared node kept its flag"          "uappnd" "$(flags_of "$SHD")"
+locked_home "$LPHOME" status "$SH1" >"$LPOUT" 2>&1 || true
+ok   "a recorded leaf parent prints as placement" grep -qF "✓  $SHD (placement uappnd)" "$LPOUT"
+deny "and not as the context row"              grep -qF "$SHD (not needed" "$LPOUT"
+
+locked_home "$LPHOME" unprotect --dry-run "$SH2" >"$LPOUT" 2>&1 || true
+ok   "a leaf's own parent says what holds it"  grep -qF "$SHD (not needed: $LPA keeps it in place)" "$LPOUT"
+deny "and the grandparent stays: another leaf needs it" grep -q "release  *$LPA " "$LPOUT"
+ok   "unprotect the deeper leaf"               locked_home "$LPHOME" unprotect --yes "$SH2"
+check "the shared node went home"              "$INV staff 777" "$(stat -f '%Su %Sg %OLp' "$SHD")"
+check "with no flag"                           "" "$(flags_of "$SHD")"
+check "the shallow leaf is still sealed"       "uchg" "$(flags_of "$SH1")"
+check "and its grandparent too"                "uappnd" "$(flags_of "$LPA")"
+locked_home "$LPHOME" status "$SH1" >"$LPOUT" 2>&1 || true
+ok   "status: the released parent is context"  grep -qF -- "-  $SHD (not needed: $LPA keeps it in place)" "$LPOUT"
+deny "and no retired row takes its place"      grep -qF "retired via" "$LPOUT"
+ok   "verify clean with the shared node gone"  locked_home "$LPHOME" verify --quiet
+
+note "== lock: a plan releases what nothing needs any more =="
+ORD="$LPA/orphan"
+install -d -o "$INV" -g staff -m 777 "$ORD"
+install -d -o "$INV" -g staff -m 755 "$ORD/in"
+ORF="$ORD/in/o.txt"
+as_user /bin/sh -c "echo o > '$ORF'"
+ok   "lock a leaf that will go away"           locked_home "$LPHOME" lock --yes "$ORF"
+check "its grandparent took placement"         "uappnd" "$(flags_of "$ORD")"
+# The file goes behind locked's back (root, by hand) and a human asserts
+# it: the record retires and ORD protects nothing -- but only a gated verb
+# releases, so it stays sealed until the next plan.
+chflags -- nouchg "$ORF"
+rm -f -- "$ORF"
+ok   "tombstone the vanished leaf"             locked_home "$LPHOME" tombstone --yes "$ORF"
+check "the unneeded dir is still sealed"       "uappnd" "$(flags_of "$ORD")"
+locked_home "$LPHOME" status >"$LPOUT" 2>&1 || true
+ok   "the pool listing notes it"               grep -qF "no protected file needs these any more:" "$LPOUT"
+ok   "by name"                                 grep -qF "      $ORD" "$LPOUT"
+locked_home "$LPHOME" lock --yes "$SH1" >"$LPOUT" 2>&1 || true
+ok   "an unrelated lock plans the release"     grep -q "^  release  *$ORD (no protected file needs it)" "$LPOUT"
+ok   "and applies it"                          grep -qF "✓ released: $ORD (back to $INV:staff 777)" "$LPOUT"
+deny "the whole chain asked for no seal"       grep -q "^  seal " "$LPOUT"
+check "the dir carries no flag"                "" "$(flags_of "$ORD")"
+check "its record retired as unneeded"         "unneeded" "$(meta_get "$ORD" via)"
+locked_home "$LPHOME" status >"$LPOUT" 2>&1 || true
+deny "the listing has nothing left to note"    grep -qF "no protected file needs these" "$LPOUT"
+
+note "== rm: removing a protected file releases its chain in the same gate =="
+RMD="$LPA/rmarea"
+install -d -o "$INV" -g staff -m 777 "$RMD"
+install -d -o "$INV" -g staff -m 755 "$RMD/in"
+RMF="$RMD/in/r.txt"
+as_user /bin/sh -c "echo r > '$RMF'"
+ok   "lock the file to be removed"             locked_home "$LPHOME" lock --yes "$RMF"
+check "its grandparent took placement"         "uappnd" "$(flags_of "$RMD")"
+locked_home "$LPHOME" rm --yes "$RMF" >"$LPOUT" 2>&1 || true
+ok   "the gate lists what goes with it"        grep -qF "removing it also releases:" "$LPOUT"
+ok   "by name and reason"                      grep -q "release  *$RMD (no protected file needs it)" "$LPOUT"
+deny "the file is gone"                        test -e "$RMF"
+check "its record retired via rm"              "rm" "$(meta_get "$RMF" via)"
+ok   "the chain dir was released after it"     grep -qF "✓ released: $RMD (back to $INV:staff 777)" "$LPOUT"
+check "and carries no flag"                    "" "$(flags_of "$RMD")"
+check "the grandparent above stays for the others" "uappnd" "$(flags_of "$LPA")"
+ok   "verify clean after the rm"               locked_home "$LPHOME" verify --quiet
+
+note "== mv: a moved file takes its chain along =="
+MFD="$LPA/mvfrom"
+MTD="$LPA/mvto"
+install -d -o "$INV" -g staff -m 777 "$MFD" "$MTD"
+install -d -o "$INV" -g staff -m 755 "$MFD/in" "$MTD/in"
+MVF="$MFD/in/m.txt"
+as_user /bin/sh -c "echo m > '$MVF'"
+ok   "lock the file to be moved"               locked_home "$LPHOME" lock --yes "$MVF"
+check "its grandparent took placement"         "uappnd" "$(flags_of "$MFD")"
+locked_home "$LPHOME" mv --yes "$MVF" "$MTD/in/m.txt" >"$LPOUT" 2>&1 || true
+ok   "the file moved"                          test -f "$MTD/in/m.txt"
+check "still sealed as itself"                 "uchg" "$(flags_of "$MTD/in/m.txt")"
+ok   "the lock plan sealed the new chain"      grep -q "seal placement  *$MTD\$" "$LPOUT"
+check "the new grandparent is placement"       "uappnd" "$(flags_of "$MTD")"
+ok   "and released the old one"                grep -q "release  *$MFD (no protected file needs it)" "$LPOUT"
+check "the old grandparent carries no flag"    "" "$(flags_of "$MFD")"
+# Off a tty the move still happens (it has no gate of its own), the lock
+# plan declines, and the output says how to finish.
+locked_home "$LPHOME" mv "$MTD/in/m.txt" "$MFD/in/m.txt" </dev/null >"$LPOUT" 2>&1 || true
+ok   "a move without --yes still moves"        test -f "$MFD/in/m.txt"
+ok   "and says the new chain is not settled"   grep -qF "the chain at its new place is not settled" "$LPOUT"
+ok   "with the command that settles it"        grep -qF "sudo locked lock $MFD/in/m.txt" "$LPOUT"
+check "the declined plan sealed nothing"       "" "$(flags_of "$MFD")"
+ok   "the command does settle it"              locked_home "$LPHOME" lock --yes "$MFD/in/m.txt"
+check "the new grandparent is sealed"          "uappnd" "$(flags_of "$MFD")"
+check "the old one released"                   "" "$(flags_of "$MTD")"
+ok   "verify clean after the moves"            locked_home "$LPHOME" verify --quiet
 
 note "== status: the leaf parent prints as context =="
 locked_home "$LPHOME" status "$LPF" >"$LPOUT" 2>&1 || true
 ok   "the chain names the leaf parent"         \
-     grep -qF -- "-  $LPB (leaf parent, not in the chain)" "$LPOUT"
+     grep -qF -- "-  $LPB (not needed: $LPA keeps it in place)" "$LPOUT"
 deny "and never marks it unlocked"             grep -qF "!  $LPB" "$LPOUT"
 deny "and never calls it a drift"              grep -qF "✗  $LPB" "$LPOUT"
 ok   "the grandparent prints as placement"     grep -qF "✓  $LPA (placement uappnd)" "$LPOUT"
 ok   "the leaf prints as its own row"          grep -qF "✓  $LPF (content uchg)" "$LPOUT"
-# A leaf parent that IS still a pool node gets the ordinary row: the
-# shared-ancestor case, where it is somebody else's ancestor.
-locked_home "$LPHOME" status "$SH1" >"$LPOUT" 2>&1 || true
-ok   "a recorded leaf parent prints as placement" \
-     grep -qF "✓  $SHD (placement uappnd)" "$LPOUT"
-deny "and not as the context row"              grep -qF "(leaf parent, not in the chain)" "$LPOUT"
 
-note "== chain: the anchor is exempt from the rule =="
-# ~/.zshrc's parent IS the home. The anchor never changes ownership and is
-# never released, and its sappnd is what holds ~/.claude and ~/.config in
-# place, so it stays in the chain wherever it sits.
+note "== chain: the anchor stays in the chain as a leaf's own parent =="
+# ~/.zshrc's parent IS the home. Its sappnd is what holds ~/.claude and
+# ~/.config in place, so it stays in the chain wherever it sits.
 ZRC="$LPHOME/.zshrc"
 as_user /bin/sh -c "echo 'setopt nomatch' > '$ZRC'"
 locked_home "$LPHOME" lock --yes "$ZRC" >"$LPOUT" 2>&1 || true
@@ -1985,21 +2109,55 @@ check "the startup file is sealed"             "$LOCK_ACCT uchg" "$(stat -f '%Su
 check "the home anchor is still sappnd"        "sappnd" "$(flags_of "$LPHOME")"
 check "and still owned by the user"            "$INV" "$(owner_of "$LPHOME")"
 check "its record is still locked"             "locked" "$(meta_get "$LPHOME" state)"
-deny "the plan never offered to release it"    grep -qF "release: $LPHOME" "$LPOUT"
+deny "the plan never offered to release it"    grep -q "release  *$LPHOME " "$LPOUT"
 locked_home "$LPHOME" status "$ZRC" >"$LPOUT" 2>&1 || true
 ok   "the anchor prints as a chain row"        grep -qF "✓  $LPHOME (anchor sappnd)" "$LPOUT"
-deny "and never as the leaf-parent context row" \
-     grep -qF "$LPHOME (leaf parent, not in the chain)" "$LPOUT"
-ok   "verify clean with an anchor leaf parent" locked verify --quiet
+deny "and never as a context row"              grep -qF "$LPHOME (not needed" "$LPOUT"
+refuse "a chain dir cannot be named"           "sealed as a chain directory" \
+       locked_home "$LPHOME" lock --yes "$LPA"
+refuse "nor unprotected by name"               "not protected by name" \
+       locked_home "$LPHOME" unprotect --yes "$LPA"
+ok   "verify clean with an anchor leaf parent" locked_home "$LPHOME" verify --quiet
+BRC=0
+locked_home "$LPHOME" lock --yes "$SH1" "$ZRC" >"$LPOUT" 2>&1 || BRC=$?
+check "a batch of whole chains exits 0"        "0" "$BRC"
+ok   "the lock tail says done, not locked"     grep -qxF "2 done, 0 declined, 0 failed" "$LPOUT"
 
-note "== chain: the live pool shape, re-locked under the rule =="
-# The deployed pool as of 2026-09-15, in miniature. Built in the old shape
-# -- every placement dir sealed in its own right, deepest first, because a
-# leaf inside one would no longer provision it -- then every leaf locked,
-# deepest first. Expected: .claude, .config/agents/claude/settings and
-# Library/Application Support are each some leaf's parent and nothing
-# else's ancestor, so they leave; .config and Library are leaf parents too
-# but sit HIGHER above another sealed leaf, so the guard keeps them.
+note "== records: a live record without a role stops every release =="
+# Written before roles existed, a record cannot say whether it is intent or
+# derived, so no release may be planned from a pool that holds one.
+ORD2="$LPA/orphan2"
+install -d -o "$INV" -g staff -m 777 "$ORD2"
+install -d -o "$INV" -g staff -m 755 "$ORD2/in"
+as_user /bin/sh -c "echo o > '$ORD2/in/o.txt'"
+ok   "lock a second leaf that will go away"    locked_home "$LPHOME" lock --yes "$ORD2/in/o.txt"
+chflags -- nouchg "$ORD2/in/o.txt"
+rm -f -- "$ORD2/in/o.txt"
+ok   "tombstone it"                            locked_home "$LPHOME" tombstone --yes "$ORD2/in/o.txt"
+SH1M="$(meta_path "$SH1")"
+sed '/^role=/d' "$SH1M" >"$SH1M.tmp"
+mv -f "$SH1M.tmp" "$SH1M"
+chown "$LOCK_ACCT:$LOCK_ACCT" "$SH1M"
+chmod 640 "$SH1M"
+if locked_home "$LPHOME" verify >"$LPOUT" 2>&1; then vrc=0; else vrc=$?; fi
+check "verify calls a roleless record drift"   "5" "$vrc"
+ok   "and says what is missing"                grep -qF "record has no role" "$LPOUT"
+locked_home "$LPHOME" lock --yes "$ZRC" >"$LPOUT" 2>&1 || true
+ok   "a plan says why it releases nothing"     grep -qF "no directory is released this run: the record for $SH1 has no role" "$LPOUT"
+check "the unneeded dir stays sealed"          "uappnd" "$(flags_of "$ORD2")"
+printf 'role=leaf\n' >>"$SH1M"
+locked_home "$LPHOME" lock --yes "$ZRC" >"$LPOUT" 2>&1 || true
+ok   "with the role back, the plan releases it" grep -qF "✓ released: $ORD2" "$LPOUT"
+check "and the dir carries no flag"            "" "$(flags_of "$ORD2")"
+ok   "verify clean again"                      locked_home "$LPHOME" verify --quiet
+
+note "== chain: the live pool shape =="
+# The deployed pool as of 2026-09-15, in miniature, built from nothing but
+# its six leaves in no particular order. Expected: .config, .config/agents,
+# .config/agents/claude and Library are chain nodes; .claude,
+# .config/agents/claude/settings and Library/Application Support are
+# somebody's leaf parent and nobody's higher ancestor, so they are never
+# sealed at all.
 WPSTOP="$SCRATCH/wpusers"
 install -d -m 755 -o root -g wheel "$WPSTOP"
 WPHOME="$WPSTOP/home"
@@ -2026,72 +2184,60 @@ as_user /bin/sh -c "
 WPCLAUDE_B="$(stat -f '%Su %Sg %OLp' "$WPHOME/.claude")"
 WPSET_B="$(stat -f '%Su %Sg %OLp' "$WPHOME/.config/agents/claude/settings")"
 WPAPP_B="$(stat -f '%Su %Sg %OLp' "$WPHOME/Library/Application Support")"
-# The old shape, deepest placement first.
-for d in \
-  "$WPHOME/.config/agents/claude/settings" \
-  "$WPHOME/.config/agents/claude" \
-  "$WPHOME/.config/agents" \
-  "$WPHOME/.config" \
-  "$WPHOME/Library/Application Support" \
-  "$WPHOME/Library" \
-  "$WPHOME/.claude"
-do
-  ok "old shape: placement on ${d#$WPHOME/}" locked_home "$WPHOME" lock --yes --tier placement "$d"
-done
-# .claude is recorded unlocked in the live pool: flag off, identity kept.
-ok   "old shape: .claude is left unlocked"     locked_home "$WPHOME" unlock "$WPHOME/.claude"
-check "and its record says unlocked"           "unlocked" "$(meta_get "$WPHOME/.claude" state)"
-
-# Now the leaves, deepest first: a shared ancestor is only kept once the
-# deeper leaf under it is on record.
 WPOUT="$SCRATCH/worked-pool.out"
-ok   "lock the nested settings.json"           \
-     locked_home "$WPHOME" lock --yes "$WPHOME/.config/agents/claude/settings/settings.json"
-ok   "lock the ghostty prefs dir"              locked_home "$WPHOME" lock --yes "$WPHOME/Library/Application Support/com.mitchellh.ghostty"
-ok   "lock the ghostty config dir"             locked_home "$WPHOME" lock --yes "$WPHOME/.config/ghostty"
-ok   "lock the LaunchAgents dir"               locked_home "$WPHOME" lock --yes "$WPHOME/Library/LaunchAgents"
-ok   "lock the startup file in the home"       locked_home "$WPHOME" lock --yes "$WPHOME/.zshrc"
-locked_home "$WPHOME" lock --yes "$WPHOME/.claude/settings.json" >"$WPOUT" 2>&1 || true
-ok   "the symlink node is sealed"              test -L "$WPHOME/.claude/settings.json"
-check "and by its own uchg"                    "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$WPHOME/.claude/settings.json")"
-
-# Released: each is somebody's leaf parent and nobody's higher ancestor.
-ok   "the .claude release was announced"       \
-     grep -qF "release: $WPHOME/.claude (leaf parent, leaves the chain)" "$WPOUT"
-check ".claude is back to the invoker"         "$WPCLAUDE_B" "$(stat -f '%Su %Sg %OLp' "$WPHOME/.claude")"
-check ".claude carries no flag"                "" "$(flags_of "$WPHOME/.claude")"
-check ".claude's record is retired"            "retired" "$(meta_get "$WPHOME/.claude" state)"
-check "the settings dir is back to the invoker" "$WPSET_B" \
+: >"$WPOUT"
+for leaf in \
+  "$WPHOME/.claude/settings.json" \
+  "$WPHOME/.zshrc" \
+  "$WPHOME/Library/LaunchAgents" \
+  "$WPHOME/.config/ghostty" \
+  "$WPHOME/.config/agents/claude/settings/settings.json" \
+  "$WPHOME/Library/Application Support/com.mitchellh.ghostty"
+do
+  ok "lock ${leaf#"$WPHOME"/}" locked_home "$WPHOME" lock --yes "$leaf"
+  locked_home "$WPHOME" status "$leaf" >>"$WPOUT" 2>&1 || true
+done
+check "the symlink node is sealed by its own uchg" "$LOCK_ACCT uchg" \
+      "$(stat -f '%Su %Sf' "$WPHOME/.claude/settings.json")"
+for d in .config .config/agents .config/agents/claude Library; do
+  check "$d is a sealed chain node"            "uappnd chain" \
+        "$(flags_of "$WPHOME/$d") $(meta_get "$WPHOME/$d" role)"
+done
+check "the home is the anchor"                 "sappnd" "$(flags_of "$WPHOME")"
+check ".claude was never touched"              "$WPCLAUDE_B" "$(stat -f '%Su %Sg %OLp' "$WPHOME/.claude")"
+deny ".claude has no record"                   test -f "$(meta_path "$WPHOME/.claude")"
+check "nor the settings dir"                   "$WPSET_B" \
       "$(stat -f '%Su %Sg %OLp' "$WPHOME/.config/agents/claude/settings")"
-check "its record is retired"                  "retired" \
-      "$(meta_get "$WPHOME/.config/agents/claude/settings" state)"
-check "Application Support is back to the invoker" "$WPAPP_B" \
+deny "which has no record either"              test -f "$(meta_path "$WPHOME/.config/agents/claude/settings")"
+check "nor Application Support"                "$WPAPP_B" \
       "$(stat -f '%Su %Sg %OLp' "$WPHOME/Library/Application Support")"
-check "its record is retired"                  "retired" \
-      "$(meta_get "$WPHOME/Library/Application Support" state)"
-
-# Kept: leaf parents that are also higher ancestors of another sealed leaf.
-check ".config kept its seal"                  "uappnd" "$(flags_of "$WPHOME/.config")"
-check "and its record is still locked"         "locked" "$(meta_get "$WPHOME/.config" state)"
-check "Library kept its seal"                  "uappnd" "$(flags_of "$WPHOME/Library")"
-check "and its record is still locked"         "locked" "$(meta_get "$WPHOME/Library" state)"
-# Untouched middles: neither leaf parents nor released.
-check ".config/agents is still placement"      "uappnd" "$(flags_of "$WPHOME/.config/agents")"
-check ".config/agents/claude is still placement" "uappnd" "$(flags_of "$WPHOME/.config/agents/claude")"
-# The anchor, never released.
-check "the home is anchored"                   "sappnd" "$(flags_of "$WPHOME")"
-check "and still owned by the user"            "$INV" "$(owner_of "$WPHOME")"
+deny "which has no record either"              test -f "$(meta_path "$WPHOME/Library/Application Support")"
+ok   "status names .claude as context"         grep -qF -- "-  $WPHOME/.claude (not needed: $WPHOME keeps it in place)" "$WPOUT"
 
 # The motivating failure, gone: the software that owns ~/.claude can take
-# and release its lock directory again.
+# and release its lock directory, and a temp+rename save strands nothing.
 ok   "mkdir the oauth refresh lock"            as_user mkdir -- "$WPHOME/.claude/.oauth_refresh.lock"
 ok   "and rmdir it again"                      as_user rmdir -- "$WPHOME/.claude/.oauth_refresh.lock"
 ok   "a temp+rename save inside .claude"       \
      as_user /bin/sh -c "echo j > '$WPHOME/.claude/.claude.json.tmp' && mv -- '$WPHOME/.claude/.claude.json.tmp' '$WPHOME/.claude/.claude.json'"
 ok   "and it strands nothing"                  as_user rm -f -- "$WPHOME/.claude/.claude.json"
-# The link node is still what a same-UID process cannot re-point.
 deny "the sealed link cannot be repointed"     as_user ln -sfn "$WPHOME/.zshrc" "$WPHOME/.claude/settings.json"
-ok   "verify clean across the worked pool"     locked verify --quiet
+ok   "verify clean across the worked pool"     locked_home "$WPHOME" verify --quiet
+
+# Stop protecting the nested settings file: its whole chain up to .config
+# goes, because nothing else needs it; Library stays for the ghostty prefs.
+locked_home "$WPHOME" unprotect --yes "$WPHOME/.config/agents/claude/settings/settings.json" >"$WPOUT" 2>&1 || true
+ok   ".config/agents/claude is released"       grep -q "release  *$WPHOME/.config/agents/claude (no protected file needs it)" "$WPOUT"
+ok   ".config/agents too"                      grep -q "release  *$WPHOME/.config/agents (no protected file needs it)" "$WPOUT"
+ok   ".config says what holds it now"          grep -qF "$WPHOME/.config (not needed: $WPHOME keeps it in place)" "$WPOUT"
+for d in .config .config/agents .config/agents/claude; do
+  check "$d is back to the invoker, unflagged" "$INV staff 777 -" \
+        "$(stat -f '%Su %Sg %OLp %Sf' "$WPHOME/$d")"
+done
+check "Library stays for the ghostty prefs"    "uappnd" "$(flags_of "$WPHOME/Library")"
+check "the home stays the anchor"              "sappnd" "$(flags_of "$WPHOME")"
+check "the link is still sealed as itself"     "uchg" "$(flags_of "$WPHOME/.claude/settings.json")"
+ok   "verify clean after the unprotect"        locked_home "$WPHOME" verify --quiet
 
 # ---- summary ---------------------------------------------------------------
 

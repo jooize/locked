@@ -8,14 +8,18 @@
 #
 # Tiers (see DESIGN-v2.md):
 #   content    uchg,  owned by _<user>-lock; leaf files, or leaf dirs (recursive)
-#   placement  uappnd, owned by _<user>-lock + group-write; shared parent dirs
+#   placement  uappnd, owned by _<user>-lock + group-write; chain dirs
 #   anchor     sappnd/schg, ownership UNCHANGED; nodes the OS identity-checks
 #              against the user's UID (~, ~/.ssh, ...)
+#
+# You name what to protect (leaves); every chain directory is derived from
+# them and released once no protected file needs it.
 #
 # Invoked via sudo; sudoers pins the binary by sha256 digest (setup writes it).
 # Sudo auth (password, pam_tid, sudowhat, ...) is the user's choice.
 #
-#   sudo locked lock   [--tier T] [--flag F] [--yes] [--dry-run] <path>...
+#   sudo locked lock   [--flag F] [--yes] [--dry-run] <path>...
+#   sudo locked unprotect [--yes] [--dry-run] <path>...
 #   sudo locked unlock [--chain] [--dry-run] <path>...
 #   sudo locked revert [--dry-run] <path>...
 #   sudo locked rm|trash [--recursive] [--dry-run] <path>...
@@ -115,16 +119,24 @@ usage() {
   cat <<EOF
 usage: sudo locked <action> [options] [args]
 
-  lock [--tier T] [--flag F] [--yes] [--dry-run] <path>...
-      Adopt or relock. Derives and provisions the whole ancestor chain:
-      leaf tier (default content), placement for user-owned ancestors,
-      anchor for \$HOME. Nothing is touched until the whole ceremony is
-      derived: the snapshot->current diff, then the plan -- one line per
-      node, root-most first -- then ONE question for the lot. --yes
-      answers it (required when stdin is not a tty); --dry-run prints the
-      plan and stops. A symlink argument seals the LINK, not its target.
-      --tier content|placement|anchor    leaf tier (default content)
+  lock [--flag F] [--yes] [--dry-run] <path>...
+      Protect a file, directory or symlink. You name what to protect;
+      locked derives the rest: the directories above it that must stay
+      put (placement; the path's own parent is never needed), the anchor
+      at \$HOME, and any sealed directory no protected file needs any more,
+      which it releases. ~ and anything under ~/.ssh take the anchor tier
+      (ownership unchanged), everything else the content tier. Nothing is
+      touched until the whole ceremony is derived: the snapshot->current
+      diff, then the plan -- one line per node, root-most first -- then
+      ONE question for the lot. --yes answers it (required when stdin is
+      not a tty); --dry-run prints the plan and stops. A symlink argument
+      seals the LINK, not its target.
       --flag sappnd|schg                 anchor flag (default sappnd)
+  unprotect [--yes] [--dry-run] <path>...
+      Stop protecting a path you locked: its flag comes off, its owner,
+      group and mode go back to what they were before the first lock, and
+      the record is retired. Directories no other protected file needs are
+      released in the same plan and under the same one question.
   unlock [--chain] [--dry-run] <path>...
       Release the named node only (snapshot taken first for content
       files/dirs). --chain also drops flags on chain ancestors, for
@@ -204,7 +216,6 @@ shift
 
 # ---- option parsing --------------------------------------------------------
 
-OPT_TIER=""
 OPT_FLAG=sappnd
 OPT_FLAG_SET=0
 OPT_EDITOR=""
@@ -218,8 +229,6 @@ PATHS=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --tier)    OPT_TIER="${2:?--tier needs a value}"; shift 2 ;;
-    --tier=*)  OPT_TIER="${1#--tier=}"; shift ;;
     --flag)    OPT_FLAG="${2:?--flag needs a value}"; OPT_FLAG_SET=1; shift 2 ;;
     --flag=*)  OPT_FLAG="${1#--flag=}"; OPT_FLAG_SET=1; shift ;;
     --editor)   OPT_EDITOR="${2:?--editor needs a value}"; shift 2 ;;
@@ -237,9 +246,6 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-case "$OPT_TIER" in ''|content|placement|anchor) ;; *)
-  echo "invalid --tier: $OPT_TIER (content|placement|anchor)" >&2; exit 1 ;;
-esac
 case "$OPT_FLAG" in sappnd|schg) ;; *)
   echo "invalid --flag: $OPT_FLAG (sappnd|schg)" >&2; exit 1 ;;
 esac
@@ -594,8 +600,10 @@ meta_field() {
 # write_meta <metafile> key=value...
 #
 # Known keys: owner, group, mode, lockmode, tier, flag, flagsym, id,
-# recursive, state, plus the provenance fields the retired/suspended states
-# add -- via, by, at, bin. Nothing here validates the set; the caller emits
+# recursive, role, state, plus the provenance fields the retired/suspended
+# states add -- via, by, at, bin. role is leaf (a node you named with lock:
+# the intent) or chain (a directory sealed because some leaf needs it; see
+# plan_releases). Nothing here validates the set; the caller emits
 # the full record, because this replaces the file rather than patching it.
 # No key stores the node's own PATH: the path lives only in the encoded
 # filename, which is what makes rekey_record a rename and nothing more.
@@ -644,6 +652,7 @@ rewrite_meta_id() {
     "flagsym=$(meta_field "$meta" flagsym)" \
     "id=$id" \
     "recursive=$(meta_field "$meta" recursive)" \
+    "role=$(meta_field "$meta" role)" \
     "state=$(meta_field "$meta" state)" || return 1
 }
 
@@ -665,8 +674,28 @@ rewrite_meta_state() {
     "flagsym=$(meta_field "$meta" flagsym)" \
     "id=$(meta_field "$meta" id)" \
     "recursive=$(meta_field "$meta" recursive)" \
+    "role=$(meta_field "$meta" role)" \
     "state=$state" \
     "$@" || return 1
+}
+
+# rewrite_meta_role <metafile> <role>: a sealed anchor becoming yours by
+# name (chain -> leaf). Everything else about the record stays; only a live
+# record without provenance fields ever takes this path.
+rewrite_meta_role() {
+  local meta="$1" role="$2"
+  write_meta "$meta" \
+    "owner=$(meta_field "$meta" owner)" \
+    "group=$(meta_field "$meta" group)" \
+    "mode=$(meta_field "$meta" mode)" \
+    "lockmode=$(meta_field "$meta" lockmode)" \
+    "tier=$(meta_field "$meta" tier)" \
+    "flag=$(meta_field "$meta" flag)" \
+    "flagsym=$(meta_field "$meta" flagsym)" \
+    "id=$(meta_field "$meta" id)" \
+    "recursive=$(meta_field "$meta" recursive)" \
+    "role=$role" \
+    "state=$(meta_field "$meta" state)" || return 1
 }
 
 # ---- setup -----------------------------------------------------------------
@@ -1132,6 +1161,19 @@ verify_node() {
   id="$(meta_field "$meta" id)"
   recursive="$(meta_field "$meta" recursive)"
 
+  # A live record names what it is there for: a leaf you protected, or a
+  # chain directory some leaf needs. Without that, no release can be planned
+  # safely (plan_releases stops), so it is drift until the record says.
+  if [ "$state" != "retired" ]; then
+    case "$(meta_field "$meta" role)" in
+      leaf|chain) ;;
+      *)
+        echo "  DRIFT $f: record has no role (written before locked 0.13.0)"
+        return 1
+        ;;
+    esac
+  fi
+
   # Retired and suspended are checked before the existence test: for both,
   # the path being absent is the recorded expectation, not drift.
   if [ "$state" = "retired" ]; then
@@ -1296,35 +1338,154 @@ chain_for() {
   done
 }
 
-# shared_ancestor_of <dir>: the first sealed node in the invoker's pool
-# that still needs <dir> as placement, printed; 1 when there is none.
-#
-# The leaf-parent rule takes a node out of the chain of the leaf directly
-# under it, but the same node can sit HIGHER above another sealed leaf --
-# ~/.config/agents/claude is the parent of ~/.config/agents/claude/CLAUDE.md
-# and the grandparent of ~/.config/agents/claude/settings/settings.json --
-# and in that position its uappnd is exactly what pins the entry below it.
-# So the test is the chain rule read backwards: <dir> is a PROPER ancestor
-# of some still-locked record, and not that record's immediate parent.
-#
-# Reads the pool directly rather than through pool_records_under: the
-# question is about one directory's ancestry, not about a subtree, and the
-# state field decides it. The case patterns quote $d, so a directory whose
-# name holds glob characters is matched literally.
-shared_ancestor_of() { # <dir>
-  local d="${1%/}" meta q
-  for meta in "$USER_SNAPSHOTS"/*.meta; do
-    [ "$(meta_field "$meta" state)" = "locked" ] || continue
-    q="$(decode "$(basename "$meta" .meta)")"
-    case "$q" in
-      "$d"/*) ;;
-      *) continue ;;
-    esac
-    [ "$(dirname "$q")" = "$d" ] && continue
-    printf '%s' "$q"
-    return 0
-  done
+# record_live <metafile>: true when the record still answers for a node --
+# locked, unlocked, or suspended in the trash. A retired record is history:
+# the audit trail of a node locked no longer holds, so sealing that path
+# again is a first seal, not a relock (identity from the live node, a fresh
+# snapshot), and every "is it in the pool" question reads it as absent.
+record_live() { # <metafile>
+  [ -f "$1" ] || return 1
+  case "$(meta_field "$1" state)" in
+    locked|unlocked|suspended) return 0 ;;
+  esac
   return 1
+}
+
+# ---- the needed set --------------------------------------------------------
+#
+# The pool is what you asked to protect. A leaf record (role=leaf) is a
+# node you named with lock; a chain record (role=chain) is a directory
+# sealed only because some leaf needs it. So the chain nodes a pool needs
+# are exactly the union of chain_for over its live leaves, and a chain
+# record outside that union protects nothing: every gated verb plans its
+# release, and the plan shows it before the one question.
+#
+# Suspended leaves still count: Put Back can return them to the path their
+# chain pins. Seals are NOT computed here -- they stay with the verb's own
+# leaves, because re-sealing another leaf's chain would close the window an
+# `unlock --chain` deliberately left open.
+#
+# Fails closed. A release is never planned on incomplete knowledge: a live
+# record with no role (written before roles existed) or a leaf whose chain
+# cannot be derived empties the plan and says why.
+
+RELEASE_PATHS=()
+RELEASE_REASONS=()
+
+# in_lines <line> <list>: true when <line> is one of the newline-separated
+# lines of <list>, matched literally (the pattern is quoted, so a path with
+# glob characters is just a path).
+in_lines() {
+  case $'\n'"$2"$'\n' in
+    *$'\n'"$1"$'\n'*) return 0 ;;
+  esac
+  return 1
+}
+
+# plan_releases <exclude> <add>: fill RELEASE_PATHS (deepest first) with the
+# live chain records nothing needs once the leaves in <exclude> are gone and
+# those in <add> are protected; both are newline-separated path lists.
+# RELEASE_REASONS holds the matching plan reason for each.
+plan_releases() {
+  local exclude="$1" add="$2" meta q st role leaves="" needed="" c cands l held
+  RELEASE_PATHS=()
+  RELEASE_REASONS=()
+  for meta in "$USER_SNAPSHOTS"/*.meta; do
+    [ -f "$meta" ] || continue
+    record_live "$meta" || continue
+    q="$(decode "$(basename "$meta" .meta)")"
+    role="$(meta_field "$meta" role)"
+    case "$role" in
+      leaf) ;;
+      chain) continue ;;
+      *)
+        echo "${E_YEL}note:${E_OFF} no directory is released this run: the record for $q has no role" >&2
+        echo "      (written before locked 0.13.0; convert the pool first)" >&2
+        return 0
+        ;;
+    esac
+    if in_lines "$q" "$exclude"; then
+      continue
+    fi
+    leaves="$leaves$q"$'\n'
+  done
+  leaves="$leaves$add"
+
+  # fd 3, not stdin, for the reason given in do_lock_one.
+  while IFS= read -r q <&3; do
+    [ -n "$q" ] || continue
+    if ! c="$(chain_for "$q" 2>/dev/null)"; then
+      echo "${E_YEL}note:${E_OFF} no directory is released this run: the chain of $q cannot be derived" >&2
+      return 0
+    fi
+    needed="$needed$c"$'\n'
+  done 3<<EOF
+$leaves
+EOF
+
+  # The live chain records, deepest first. An if below, not a case, and no
+  # comment inside the substitution: /bin/bash 3.2 ends a $( ... ) at the
+  # first unbalanced paren it scans, a case pattern's included.
+  cands="$(
+    for meta in "$USER_SNAPSHOTS"/*.meta; do
+      [ -f "$meta" ] || continue
+      [ "$(meta_field "$meta" role)" = "chain" ] || continue
+      st="$(meta_field "$meta" state)"
+      if [ "$st" != "locked" ] && [ "$st" != "unlocked" ]; then
+        continue
+      fi
+      printf '%s\n' "$(decode "$(basename "$meta" .meta)")"
+    done | sort -r
+  )"
+  while IFS= read -r q <&3; do
+    [ -n "$q" ] || continue
+    # A node this very run names as a leaf is claimed, not released.
+    if in_lines "$q" "$needed" || in_lines "$q" "$add"; then
+      continue
+    fi
+    # The reason a reader needs: a directory that still holds a protected
+    # file reads as if that file needed it, so say what holds it instead.
+    held=0
+    while IFS= read -r l; do
+      [ -n "$l" ] || continue
+      if [ "$(dirname "$l")" = "$q" ]; then
+        held=1
+        break
+      fi
+    done <<EOF
+$leaves
+EOF
+    RELEASE_PATHS+=("$q")
+    if [ "$held" -eq 1 ]; then
+      RELEASE_REASONS+=("not needed: $(dirname "$q") keeps it in place")
+    else
+      RELEASE_REASONS+=("no protected file needs it")
+    fi
+  done 3<<EOF
+$cands
+EOF
+  return 0
+}
+
+# release_rows <indent> <width>: the plan rows for RELEASE_PATHS, root-most
+# first like every other plan row, the reason dim after the path.
+release_rows() { # <indent> <width>
+  local ind="$1" w="$2" i
+  i=$((${#RELEASE_PATHS[@]} - 1))
+  while [ "$i" -ge 0 ]; do
+    printf '%s%-*s  %s %s(%s)%s\n' "$ind" "$w" release "${RELEASE_PATHS[$i]}" \
+      "$E_DIM" "${RELEASE_REASONS[$i]}" "$E_OFF" >&2
+    i=$((i - 1))
+  done
+}
+
+# apply_releases: run the planned releases, deepest first.
+apply_releases() {
+  local i=0
+  while [ "$i" -lt "${#RELEASE_PATHS[@]}" ]; do
+    release_chain_node "${RELEASE_PATHS[$i]}" || return 1
+    i=$((i + 1))
+  done
 }
 
 # ---- diff witness ----------------------------------------------------------
@@ -1546,7 +1707,7 @@ T_OWNER="" T_GROUP="" T_MODE=""
 content_targets() { # <path>
   local p="$1"
   snap_paths "$p"
-  if [ -f "$META" ]; then
+  if record_live "$META"; then
     T_OWNER="$(meta_field "$META" owner)"
     T_GROUP="$(meta_field "$META" group)"
     T_MODE="$(meta_field "$META" mode)"
@@ -1574,8 +1735,9 @@ content_targets() { # <path>
 plan_node() {
   local p="$1" t="$2" fl="${3:-}"
   snap_paths "$p"
-  local state="" prev_flag=""
-  if [ -f "$META" ]; then
+  local state="" prev_flag="" live=0
+  if record_live "$META"; then
+    live=1
     state="$(meta_field "$META" state)"
     prev_flag="$(meta_field "$META" flag)"
   fi
@@ -1609,7 +1771,7 @@ plan_node() {
         is_dir=1
       fi
       content_targets "$p" || return 1
-      if [ ! -f "$META" ] && [ "$T_OWNER" != "$inv" ]; then
+      if [ "$live" -eq 0 ] && [ "$T_OWNER" != "$inv" ]; then
         echo "skip $p: not owned by you (owner=$T_OWNER)" >&2
         log_action lock "$p" skip-not-owned
         return 1
@@ -1631,7 +1793,7 @@ plan_node() {
         echo "${E_RED}${E_B}ERROR:${E_OFF} placement tier needs a directory: $p" >&2
         return 1
       }
-      if [ ! -f "$META" ]; then
+      if [ "$live" -eq 0 ]; then
         local owner_now
         owner_now="$(stat -f '%Su' "$p")"
         if [ "$owner_now" != "$inv" ]; then
@@ -1653,7 +1815,7 @@ plan_node() {
   # A relock names its tier the way a first seal does: the header carries
   # the LEAF's tier and nothing else, so without it an ancestor's line
   # would not say whether it is coming back as placement or as an anchor.
-  if [ -f "$META" ]; then
+  if [ "$live" -eq 1 ]; then
     case "$t" in
       content)   printf 'relock content' ;;
       placement) printf 'relock placement' ;;
@@ -1675,9 +1837,12 @@ plan_node() {
 # its target, which is one line rather than a diff. The block owns its
 # trailing blank line, which separates it from the plan below it.
 lock_witness() { # <path> <tier>
-  local f="$1" t="$2" shown=0
+  local f="$1" t="$2" shown=0 live=0
   [ "$t" = "placement" ] && return 0
   snap_paths "$f"
+  # A retired record's snapshot is the content of a protection that ended;
+  # a new one starts from what the node holds now.
+  record_live "$META" && live=1
   if [ -L "$f" ]; then
     # -e follows the link, so it asks after the TARGET. A missing one is
     # not a refusal -- the target may still arrive -- but it is the one
@@ -1691,7 +1856,7 @@ lock_witness() { # <path> <tier>
     shown=1
   elif [ -d "$f" ]; then
     if [ "$t" = "content" ]; then
-      if [ -d "$SNAPDIR" ]; then
+      if [ "$live" -eq 1 ] && [ -d "$SNAPDIR" ]; then
         show_diff 'diff snapshot -> current' "$f" \
           diff --color=never -ru "$SNAPDIR" "$f" || return 1
       else
@@ -1699,7 +1864,7 @@ lock_witness() { # <path> <tier>
       fi
       shown=1
     fi
-  elif [ -f "$SNAP" ]; then
+  elif [ "$live" -eq 1 ] && [ -f "$SNAP" ]; then
     if cmp -s "$SNAP" "$f"; then
       echo "no changes since unlock: $f"
     else
@@ -1739,7 +1904,9 @@ seal_content() {
   content_targets "$f" || return 1
   local target_owner="$T_OWNER" target_group="$T_GROUP" target_mode="$T_MODE"
 
-  if [ -f "$META" ] && [ "$is_link" -eq 0 ]; then
+  local live=0
+  record_live "$META" && live=1
+  if [ "$live" -eq 1 ] && [ "$is_link" -eq 0 ]; then
     local mode_now
     mode_now="$(stat -f '%OLp' "$f")"
     if [ "$mode_now" != "$target_mode" ]; then
@@ -1751,10 +1918,11 @@ seal_content() {
   # symlink gets none: its content is the path it names, which the identity
   # record pins already, and the helper's copy verb opens its source
   # O_NOFOLLOW -- a link is precisely what it refuses to read through.
+  # A retired record's snapshot is replaced for the same reason.
   if [ "$is_link" -eq 0 ]; then
-    if [ "$is_dir" -eq 0 ] && [ ! -f "$SNAP" ]; then
+    if [ "$is_dir" -eq 0 ] && { [ "$live" -eq 0 ] || [ ! -f "$SNAP" ]; }; then
       run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || return 1
-    elif [ "$is_dir" -eq 1 ] && [ ! -d "$SNAPDIR" ]; then
+    elif [ "$is_dir" -eq 1 ] && { [ "$live" -eq 0 ] || [ ! -d "$SNAPDIR" ]; }; then
       run snapshot_tree "$f" "$SNAPDIR" || return 1
     fi
   fi
@@ -1787,6 +1955,7 @@ seal_content() {
       "flagsym=$(flags_of "$f")" \
       "id=$(node_id "$f")" \
       "recursive=$is_dir" \
+      "role=leaf" \
       "state=locked" || return 1
   fi
   echo "${C_GRN}✓${C_OFF} locked: $f (content)"
@@ -1803,7 +1972,7 @@ seal_placement() {
   group_now="$(stat -f '%Sg' "$d")"
   mode_now="$(stat -f '%OLp' "$d")"
 
-  if [ -f "$META" ]; then
+  if record_live "$META"; then
     # Re-seal after an unlock ceremony: reapply flag only -- but never
     # silently bless a node that was swapped during the window. This is the
     # one live question left in an applying seal, because it reports an
@@ -1823,6 +1992,7 @@ seal_placement() {
         "flagsym=$(flags_of "$d")" \
         "id=$(node_id "$d")" \
         "recursive=0" \
+        "role=chain" \
         "state=locked" || return 1
     fi
     echo "${C_GRN}✓${C_OFF} relocked: $d (placement)"
@@ -1846,18 +2016,21 @@ seal_placement() {
       "flagsym=$(flags_of "$d")" \
       "id=$(node_id "$d")" \
       "recursive=0" \
+      "role=chain" \
       "state=locked" || return 1
   fi
   echo "${C_GRN}✓${C_OFF} locked: $d (placement)"
   log_action lock "$d" ok
 }
 
-# seal_anchor <path> <flagword>: apply a decided anchor seal -- system flag,
-# ownership and mode untouched. Anchor FILES still get the snapshot (ssh
-# config class: ownership never changes but the content is what's being
-# sealed); dirs (~, ~/.ssh) have no content snapshot.
+# seal_anchor <path> <flagword> <role>: apply a decided anchor seal --
+# system flag, ownership and mode untouched. Anchor FILES still get the
+# snapshot (ssh config class: ownership never changes but the content is
+# what's being sealed); dirs (~, ~/.ssh) have no content snapshot. <role> is
+# leaf for a node you named, chain for one a leaf below needs; the caller
+# decides, because only it knows which node was named.
 seal_anchor() {
-  local f="$1" flagword="$2"
+  local f="$1" flagword="$2" role="$3"
   snap_paths "$f"
   local is_file=0
   [ -f "$f" ] && is_file=1
@@ -1867,8 +2040,9 @@ seal_anchor() {
   group_now="$(stat -f '%Sg' "$f")"
   mode_now="$(stat -f '%OLp' "$f")"
 
-  local state="" prev_flag=""
-  if [ -f "$META" ]; then
+  local state="" prev_flag="" live=0
+  if record_live "$META"; then
+    live=1
     state="$(meta_field "$META" state)"
     prev_flag="$(meta_field "$META" flag)"
   fi
@@ -1877,7 +2051,7 @@ seal_anchor() {
   # except by identity -- check it. (Files are covered by the witness the
   # plan gate was answered on, and atomic-save legitimately changes a
   # file's inode.) This is the one live question left in an applying seal.
-  if [ -f "$META" ] && [ "$is_file" -eq 0 ]; then
+  if [ "$live" -eq 1 ] && [ "$is_file" -eq 0 ]; then
     check_reseal_identity "$f" "$META" || {
       echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
     }
@@ -1890,7 +2064,7 @@ seal_anchor() {
     fclear "$prev_flag" "$f" || return 1
   fi
 
-  if [ "$is_file" -eq 1 ] && [ ! -f "$SNAP" ]; then
+  if [ "$is_file" -eq 1 ] && { [ "$live" -eq 0 ] || [ ! -f "$SNAP" ]; }; then
     run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || return 1
   fi
 
@@ -1906,6 +2080,7 @@ seal_anchor() {
       "flagsym=$(flags_of "$f")" \
       "id=$(node_id "$f")" \
       "recursive=0" \
+      "role=$role" \
       "state=locked" || return 1
   fi
   echo "${C_GRN}✓${C_OFF} locked: $f (anchor $flagword)"
@@ -1917,7 +2092,7 @@ seal_anchor() {
 release_node() {
   local f="$1"
   snap_paths "$f"
-  if [ ! -f "$META" ]; then
+  if ! record_live "$META"; then
     # "not in pool" is true and unhelpful on its own: what usually blocks
     # this path is an ancestor, not the leaf. Say which one.
     echo "skip $f: not in pool" >&2
@@ -2000,6 +2175,7 @@ release_node() {
       "flagsym=$(flags_of "$f")" \
       "id=$(node_id "$f")" \
       "recursive=$recursive" \
+      "role=$(meta_field "$META" role)" \
       "state=unlocked" || return 1
   fi
   echo "${C_GRN}✓${C_OFF} unlocked: $f ($tier)"
@@ -2021,37 +2197,47 @@ release_node() {
   log_action unlock "$f" ok
 }
 
-# release_leaf_parent <dir>: un-provision a placement node that the
-# leaf-parent rule has taken out of the chain. This is NOT an unlock: an
-# unlock keeps lock-account ownership and mode 770 because the seal is
-# coming back, and here it is not, so the node goes all the way home --
-# flag off, then owner, group and mode restored from the pre-adoption
-# identity the record captured. The record retires with the rule named as
-# its via, so the audit trail says which decision released it.
+# release_chain_node <dir>: un-provision a chain directory nothing needs any
+# more (plan_releases decided that). This is NOT an unlock: an unlock keeps
+# lock-account ownership and mode 770 because the seal is coming back, and
+# here it is not, so a placement node goes all the way home -- flag off,
+# then owner, group and mode restored from the pre-adoption identity the
+# record captured. An anchor never changed ownership, so only its flag
+# comes off. The record retires via=unneeded, so the audit trail says which
+# decision released it.
 #
-# A record left state=unlocked is the same migration: unlock cleared the
-# flag but deliberately kept the lock account and 770, so the identity
-# restore below is exactly what that node is still owed.
-release_leaf_parent() { # <dir>
-  local d="$1" owner group mode flag state
+# A record left state=unlocked is the same release with no flag to clear:
+# unlock deliberately kept the lock account and 770, so the identity restore
+# below is exactly what that node is still owed.
+release_chain_node() { # <dir>
+  local d="$1" owner group mode flag state tier
   snap_paths "$d"
-  [ -f "$META" ] || return 0
+  record_live "$META" || return 0
+  tier="$(meta_field "$META" tier)"
   owner="$(meta_field "$META" owner)"
   group="$(meta_field "$META" group)"
   mode="$(meta_field "$META" mode)"
   flag="$(meta_field "$META" flag)"
   state="$(meta_field "$META" state)"
-  if [ "$OPT_DRY" -eq 0 ]; then
-    # Flag first: it blocks chown and chmod. An unlocked record has none.
-    if [ "$state" = "locked" ]; then
-      fclear "$flag" "$d" || return 1
-    fi
+  if [ "$OPT_DRY" -eq 1 ]; then
+    echo "DRY-RUN: release $d"
+    return 0
+  fi
+  # Flag first: it blocks chown and chmod.
+  if [ "$state" = "locked" ]; then
+    fclear "$flag" "$d" || return 1
+  fi
+  if [ "$tier" = "placement" ]; then
     run chown "${owner}:${group}" "$d" || return 1
     run chmod "$mode" "$d" || return 1
   fi
-  retire_record "$d" leaf-parent || return 1
-  echo "${C_GRN}✓${C_OFF} released: $d (leaf parent, no longer in the chain)"
-  log_action lock "$d" release-leaf-parent
+  retire_record "$d" unneeded quiet || return 1
+  if [ "$tier" = "placement" ]; then
+    echo "${C_GRN}✓${C_OFF} released: $d (back to ${owner}:${group} $mode)"
+  else
+    echo "${C_GRN}✓${C_OFF} released: $d ($flag cleared)"
+  fi
+  log_action release "$d" ok
 }
 
 # ---- mediated window -------------------------------------------------------
@@ -2329,8 +2515,8 @@ helper_outcome() { # <verb> <path>
 # insists on keeping apart -- rm and trash-finalized are observations by
 # the tool, assertion is a human's claim about a fact found afterwards.
 # The meta and its snapshots stay as the audit trail.
-retire_record() { # <path> <via>
-  local f="$1" via="$2"
+retire_record() { # <path> <via> [quiet]
+  local f="$1" via="$2" quiet="${3:-}"
   snap_paths "$f"
   [ -f "$META" ] || return 0
   if [ "$OPT_DRY" -eq 1 ]; then
@@ -2338,7 +2524,9 @@ retire_record() { # <path> <via>
     return 0
   fi
   rewrite_meta_state "$META" retired "via=$via" "by=$inv" "at=$(now_utc)" || return 1
-  echo "  record retired: $f"
+  # quiet: the caller's own result line already says what happened to the
+  # node, and the record following it is bookkeeping, not news.
+  [ "$quiet" = "quiet" ] || echo "  record retired: $f"
 }
 
 # Suspend: trashing is reversible, so retiring here would let a Put Back
@@ -2673,59 +2861,41 @@ do_lock_one() {
     "$user_home/.ssh"|"$user_home/.ssh/"*) under_ssh=1 ;;
   esac
 
-  local leaf_tier="$OPT_TIER"
-  if [ -z "$leaf_tier" ]; then
-    leaf_tier=content
-    if [ "$f" = "$user_home" ] || [ "$under_ssh" -eq 1 ]; then
-      leaf_tier=anchor
-    fi
+  # The tier follows the path: anchor for ~ itself and everything under
+  # ~/.ssh (sshd and the ssh client identity-check those, so their owner
+  # must never change), content for everything else. There is no option: a
+  # chain directory is never named -- it is derived from the leaves below it
+  # (see plan_releases) -- and nothing else is a choice worth offering.
+  local leaf_tier=content
+  if [ "$f" = "$user_home" ] || [ "$under_ssh" -eq 1 ]; then
+    leaf_tier=anchor
   fi
 
-  # A relock is not a tier change: a node with a record keeps the tier the
-  # record names. Defaulting to content instead turned a routine
-  # unlock/lock round trip on a placement dir into a failure -- content
-  # needs a uniform tree, and a placement dir's children legitimately carry
-  # the lock group -- and would have restored the wrong mode. The ~ and
-  # ~/.ssh anchor defaults above agree with any record those paths can
-  # have, and the ~/.ssh rule below still gets the last word.
+  # A chain directory is sealed for the leaves under it. Protecting it as
+  # content would freeze everything inside it, which is a different seal
+  # altogether, so say so rather than guess.
   snap_paths "$f"
-  local rec_tier=""
-  if [ -f "$META" ]; then
-    case "$(meta_field "$META" state)" in
-      locked|unlocked) rec_tier="$(meta_field "$META" tier)" ;;
-    esac
-  fi
-  if [ -n "$rec_tier" ]; then
-    if [ -z "$OPT_TIER" ]; then
-      leaf_tier="$rec_tier"
-    elif [ "$OPT_TIER" != "$rec_tier" ]; then
-      echo "${E_RED}${E_B}ERROR:${E_OFF} $f is recorded as tier $rec_tier; a relock keeps the recorded tier" >&2
-      echo "       A tier change is not a relock: it would have to un-provision" >&2
-      echo "       the seal this record describes, and no verb does that yet." >&2
-      log_action lock "$f" refuse-tier-change
+  local rec_role=""
+  if record_live "$META"; then
+    rec_role="$(meta_field "$META" role)"
+    if [ "$(meta_field "$META" tier)" = "placement" ]; then
+      echo "${E_RED}${E_B}ERROR:${E_OFF} $f is sealed as a chain directory for the files under it" >&2
+      echo "       Protecting it as content would freeze everything inside it. Protect" >&2
+      echo "       the files you mean instead; this seal goes when nothing needs it." >&2
+      log_action lock "$f" refuse-chain-dir
       return 1
     fi
   fi
 
-  # A symlink takes the content tier and no other. Placement is for a
-  # directory with entries to place, and a link has none; anchor is for the
-  # nodes the OS identity-checks, and every one of those checks resolves
-  # the path, so it judges the target and never the link. Content is the
-  # tier that seals a node as itself, which is the whole point of naming a
-  # link here.
+  # A symlink takes the content tier and no other. Anchor is for the nodes
+  # the OS identity-checks, and every one of those checks resolves the path,
+  # so it judges the target and never the link. Content is the tier that
+  # seals a node as itself, which is the whole point of naming a link here.
   if [ "$is_link" -eq 1 ] && [ "$leaf_tier" != "content" ]; then
-    echo "${E_RED}${E_B}ERROR:${E_OFF} $f is a symlink; the $leaf_tier tier does not apply to a link" >&2
-    echo "       A link has no entries to place and no ownership the OS" >&2
-    echo "       checks -- content is the only tier that seals the link" >&2
-    echo "       node itself. Name its target to seal that too." >&2
+    echo "${E_RED}${E_B}ERROR:${E_OFF} $f is a symlink under ~/.ssh; the anchor tier does not apply to a link" >&2
+    echo "       A link has no ownership the OS checks -- content is the only" >&2
+    echo "       tier that seals the link node itself. Name its target instead." >&2
     log_action lock "$f" refuse-link-tier
-    return 1
-  fi
-
-  if [ "$under_ssh" -eq 1 ] && [ "$leaf_tier" != "anchor" ]; then
-    echo "${E_RED}${E_B}ERROR:${E_OFF} $f: ~/.ssh and its files take the anchor tier only -- sshd" >&2
-    echo "       StrictModes and the ssh client's config check require" >&2
-    echo "       user-or-root ownership, which content/placement would flip" >&2
     return 1
   fi
 
@@ -2742,30 +2912,6 @@ do_lock_one() {
   local chain
   chain="$(chain_for "$f")" || return 1
 
-  # A leaf parent left out of the chain (the rule is argued at
-  # chain_skips_parent) may still hold a record. It is either a seal from
-  # before that rule, which this run un-provisions, or a node that earns
-  # its placement seal from HIGHER up -- some other sealed leaf sits more
-  # than one level below it, and its uappnd is what pins that leaf's
-  # parent. Both outcomes belong in the plan: one is a change the gate has
-  # to cover, the other is the reason a node a reader expects to leave is
-  # staying. An anchor parent is in the chain and takes neither.
-  local leaf_parent parent_action="" parent_keeper=""
-  leaf_parent="$(dirname "$f")"
-  snap_paths "$leaf_parent"
-  if chain_skips_parent "$f" && [ -f "$META" ] &&
-     [ "$(meta_field "$META" tier)" = "placement" ]; then
-    case "$(meta_field "$META" state)" in
-      locked|unlocked)
-        if parent_keeper="$(shared_ancestor_of "$leaf_parent")"; then
-          parent_action=kept
-        else
-          parent_action=release
-        fi
-        ;;
-    esac
-  fi
-
   # ---- plan ----------------------------------------------------------------
   #
   # Collected leaf first, then ancestors nearest-first: that is the order
@@ -2775,6 +2921,12 @@ do_lock_one() {
   plan_paths=(); plan_tiers=(); plan_flags=(); plan_actions=()
   local act
   act="$(plan_node "$f" "$leaf_tier" "$leaf_flag")" || return 1
+  # An anchor that is already sealed as somebody's chain node becomes yours
+  # by name: nothing on disk changes, but the record's role does, and from
+  # then on no release plan may take it.
+  if [ "$act" = "already locked" ] && [ "$rec_role" = "chain" ]; then
+    act="protect"
+  fi
   plan_paths+=("$f")
   plan_tiers+=("$leaf_tier")
   plan_flags+=("$leaf_flag")
@@ -2798,26 +2950,30 @@ do_lock_one() {
 $chain
 EOF
 
-  local n i w=0 changes=0
+  # Everything nothing needs once this leaf is protected: a directory that
+  # used to be sealed for a leaf that is gone, or the leaf's own parent
+  # from before the chain left it out.
+  plan_releases "" "$f"
+
+  local n i w=7 seals=0 protects=0 releases
+  releases="${#RELEASE_PATHS[@]}"
   n="${#plan_paths[@]}"
   i=0
   while [ "$i" -lt "$n" ]; do
-    if [ "${plan_actions[$i]}" != "already locked" ]; then
-      changes=$((changes + 1))
-    fi
+    case "${plan_actions[$i]}" in
+      "already locked") ;;
+      protect) protects=$((protects + 1)) ;;
+      *) seals=$((seals + 1)) ;;
+    esac
     if [ "${#plan_actions[$i]}" -gt "$w" ]; then
       w="${#plan_actions[$i]}"
     fi
     i=$((i + 1))
   done
-  # Un-provisioning the leaf's parent is a change like any other: it is
-  # what the gate below is being asked about, and a run that has nothing
-  # else to do still has this.
-  [ "$parent_action" = "release" ] && changes=$((changes + 1))
 
   # A chain that is already whole asks nothing: there is no change to
   # consent to, and a gate over an empty set trains the eye to say yes.
-  if [ "$changes" -eq 0 ]; then
+  if [ $((seals + protects + releases)) -eq 0 ]; then
     echo "already locked: $f"
     log_action lock "$f" skip-already-locked
     return 0
@@ -2825,44 +2981,37 @@ EOF
 
   # The witness first (what the leaf holds now against what it held when it
   # was released), then the plan, then the one question.
-  if [ "${plan_actions[0]}" != "already locked" ]; then
-    lock_witness "$f" "$leaf_tier" || return 1
-  fi
+  case "${plan_actions[0]}" in
+    "already locked"|protect) ;;
+    *) lock_witness "$f" "$leaf_tier" || return 1 ;;
+  esac
 
   # Root-most first: a tree reads top-down, and the node that governs
   # everything under it is the one to read first. The plan shares the
   # prompt's stream, so redirecting stdout can never separate the gate from
   # the list it is about. Already-locked rows are dim -- they are context,
-  # not offer.
-  #
-  # The leaf's parent sits between the chain and the leaf, so its line goes
-  # in at exactly that point: root-most ordering is preserved and the row
-  # reads where a reader looks for it. It carries its reason rather than a
-  # bare action word -- a node leaving the chain, or staying in it for
-  # somebody else, is the one plan row that is not self-explanatory.
+  # not offer. Releases follow the chain in the same column, each with the
+  # reason a reader needs: a directory leaving the pool is the one row that
+  # is not self-explanatory.
   echo "${E_B}plan for $f (tier $leaf_tier):${E_OFF}" >&2
   i=$((n - 1))
   while [ "$i" -ge 0 ]; do
-    if [ "$i" -eq 0 ]; then
-      case "$parent_action" in
-        kept)
-          printf '%s  kept: %s (placement; ancestor of %s)%s\n' \
-            "$E_DIM" "$leaf_parent" "$parent_keeper" "$E_OFF" >&2
-          ;;
-        release)
-          printf '  release: %s (leaf parent, leaves the chain)\n' \
-            "$leaf_parent" >&2
-          ;;
-      esac
-    fi
-    if [ "${plan_actions[$i]}" = "already locked" ]; then
-      printf '%s  %-*s  %s%s\n' "$E_DIM" "$w" "${plan_actions[$i]}" \
-        "${plan_paths[$i]}" "$E_OFF" >&2
-    else
-      printf '  %-*s  %s\n' "$w" "${plan_actions[$i]}" "${plan_paths[$i]}" >&2
-    fi
+    case "${plan_actions[$i]}" in
+      "already locked")
+        printf '%s  %-*s  %s%s\n' "$E_DIM" "$w" "${plan_actions[$i]}" \
+          "${plan_paths[$i]}" "$E_OFF" >&2
+        ;;
+      protect)
+        printf '  %-*s  %s %s(already sealed; now protected by name)%s\n' "$w" \
+          protect "${plan_paths[$i]}" "$E_DIM" "$E_OFF" >&2
+        ;;
+      *)
+        printf '  %-*s  %s\n' "$w" "${plan_actions[$i]}" "${plan_paths[$i]}" >&2
+        ;;
+    esac
     i=$((i - 1))
   done
+  release_rows "  " "$w"
   echo >&2
 
   if [ "$OPT_DRY" -eq 1 ]; then
@@ -2871,9 +3020,13 @@ EOF
     return 0
   fi
 
-  local noun="nodes"
-  [ "$changes" -eq 1 ] && noun="node"
-  confirm "Seal $(subj "$f") as listed ($changes $noun to change)?" seals || {
+  local q
+  if [ "$seals" -gt 0 ]; then
+    q="Seal $(subj "$f") as listed ($(change_counts seal "$seals" protect "$protects" release "$releases"))?"
+  else
+    q="Apply the plan for $(subj "$f") ($(change_counts protect "$protects" release "$releases"))?"
+  fi
+  confirm "$q" "applies it" || {
     # The decline is the decision this run made, so it goes in the log
     # beside the seals that were taken -- and it is the whole record of
     # the run, since not one node was touched.
@@ -2884,24 +3037,61 @@ EOF
 
   # ---- apply ---------------------------------------------------------------
   #
-  # The leaf's parent first: while it is still uappnd, nothing may be
-  # renamed or unlinked inside it, and the seals below are free to do
-  # either. Then leaf, then ancestors nearest-first (the plan's own order),
-  # and no further questions: the gate above answered for all of them.
-  if [ "$parent_action" = "release" ]; then
-    release_leaf_parent "$leaf_parent" || return $?
-  fi
+  # Releases first: a node leaving the pool is never one this plan seals
+  # (the needed set holds every node of this chain), so the order is free,
+  # and done first no seal below can trip over a flag about to go. Then the
+  # leaf, then ancestors nearest-first (the plan's own order), and no
+  # further questions: the gate above answered for all of them.
+  apply_releases || return 1
+  local role
   i=0
   while [ "$i" -lt "$n" ]; do
-    if [ "${plan_actions[$i]}" != "already locked" ]; then
-      case "${plan_tiers[$i]}" in
-        content)   seal_content "${plan_paths[$i]}" || return $? ;;
-        placement) seal_placement "${plan_paths[$i]}" || return $? ;;
-        anchor)    seal_anchor "${plan_paths[$i]}" "${plan_flags[$i]}" || return $? ;;
-      esac
-    fi
+    case "${plan_actions[$i]}" in
+      "already locked") ;;
+      protect)
+        snap_paths "${plan_paths[$i]}"
+        rewrite_meta_role "$META" leaf || return 1
+        echo "${C_GRN}✓${C_OFF} protected: ${plan_paths[$i]} (already sealed; now yours by name)"
+        log_action lock "${plan_paths[$i]}" protect
+        ;;
+      *)
+        case "${plan_tiers[$i]}" in
+          content)   seal_content "${plan_paths[$i]}" || return $? ;;
+          placement) seal_placement "${plan_paths[$i]}" || return $? ;;
+          anchor)
+            # The named node is a leaf. An ancestor keeps a leaf role it
+            # already has -- a node you named stays yours when some other
+            # chain runs through it -- and is a chain node otherwise.
+            role=chain
+            if [ "$i" -eq 0 ]; then
+              role=leaf
+            else
+              snap_paths "${plan_paths[$i]}"
+              if record_live "$META" && [ "$(meta_field "$META" role)" = "leaf" ]; then
+                role=leaf
+              fi
+            fi
+            seal_anchor "${plan_paths[$i]}" "${plan_flags[$i]}" "$role" || return $?
+            ;;
+        esac
+        ;;
+    esac
     i=$((i + 1))
   done
+}
+
+# change_counts <kind> <n>...: "2 seals, 1 release" -- the kinds with a
+# nonzero count, in the order given, so a gate names what it is asking.
+change_counts() {
+  local out="" kind cnt
+  while [ $# -ge 2 ]; do
+    kind="$1" cnt="$2"
+    shift 2
+    [ "$cnt" -gt 0 ] || continue
+    [ "$cnt" -eq 1 ] || kind="${kind}s"
+    if [ -z "$out" ]; then out="$cnt $kind"; else out="$out, $cnt $kind"; fi
+  done
+  printf '%s' "$out"
 }
 
 do_unlock_one() {
@@ -2935,6 +3125,132 @@ $chain
 EOF
     echo "chain released; relock with: ${C_CYN}sudo locked lock $f${C_OFF}"
   fi
+}
+
+# ---- unprotect --------------------------------------------------------------
+#
+# The permanent counterpart of lock. unlock is the edit window: it keeps the
+# record, the snapshot and the chain, because the seal is coming back.
+# unprotect ends the protection: the leaf goes back to the identity it had
+# before it was locked, its record retires via=unprotect, and every chain
+# directory no other protected file needs is released in the same plan and
+# under the same one question.
+
+# identity_text <metafile>: "jooize:staff 644" for the result and plan rows.
+identity_text() {
+  printf '%s:%s %s' "$(meta_field "$1" owner)" "$(meta_field "$1" group)" \
+    "$(meta_field "$1" mode)"
+}
+
+do_unprotect_one() {
+  local f
+  # leaf_path, so a protected symlink is one node here too.
+  f="$(leaf_path "$1")" || return 1
+  snap_paths "$f"
+  if ! record_live "$META"; then
+    echo "skip $f: not protected" >&2
+    log_action unprotect "$f" skip-no-record
+    return 1
+  fi
+  local role state tier back
+  role="$(meta_field "$META" role)"
+  state="$(meta_field "$META" state)"
+  tier="$(meta_field "$META" tier)"
+  if [ "$role" != "leaf" ]; then
+    echo "skip $f: sealed as part of a chain, not protected by name" >&2
+    echo "  it is released by the first plan in which no protected file needs it" >&2
+    log_action unprotect "$f" skip-chain-node
+    return 1
+  fi
+  if [ "$state" = "suspended" ]; then
+    echo "skip $f: in the trash (record suspended); nothing here to unprotect" >&2
+    log_action unprotect "$f" skip-suspended
+    return 1
+  fi
+
+  plan_releases "$f" ""
+
+  # What the leaf goes back to, in the words the result line will use.
+  case "$tier" in
+    anchor) back="$(meta_field "$META" flag) cleared" ;;
+    *)
+      if [ -L "$f" ]; then
+        back="back to $(meta_field "$META" owner):$(meta_field "$META" group)"
+      else
+        back="back to $(identity_text "$META")"
+      fi
+      ;;
+  esac
+
+  local w=9
+  echo "${E_B}plan for $f:${E_OFF}" >&2
+  printf '  %-*s  %s %s(%s)%s\n' "$w" unprotect "$f" "$E_DIM" "$back" "$E_OFF" >&2
+  release_rows "  " "$w"
+  echo >&2
+
+  if [ "$OPT_DRY" -eq 1 ]; then
+    echo "dry run: nothing changed" >&2
+    log_action unprotect "$f" dry-run
+    return 0
+  fi
+
+  local q="Stop protecting $(subj "$f")?" nr="${#RELEASE_PATHS[@]}"
+  if [ "$nr" -eq 1 ]; then
+    q="Stop protecting $(subj "$f") and release 1 directory?"
+  elif [ "$nr" -gt 1 ]; then
+    q="Stop protecting $(subj "$f") and release $nr directories?"
+  fi
+  confirm "$q" "applies it" || {
+    log_action unprotect "$f" abort
+    echo "${E_YEL}aborted: $f${E_OFF}" >&2
+    return 2
+  }
+
+  unprotect_leaf "$f" "$back" || return 1
+  apply_releases || return 1
+}
+
+# unprotect_leaf <path> <result text>: flag off (unless an unlock already
+# took it), recorded identity back, record retired. An unlocked content
+# leaf is already the invoker's again -- unlock restored owner and mode --
+# so only the record is left to close.
+unprotect_leaf() {
+  local f="$1" back="$2" tier flag recursive owner group mode state
+  snap_paths "$f"
+  tier="$(meta_field "$META" tier)"
+  flag="$(meta_field "$META" flag)"
+  recursive="$(meta_field "$META" recursive)"
+  owner="$(meta_field "$META" owner)"
+  group="$(meta_field "$META" group)"
+  mode="$(meta_field "$META" mode)"
+  state="$(meta_field "$META" state)"
+  if [ "$state" = "locked" ]; then
+    case "$tier" in
+      content)
+        if [ "$recursive" = "1" ]; then
+          fclear "$flag" "$f" -R || return 1
+          run chown -R "${owner}:${group}" "$f" || return 1
+        else
+          fclear "$flag" "$f" || return 1
+          run chown -h "${owner}:${group}" "$f" || return 1
+        fi
+        # No chmod on a link: chmod(2) follows it to the target.
+        if [ ! -L "$f" ]; then
+          run chmod "$mode" "$f" || return 1
+        fi
+        ;;
+      anchor)
+        fclear "$flag" "$f" || return 1
+        ;;
+      *)
+        echo "${E_RED}${E_B}ERROR:${E_OFF} $f record has tier '$tier'; only a leaf can be unprotected" >&2
+        return 1
+        ;;
+    esac
+  fi
+  retire_record "$f" unprotect quiet || return 1
+  echo "${C_GRN}✓${C_OFF} unprotected: $f ($back)"
+  log_action unprotect "$f" ok
 }
 
 # The staging file both edit paths freeze their candidate into: a fresh
@@ -3104,6 +3420,7 @@ do_edit_one() {
     "flagsym=$(flags_of "$f")" \
     "id=$(node_id "$f")" \
     "recursive=0" \
+    "role=$(meta_field "$META" role)" \
     "state=locked" || return 1
   echo "${C_GRN}✓${C_OFF} edited and resealed: $f"
   log_action edit "$f" ok
@@ -3168,6 +3485,7 @@ do_revert_one() {
         "flagsym=$(flags_of "$f")" \
         "id=$(node_id "$f")" \
         "recursive=0" \
+        "role=$(meta_field "$META" role)" \
         "state=locked" || return 1
     fi
   else
@@ -3221,7 +3539,45 @@ do_rm_one() {
       what="directory and everything under it"
     fi
   fi
-  confirm "Permanently remove $(subj "$f") ($what)?" || {
+  # Removing a protected file can leave chain directories nothing needs any
+  # more. They are released under this same question, after the removal
+  # has happened -- never ones inside the removed path, which go with it.
+  local rm_leaves="" p i
+  for p in ${SUBTREE_NODES[@]+"${SUBTREE_NODES[@]}"}; do
+    snap_paths "$p"
+    record_live "$META" || continue
+    [ "$(meta_field "$META" role)" = "leaf" ] || continue
+    rm_leaves="$rm_leaves$p"$'\n'
+  done
+  RELEASE_PATHS=()
+  RELEASE_REASONS=()
+  if [ -n "$rm_leaves" ]; then
+    plan_releases "$rm_leaves" ""
+    local -a keep_p keep_r
+    keep_p=(); keep_r=()
+    i=0
+    while [ "$i" -lt "${#RELEASE_PATHS[@]}" ]; do
+      case "${RELEASE_PATHS[$i]}" in
+        "$f"|"$f"/*) ;;
+        *) keep_p+=("${RELEASE_PATHS[$i]}"); keep_r+=("${RELEASE_REASONS[$i]}") ;;
+      esac
+      i=$((i + 1))
+    done
+    RELEASE_PATHS=(${keep_p[@]+"${keep_p[@]}"})
+    RELEASE_REASONS=(${keep_r[@]+"${keep_r[@]}"})
+  fi
+  local q="Permanently remove $(subj "$f") ($what)?" nr="${#RELEASE_PATHS[@]}"
+  if [ "$nr" -gt 0 ]; then
+    echo "${E_B}removing it also releases:${E_OFF}" >&2
+    release_rows "  " 7
+    echo >&2
+    if [ "$nr" -eq 1 ]; then
+      q="Permanently remove $(subj "$f") ($what) and release 1 directory?"
+    else
+      q="Permanently remove $(subj "$f") ($what) and release $nr directories?"
+    fi
+  fi
+  confirm "$q" || {
     echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
   }
 
@@ -3241,6 +3597,7 @@ do_rm_one() {
   local rc=0
   echo "${C_GRN}✓${C_OFF} removed: $f"
   apply_subtree_effect rm "$f" || rc=1
+  apply_releases || rc=1
   if [ "$HELPER_ANOMALY" -eq 1 ]; then
     rc=3
   else
@@ -3420,6 +3777,31 @@ do_mv() { # <old> <new>
     rc=3
   elif [ "$rc" -eq 0 ]; then
     log_action mv "$old" ok
+  fi
+
+  # A protected file that moved needs the chain of its new place, and the
+  # chain of its old place may be needed by nothing now. That is exactly a
+  # lock plan for it at the new path, so each moved leaf gets one, with its
+  # own question (--yes answers them). The move has happened either way: a
+  # declined plan leaves the file sealed where it is, and says how to finish.
+  if [ "$rc" -ne 1 ] && [ "$OPT_DRY" -eq 0 ]; then
+    local i n moved lrc
+    i=0
+    while [ "$i" -lt "${#SUBTREE_NODES[@]}" ]; do
+      n="${SUBTREE_NODES[$i]}"
+      i=$((i + 1))
+      moved="${new}${n#"$old"}"
+      snap_paths "$moved"
+      record_live "$META" || continue
+      [ "$(meta_field "$META" role)" = "leaf" ] || continue
+      echo
+      lrc=0
+      do_lock_one "$moved" || lrc=$?
+      if [ "$lrc" -ne 0 ]; then
+        echo "${E_YEL}note:${E_OFF} $moved is sealed, but the chain at its new place is not settled:" >&2
+        cmd_rows "      " "sudo locked lock $moved" "seals the new chain and releases the old one" >&2
+      fi
+    done
   fi
   return "$rc"
 }
@@ -3688,21 +4070,21 @@ EOF
   # A leaf parent left out of the chain (the rule is argued at
   # chain_skips_parent) is still the node a reader looks for first, so it
   # prints as context: dim, with the reason, and never a "!" -- there is
-  # nothing on it to be out of order. A parent that DOES hold a record is a
-  # pool node like any other -- it is kept as a higher ancestor of another
-  # leaf, or it is a pre-rule seal awaiting the next lock -- so it gets the
-  # ordinary row, drift and all. An anchor parent is in the chain above and
-  # has already printed.
+  # nothing on it to be out of order. A parent that holds a LIVE record is a
+  # pool node like any other -- another leaf's chain runs through it, or
+  # nothing needs it and the next plan releases it -- so it gets the
+  # ordinary row, drift and all. A retired record is history and reads as
+  # none. An anchor parent is in the chain above and has already printed.
   parent="$(dirname "$f")"
   if [ "$parent" != "$f" ] && chain_skips_parent "$f"; then
     snap_paths "$parent"
-    if [ -f "$META" ]; then
+    if record_live "$META"; then
       status_row "$parent" "$brief" || rc=1
       if [ "$STATUS_ROW_POOL" -eq 1 ]; then
         CHAIN_ANY=1
       fi
     else
-      echo "    ${P_DIM}-${P_OFF}  $parent ${P_DIM}(leaf parent, not in the chain)${P_OFF}"
+      echo "    ${P_DIM}-${P_OFF}  $parent ${P_DIM}(not needed: $(dirname "$parent") keeps it in place)${P_OFF}"
     fi
   fi
   status_row "$f" "$brief" || rc=1
@@ -3776,6 +4158,20 @@ do_status_pool() {
   done <<EOF
 $listing
 EOF
+  # Chain directories nothing needs any more -- a protected file went to
+  # the trash and never came back, or a record was tombstoned. Only a
+  # gated verb releases, so the listing says which one and stops there.
+  plan_releases "" "" 2>/dev/null
+  if [ "${#RELEASE_PATHS[@]}" -gt 0 ]; then
+    echo
+    echo "${P_YEL}note:${P_OFF} no protected file needs these any more:"
+    local i=$((${#RELEASE_PATHS[@]} - 1))
+    while [ "$i" -ge 0 ]; do
+      echo "      ${RELEASE_PATHS[$i]}"
+      i=$((i - 1))
+    done
+    echo "      The next sudo locked lock, unprotect or rm releases them."
+  fi
   return 0
 }
 
@@ -3846,7 +4242,7 @@ require_paths() {
 }
 
 case "$action" in
-  lock|unlock|revert|status|edit|rm|trash|tombstone|why)
+  lock|unprotect|unlock|revert|status|edit|rm|trash|tombstone|why)
     if [ "$action" = "edit" ] && [ "$OPT_DRY" -eq 1 ]; then
       echo "edit does not support --dry-run (the diff+confirm IS the preview)" >&2
       exit 1
@@ -3878,6 +4274,7 @@ case "$action" in
       rc=0
       case "$action" in
         lock)      do_lock_one "$f"      || rc=$? ;;
+        unprotect) do_unprotect_one "$f" || rc=$? ;;
         unlock)    do_unlock_one "$f"    || rc=$? ;;
         revert)    do_revert_one "$f"    || rc=$? ;;
         edit)      do_edit_one "$f"      || rc=$? ;;
@@ -3914,7 +4311,10 @@ case "$action" in
     # failed. Declines are a normal outcome, not an error.
     if [ "$total" -gt 1 ] && [ "$action" != "status" ] && [ "$action" != "why" ]; then
       case "$action" in
-        lock)      batch_noun=locked ;;
+        # A lock item can end with only releases, or with nothing to do,
+        # so "locked" would overclaim; each item's own lines say what.
+        lock)      batch_noun=done ;;
+        unprotect) batch_noun=unprotected ;;
         unlock)    batch_noun=unlocked ;;
         revert)    batch_noun=reverted ;;
         edit)      batch_noun=edited ;;
