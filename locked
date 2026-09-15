@@ -45,7 +45,7 @@ set -euo pipefail
 IFS=$'\n\t'
 shopt -s nullglob
 
-VERSION=0.13.0
+VERSION=0.14.0
 
 # Override-friendly defaults (test seams; sudo's env_reset strips these on
 # real invocations, so they are only reachable when the script is executed
