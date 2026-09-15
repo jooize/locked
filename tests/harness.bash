@@ -1962,7 +1962,7 @@ ok   "verify clean with a shared ancestor"     locked verify --quiet
 note "== status: the leaf parent prints as context =="
 locked_home "$LPHOME" status "$LPF" >"$LPOUT" 2>&1 || true
 ok   "the chain names the leaf parent"         \
-     grep -qF "-  $LPB (leaf parent, not in the chain)" "$LPOUT"
+     grep -qF -- "-  $LPB (leaf parent, not in the chain)" "$LPOUT"
 deny "and never marks it unlocked"             grep -qF "!  $LPB" "$LPOUT"
 deny "and never calls it a drift"              grep -qF "✗  $LPB" "$LPOUT"
 ok   "the grandparent prints as placement"     grep -qF "✓  $LPA (placement uappnd)" "$LPOUT"
