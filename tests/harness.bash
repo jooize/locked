@@ -2500,7 +2500,7 @@ ok   "with the legacy root gone, runs pass"    locked_conv verify --quiet
 # is killing the holder, with no child left behind to keep fd 9 open.
 
 note "== run lock: root runs take turns =="
-RUNLOCK="$CONV_STATE/.run.lock"
+RUNLOCK="$CONV_STATE/run.lock"
 RUNLOG="$SCRATCH/runlock.log"
 check "the run lock is root's, 600"            "root 600" "$(stat -f '%Su %OLp' "$RUNLOCK")"
 hold_run_lock() { # <seconds>: hold the run lock in the background; $! is the holder

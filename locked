@@ -1083,7 +1083,7 @@ fi
 # the pool. Layout (root converges it below):
 #
 #   $LOCKED_STATE_ROOT/      root:wheel 711
-#     .run.lock              root:wheel 600 (one root run at a time; see run_lock_take)
+#     run.lock               root:wheel 600 (one root run at a time; see run_lock_take)
 #     <user>/                root:_<user>-lock 750
 #       pool/                _<user>-lock:_<user>-lock 750 (records, snapshots)
 #       verify               root:_<user>-lock 640 (the last verify run)
@@ -1151,7 +1151,7 @@ convert_legacy_layout() {
 # read descriptor, and one opened early could stall every root run for
 # good. A child that runs as the user closes fd 9 (the editor), since a
 # child that outlived us would keep the lock held.
-LOCKED_RUN_LOCK="$LOCKED_STATE_ROOT/.run.lock"
+LOCKED_RUN_LOCK="$LOCKED_STATE_ROOT/run.lock"
 
 flock_fd9() { # <try|wait>: 0 locked, 1 held by another run (try only), 2 error
   /usr/bin/perl -MFcntl=:flock -e '

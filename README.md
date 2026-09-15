@@ -318,7 +318,7 @@ mount-table question, not a tier question.
 ## State layout
 ```
 /var/db/locked/                        mode 711  root:wheel
-├── .run.lock                          mode 600  root:wheel
+├── run.lock                           mode 600  root:wheel
 └── jooize/                            mode 750  root:_jooize-lock
     ├── pool/                          mode 750  _jooize-lock:_jooize-lock
     │   ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.snap   mode 600
@@ -345,7 +345,7 @@ The file is replaced whole by a rename in a dir only root can write: a
 reader always gets one run's complete answer, and nothing running as you
 can change or remove it.
 
-`.run.lock` makes root runs take turns. Every root invocation (a
+`run.lock` makes root runs take turns. Every root invocation (a
 ceremony, the timer's verify, one you start) holds it until it exits, and
 a run that finds it held prints whose it is and waits. So verify never
 reads a ceremony halfway, two ceremonies never plan against one pool at
