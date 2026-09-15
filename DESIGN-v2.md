@@ -358,6 +358,16 @@ reports it as stale rather than clean. (Until 0.15.0 the result was an
 alert file written as the user under their home, which any process
 running as the user could delete.)
 
+Root runs take turns on one lock (`/var/db/locked/.run.lock`, flock(2),
+root 600). Without it a verify could read a record or node halfway through
+a ceremony and report drift that is not there, two ceremonies could plan
+against one pool at once (one releasing a chain node the other's new leaf
+needs), and an older verify finishing last would overwrite a newer run's
+status. The lock is held from the root convergence to exit, gates and the
+editor included, because a plan made under the lock has to be the one
+applied; an open ceremony therefore pauses the timer's verify, which the
+status shows as stale once it lasts three intervals.
+
 What this does not cover: a reader sees drift only as of the last run, up
 to one interval late, and while the machine sleeps nothing runs.
 EndpointSecurity/eslogger EPERM-monitoring is explicitly later.

@@ -318,6 +318,7 @@ mount-table question, not a tier question.
 ## State layout
 ```
 /var/db/locked/                        mode 711  root:wheel
+├── .run.lock                          mode 600  root:wheel
 └── jooize/                            mode 750  root:_jooize-lock
     ├── pool/                          mode 750  _jooize-lock:_jooize-lock
     │   ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.snap   mode 600
@@ -343,6 +344,15 @@ each line is printable ASCII and no file name can add a line of its own.
 The file is replaced whole by a rename in a dir only root can write: a
 reader always gets one run's complete answer, and nothing running as you
 can change or remove it.
+
+`.run.lock` makes root runs take turns. Every root invocation (a
+ceremony, the timer's verify, one you start) holds it until it exits, and
+a run that finds it held prints whose it is and waits. So verify never
+reads a ceremony halfway, two ceremonies never plan against one pool at
+once, and runs finish in the order they started. The kernel drops the lock
+when its holder exits, however it exits. A ceremony left open at its
+editor or its `[y/N]` gate holds the lock too, so the timer's verify waits
+for it; past three intervals the status reads as stale.
 
 Up to 0.14.0 each pool sat at `/var/db/locked-snapshots/<user>`. The first
 root invocation of 0.15.0 moves every pool into `<user>/pool` by rename and
