@@ -326,7 +326,11 @@ home_for() {
 }
 user_home=""
 if [ -n "$inv" ]; then
-  user_home="${LOCKED_USER_HOME:-$(home_for "$inv")}"
+  # An assignment carries its substitution's exit status, and set -e would
+  # end the script on it silently (dscl exits 70 when Directory Services is
+  # unreachable, e.g. under a sandbox). Swallow it so the check below is the
+  # one that reports.
+  user_home="${LOCKED_USER_HOME:-$(home_for "$inv" || true)}"
   [ -n "$user_home" ] || { echo "cannot determine home directory of $inv" >&2; exit 1; }
 fi
 
