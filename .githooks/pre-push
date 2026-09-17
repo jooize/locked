@@ -14,10 +14,16 @@
 #   still names commits the remote lost lets those pass unscanned.
 #   Override, when the reference is the point:
 #     COMMIT_ALLOW_GITHUB_REFS=1 git push ...
+# Then gitleaks scans the same commits for secrets, so a commit that skipped the
+#   pre-commit scan (git commit -n, a rewrite) cannot carry one off the machine.
+#   Fail closed like pre-commit: no gitleaks and no nix, or a broken scan, refuses.
+#   Override, when the finding really belongs in the push:
+#     COMMIT_ALLOW_SECRETS=1 git push ...
 # Portable POSIX sh/awk/grep -- same behaviour on macOS and in the Linux lanes.
 set -eu
 
 remote="$1"
+ranges=""
 zero="0000000000000000000000000000000000000000"
 report=""
 
@@ -49,25 +55,95 @@ while read -r local_ref local_oid remote_ref remote_oid; do
   if [ "$remote_oid" != "$zero" ] && git cat-file -e "$remote_oid" 2>/dev/null; then
     set -- "$@" "$remote_oid"
   fi
+  ranges="${ranges}$*
+"
   for c in $(git rev-list "$@"); do
     scan "$(git log -1 --format='%h %s' "$c")" \
       "$(git cat-file commit "$c" | sed '1,/^$/d')"
   done
 done
 
-[ -n "$report" ] || exit 0
-if [ "${COMMIT_ALLOW_GITHUB_REFS:-}" = 1 ]; then
+if [ -n "$report" ] && [ "${COMMIT_ALLOW_GITHUB_REFS:-}" = 1 ]; then
   echo "pre-push: GitHub reference allowed (COMMIT_ALLOW_GITHUB_REFS=1):" >&2
   printf '%s' "$report" >&2
+elif [ -n "$report" ]; then
+  {
+    echo "pre-push: the push carries a message that references a GitHub thread or user."
+    printf '%s' "$report"
+    echo "  Pushed to GitHub, each of these leaves a permanent entry on that thread (or"
+    echo "  a notification to that user) linking to the commit exactly as it is."
+    echo "  Nothing was pushed. Reword the message (spell the number out, drop the @,"
+    echo "  or describe instead of linking) and push again."
+    echo "  If the reference IS the point: COMMIT_ALLOW_GITHUB_REFS=1 git push ..."
+  } >&2
+  exit 1
+fi
+
+[ -n "$ranges" ] || exit 0
+
+# gitleaks on PATH first; nix as the fallback runner. Neither -> refuse.
+if command -v gitleaks >/dev/null 2>&1; then
+  set -- gitleaks
+elif command -v nix >/dev/null 2>&1; then
+  set -- nix run nixpkgs#gitleaks --
+else
+  {
+    echo "pre-push: no gitleaks and no nix on PATH, so the pushed commits"
+    echo "  cannot be scanned for secrets. Refusing the push."
+    echo "  On this Mac gitleaks ships from nix-config (modules/git.nix);"
+    echo "  deploy nix-config to install it."
+    echo "  Anywhere else: install gitleaks, or put nix on PATH and this hook"
+    echo "  runs 'nix run nixpkgs#gitleaks' by itself."
+  } >&2
+  exit 1
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+out="$(mktemp "${TMPDIR:-/tmp}/gitleaks-pre-push.XXXXXX")"
+trap 'rm -f "$out"' EXIT
+rc=0
+# One scan per pushed ref, over the commits the remote does not have (the same
+# rev-list arguments as above). 0 clean, 1 findings, anything else broken; the
+# worst code wins.
+while IFS= read -r range; do
+  [ -n "$range" ] || continue
+  one=0
+  "$@" git --log-opts="$range" --redact --no-banner --no-color -v . \
+    >> "$out" 2>&1 || one=$?
+  if [ "$one" != 0 ] && [ "$one" != 1 ]; then rc=$one
+  elif [ "$one" = 1 ] && [ "$rc" = 0 ]; then rc=1
+  fi
+done <<EOF
+$ranges
+EOF
+
+if [ "$rc" = 0 ]; then
+  exit 0
+fi
+if [ "$rc" != 1 ]; then
+  {
+    echo "pre-push: gitleaks exited $rc, so the pushed commits are UNSCANNED."
+    echo "  Refusing the push."
+    sed 's/^./  &/' "$out"   # indent, but leave blank lines blank
+    echo "  Fix the scanner (or the .gitleaks.toml it reads) and push again."
+    echo "  COMMIT_ALLOW_SECRETS=1 does not cover a broken scan."
+  } >&2
+  exit 1
+fi
+if [ "${COMMIT_ALLOW_SECRETS:-}" = 1 ]; then
+  {
+    echo "pre-push: secret findings allowed (COMMIT_ALLOW_SECRETS=1):"
+    sed 's/^./  &/' "$out"   # indent, but leave blank lines blank
+  } >&2
   exit 0
 fi
 {
-  echo "pre-push: the push carries a message that references a GitHub thread or user."
-  printf '%s' "$report"
-  echo "  Pushed to GitHub, each of these leaves a permanent entry on that thread (or"
-  echo "  a notification to that user) linking to the commit exactly as it is."
-  echo "  Nothing was pushed. Reword the message (spell the number out, drop the @,"
-  echo "  or describe instead of linking) and push again."
-  echo "  If the reference IS the point: COMMIT_ALLOW_GITHUB_REFS=1 git push ..."
+  echo "pre-push: gitleaks found a secret in the commits being pushed."
+  sed 's/^./  &/' "$out"   # indent, but leave blank lines blank
+  echo "  Nothing was pushed. The commit object carries the secret, so remove it"
+  echo "  by rewriting that commit (rotate it if it was ever real), then push again."
+  echo "  A fixture that must carry a secret-shaped string: allowlist it in"
+  echo "  .gitleaks.toml at the repo root."
+  echo "  If the finding really belongs here: COMMIT_ALLOW_SECRETS=1 git push ..."
 } >&2
 exit 1
