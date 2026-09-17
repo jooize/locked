@@ -29,7 +29,7 @@ else
     echo "pre-commit: no gitleaks and no nix on PATH, so the staged changes"
     echo "  cannot be scanned for secrets. Refusing the commit."
     echo "  On this Mac gitleaks ships from nix-config (modules/git.nix);"
-    echo "  deploy it with: pinned upgrade"
+    echo "  deploy nix-config to install it."
     echo "  Anywhere else: install gitleaks, or put nix on PATH and this hook"
     echo "  runs 'nix run nixpkgs#gitleaks' by itself."
   } >&2
