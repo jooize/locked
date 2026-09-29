@@ -279,15 +279,22 @@ in
 
     {
       # Declarative replacement for install_verify_timer. The daemon runs
-      # the store path directly: launchd needs no digest gate (it is root
-      # already), and the plist changing per build makes nix-darwin
-      # reload it with each generation. Label is set explicitly so the
+      # the store path, not a digest-gated copy: launchd needs no gate (it
+      # is root already), and the plist changing per build makes
+      # nix-darwin reload it with each generation. Label is set explicitly so the
       # plist keeps the documented path
       # /Library/LaunchDaemons/locked.verify.plist.
+      #
+      # `command`, not ProgramArguments: nix-darwin then starts it through
+      # `/bin/wait4path /nix/store`. At boot launchd can load the plist
+      # before the Nix store volume is mounted; given the store path
+      # directly, it logs "Missing executable detected" and never starts
+      # the job again (seen on macOS 27.0.1, 2026-09-29), so verify went
+      # stale until the next reload.
       launchd.daemons.locked-verify = {
+        command = "${package}/bin/locked verify --quiet";
         serviceConfig = {
           Label = "locked.verify";
-          ProgramArguments = [ "${package}/bin/locked" "verify" "--quiet" ];
           StartInterval = cfg.verifyInterval;
           RunAtLoad = true;
           StandardErrorPath = "/var/log/locked-verify.log";
