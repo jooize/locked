@@ -491,12 +491,88 @@ EDITBODY="$SCRATCH/do_edit_one.body"
 awk '/^do_edit_one\(\) \{/,/^\}$/' "$LOCKED" >"$EDITBODY"
 ok   "the edit body was extracted"        test -s "$EDITBODY"
 ok   "the diff reads the frozen copy"     \
-     grep -qF -- '--label "$lhs" --label "$rhs" "$f" "$stage"' "$EDITBODY"
+     grep -qF -- '--label "$lhs" --label "$rhs" "$old" "$stage"' "$EDITBODY"
 ok   "the install reads the frozen copy"  \
      grep -qF 'atomic_replace "$stage" "$f"' "$EDITBODY"
 FREEZELN="$(grep -n 'show_diff' "$EDITBODY" | head -1 | cut -d: -f1)"
 deny "the proposal is not named after the freeze" \
      /bin/sh -c "tail -n +$FREEZELN '$EDITBODY' | grep -q 'OPT_FROM'"
+
+note "== cli: edit inside a folder sealed as content =="
+# CD is sealed above (content, the whole tree). Its files have no records
+# of their own; an edit follows the folder's record and never unlocks it.
+pool_meta() { printf '%s/%s/pool/%s.meta' "$STATEROOT" "$INV" "$(printf '%s' "$1" | sed -e 's|%|%25|g' -e 's|/|%2F|g')"; }
+PROPF="$PROPD/folder.proposed.txt"
+as_user /bin/sh -c "printf 'edited in the folder\n' > '$PROPF'"
+ok   "edit --from a file in a sealed folder"   locked edit --yes --from "$PROPF" "$CD/nested/b.txt"
+check "the folder file has the proposal"       "edited in the folder" "$(head -1 "$CD/nested/b.txt")"
+check "the folder file is still frozen"        "uchg" "$(flags_of "$CD/nested/b.txt")"
+check "the folder file owner lock account"     "$LOCK_ACCT" "$(owner_of "$CD/nested/b.txt")"
+check "its directory is frozen again"          "uchg" "$(flags_of "$CD/nested")"
+deny "the folder file gets no record"          test -e "$(pool_meta "$CD/nested/b.txt")"
+
+PROPN="$PROPD/new.proposed.txt"
+as_user /bin/sh -c "printf 'a new file\n' > '$PROPN'"
+NEWF="$CD/nested/new.txt"
+EDN="$SCRATCH/edit-new.out"
+ENRC=0
+locked edit --yes --from "$PROPN" "$NEWF" >"$EDN" 2>&1 || ENRC=$?
+check "edit --from creates a file in a sealed folder" "0" "$ENRC"
+ok   "the diff names the new file"             grep -qF -- "--- new file: $NEWF" "$EDN"
+ok   "the diff shows the new content"          grep -qF -- "+a new file" "$EDN"
+check "the new file has the proposal"          "a new file" "$(head -1 "$NEWF")"
+check "the new file is frozen"                 "uchg" "$(flags_of "$NEWF")"
+check "the new file owner lock account"        "$LOCK_ACCT" "$(owner_of "$NEWF")"
+check "the new file takes the folder mode without execute" \
+      "$(printf '%o' $(( 0$(stat -f '%OLp' "$CD") & 0666 )))" "$(stat -f '%OLp' "$NEWF")"
+check "its directory is frozen again"          "uchg" "$(flags_of "$CD/nested")"
+deny "the new file gets no record"             test -e "$(pool_meta "$NEWF")"
+ok   "verify clean after edits in the folder"  locked verify
+
+PROPE="$PROPD/empty.proposed.txt"
+as_user /bin/sh -c ": > '$PROPE'"
+refuse "an empty new file is refused"          "would be empty" \
+       locked edit --yes --from "$PROPE" "$CD/nested/empty.txt"
+deny "the empty file was not created"          test -e "$CD/nested/empty.txt"
+refuse "a new file outside a sealed folder is refused" "not in pool" \
+       locked edit --yes --from "$PROPN" "$FAKE_HOME/sub/nothing.txt"
+
+# The seal is checked, not assumed: a node the record says is frozen but
+# is not stops the edit, and nothing is sealed on its behalf.
+chflags nouchg "$CD/a.txt"
+refuse "an unfrozen node in the folder is refused" "not frozen (uchg)" \
+       locked edit --yes --from "$PROPF" "$CD/a.txt"
+check "the unfrozen file is untouched"         "a" "$(head -1 "$CD/a.txt")"
+chflags uchg "$CD/a.txt"
+
+# The rename lifts uchg on the file's directory for a moment, and only a
+# directory closed to the invoker may be lifted. An ACL entry that could
+# let them in while it is open refuses the edit, and the old file is left
+# frozen.
+chflags nouchg "$CD/nested"
+chmod +a "user:$INV allow add_file" "$CD/nested"
+chflags uchg "$CD/nested"
+refuse "a folder directory with an ACL entry is not lifted" "not closed to you" \
+       locked edit --yes --from "$PROPF" "$CD/nested/new.txt"
+check "the old file is intact"                 "a new file" "$(head -1 "$NEWF")"
+check "the old file is frozen again"           "uchg" "$(flags_of "$NEWF")"
+check "the directory stays frozen"             "uchg" "$(flags_of "$CD/nested")"
+chflags nouchg "$CD/nested"
+chmod -a "user:$INV allow add_file" "$CD/nested"
+chflags uchg "$CD/nested"
+
+ok   "unlock the folder"                       locked unlock "$CD"
+refuse "edit in an unlocked folder is refused" "is unlocked" \
+       locked edit --yes --from "$PROPF" "$CD/a.txt"
+
+note "== cli: a folder relock shows the content of files added while unlocked =="
+as_user /bin/sh -c "printf 'added while unlocked\n' > '$CD/added.txt'"
+LKO="$SCRATCH/relock-added.out"
+LKRC=0
+locked lock --yes "$CD" >"$LKO" 2>&1 || LKRC=$?
+check "relock with an added file"              "0" "$LKRC"
+ok   "the relock diff shows the added content" grep -qF -- "+added while unlocked" "$LKO"
+ok   "verify clean after the folder relock"    locked verify
 
 note "== cli: edit reads the candidate as the invoker, never as root =="
 # Both candidate paths sit in the invoker's own space, so a same-UID

@@ -163,6 +163,10 @@ usage: sudo locked <action> [options] [args]
       lock-account staging before the diff is drawn, and the diff and the
       install both read that frozen copy: whatever happens to COPY after
       you are shown the diff cannot change what installs.
+      A file inside a folder locked as a whole follows the folder's
+      record, and a file that does not exist yet there is created and
+      sealed (the diff shows its whole content). Revert does not apply
+      to those: they have no snapshot of their own.
   revert [--dry-run] <path>...
       Files only: save current to .attic, restore snapshot, re-seal if
       the file was locked.
@@ -1285,6 +1289,24 @@ atomic_replace() {
   case ",$pflags," in
     *,uappnd,*) lifted=uappnd ;;
     *,sappnd,*) lifted=sappnd ;;
+    *,uchg,*)
+      # Inside a folder sealed as content, every directory is frozen with
+      # uchg, and a rename into it needs the flag off for a moment. That
+      # moment must give the invoker nothing: the lock account owns the
+      # directory, no group or other write bit is set, and no ACL entry
+      # exists that could grant one. Anything else is refused, not lifted.
+      # An ACL that cannot be read counts as one that grants.
+      local pacl=unreadable
+      pacl="$(acl_entries "$dst_parent")" || pacl=unreadable
+      if [ "$(stat -f '%Su' "$dst_parent")" != "$lock_user" ] ||
+         [ $(( 0$(stat -f '%OLp' "$dst_parent") & 022 )) -ne 0 ] ||
+         [ -n "$pacl" ]; then
+        rm -f -- "$tmp"
+        echo "${E_RED}${E_B}ERROR:${E_OFF} $dst_parent is frozen (uchg) and not closed to you while open; refusing to lift it" >&2
+        return 1
+      fi
+      lifted=uchg
+      ;;
   esac
   if [ -n "$lifted" ]; then
     chflags -- "no$lifted" "$dst_parent" || { rm -f -- "$tmp"; return 1; }
@@ -2107,8 +2129,10 @@ lock_witness() { # <path> <tier>
   elif [ -d "$f" ]; then
     if [ "$t" = "content" ]; then
       if [ "$live" -eq 1 ] && [ -d "$SNAPDIR" ]; then
+        # -N: a file added while unlocked shows its whole content, not
+        # only its name, so what the seal is about to freeze is on screen.
         show_diff 'diff snapshot -> current' "$f" \
-          diff --color=never -ru "$SNAPDIR" "$f" || return 1
+          diff --color=never -ruN "$SNAPDIR" "$f" || return 1
       else
         echo "adopting into pool (no prior snapshot): $f"
       fi
@@ -3543,6 +3567,71 @@ stage_new() {
   mktemp "${stage_dir}/edit.XXXXXX"
 }
 
+# sealed_folder_for <path> <is-new>: a file with no record of its own may
+# sit inside a folder sealed as content, whose one record covers the whole
+# tree. Finds the nearest such folder above <path> and sets EDIT_FOLDER.
+# Returns 1 with the reason on stderr when there is none, when the folder
+# is unlocked or is not the node its record names, or when any node from
+# <path> up to it is not sealed the way the record says -- an edit must
+# never be the step that seals a node nobody checked. Returns 3 when no
+# live folder record covers <path>, so the caller keeps its own message.
+EDIT_FOLDER=""
+sealed_folder_for() { # <path> <is-new>
+  local f="$1" is_new="$2" d cur sn=0
+  EDIT_FOLDER=""
+  d="$(dirname "$f")"
+  while :; do
+    snap_paths "$d"
+    if record_live "$META" &&
+       [ "$(meta_field "$META" tier)" = "content" ] &&
+       [ "$(meta_field "$META" recursive)" = "1" ]; then
+      break
+    fi
+    [ "$d" = "/" ] && return 3
+    d="$(dirname "$d")"
+  done
+  if [ "$(meta_field "$META" state)" != "locked" ]; then
+    echo "skip $f: its folder $d is unlocked -- edit it directly, then: sudo locked lock $d" >&2
+    return 1
+  fi
+  cur="$(node_id "$d")" || { echo "skip $f: cannot read the identity of $d" >&2; return 1; }
+  same_node "$(meta_field "$META" id)" "$cur" || sn=$?
+  if [ "$sn" -ne 0 ]; then
+    echo "skip $f: $d is not the folder its record names -- check: sudo locked status $d" >&2
+    return 1
+  fi
+  # Every node from the file up to the folder: lock-owned and frozen, as
+  # verify expects of a sealed tree. The path was resolved, so none of
+  # them is a link; a missing file checks from its parent.
+  local n="$f"
+  [ "$is_new" -eq 1 ] && n="$(dirname "$f")"
+  local bad
+  while :; do
+    bad=0
+    [ -L "$n" ] && bad=1
+    [ "$(stat -f '%Su' "$n")" = "$lock_user" ] || bad=1
+    if [ "$n" = "$f" ]; then
+      [ -f "$n" ] || bad=1
+    else
+      [ -d "$n" ] || bad=1
+    fi
+    if [ "$bad" -eq 1 ]; then
+      echo "skip $f: $n is not sealed as $d's record says -- check: sudo locked status $d" >&2
+      return 1
+    fi
+    case ",$(flags_of "$n")," in
+      *,uchg,*) ;;
+      *)
+        echo "skip $f: $n is not frozen (uchg) as $d's record says -- check: sudo locked status $d" >&2
+        return 1
+        ;;
+    esac
+    [ "$n" = "$d" ] && break
+    n="$(dirname "$n")"
+  done
+  EDIT_FOLDER="$d"
+}
+
 # sudoedit-style edit: the locked file never spends time unlocked. The
 # editor runs AS THE INVOKER on a user-owned temp copy; the candidate is
 # then pulled into lock-account staging (out of user reach) BEFORE the
@@ -3566,25 +3655,65 @@ do_edit_one() {
     log_action edit "$f" refuse-symlink
     return 1
   fi
-  f="$(readlink -f "$f")" || { echo "skip: cannot resolve $1" >&2; return 1; }
-  snap_paths "$f"
-  [ -f "$META" ] || { echo "skip $f: not in pool (edit works on locked files; use lock to adopt)" >&2; return 1; }
-  [ -f "$f" ] || { echo "skip $f: edit supports regular files only" >&2; return 1; }
+  # A file that does not exist yet has nothing to resolve: its folder is
+  # resolved and the name kept. Only a sealed folder can take one (below).
+  local is_new=0 base
+  if [ -e "$f" ]; then
+    f="$(readlink -f "$f")" || { echo "skip: cannot resolve $1" >&2; return 1; }
+    [ -f "$f" ] || { echo "skip $f: edit supports regular files only" >&2; return 1; }
+  else
+    base="$(basename -- "$f")"
+    case "$base" in
+      .|..|'') echo "skip $f: not a file name" >&2; return 1 ;;
+    esac
+    f="$(readlink -f "$(dirname -- "$f")")" || { echo "skip: cannot resolve $1" >&2; return 1; }
+    f="${f%/}/$base"
+    is_new=1
+  fi
 
-  local tier state flag mode owner group
-  tier="$(meta_field "$META" tier)"
-  state="$(meta_field "$META" state)"
-  flag="$(meta_field "$META" flag)"
-  mode="$(meta_field "$META" mode)"
-  owner="$(meta_field "$META" owner)"
-  group="$(meta_field "$META" group)"
-  case "$tier" in
-    content|anchor) ;;
-    *) echo "skip $f: edit supports content/anchor files, not tier '$tier'" >&2; return 1 ;;
-  esac
-  if [ "$state" != "locked" ]; then
-    echo "skip $f: currently unlocked -- edit it directly, then: sudo locked lock $f" >&2
-    return 1
+  # The file's own record, or else the record of the sealed folder it sits
+  # in. A folder sealed as content has one record for its whole tree, and
+  # an edit inside it follows that record: lock account, uchg, the file's
+  # own mode (a new file takes the folder's without execute bits). No
+  # record is written for the file, and there is no per-file snapshot, so
+  # revert does not apply; the folder's snapshot is renewed at its unlock.
+  local tier state flag mode owner group folder="" frc=0
+  snap_paths "$f"
+  if [ ! -f "$META" ]; then
+    sealed_folder_for "$f" "$is_new" || frc=$?
+    if [ "$frc" -eq 3 ]; then
+      echo "skip $f: not in pool (edit works on locked files, or files in a locked folder; use lock to adopt)" >&2
+      return 1
+    fi
+    [ "$frc" -eq 0 ] || { log_action edit "$f" refuse-folder; return 1; }
+    folder="$EDIT_FOLDER"
+    snap_paths "$folder"
+    tier=content
+    state=locked
+    flag="$(meta_field "$META" flag)"
+    owner="$(meta_field "$META" owner)"
+    group="$(meta_field "$META" group)"
+    if [ "$is_new" -eq 1 ]; then
+      mode="$(printf '%o' $(( 0$(meta_field "$META" lockmode) & 0666 )))"
+    else
+      mode="$(stat -f '%OLp' "$f")"
+    fi
+  else
+    [ "$is_new" -eq 0 ] && [ -f "$f" ] || { echo "skip $f: edit supports regular files only" >&2; return 1; }
+    tier="$(meta_field "$META" tier)"
+    state="$(meta_field "$META" state)"
+    flag="$(meta_field "$META" flag)"
+    mode="$(meta_field "$META" mode)"
+    owner="$(meta_field "$META" owner)"
+    group="$(meta_field "$META" group)"
+    case "$tier" in
+      content|anchor) ;;
+      *) echo "skip $f: edit supports content/anchor files, not tier '$tier'" >&2; return 1 ;;
+    esac
+    if [ "$state" != "locked" ]; then
+      echo "skip $f: currently unlocked -- edit it directly, then: sudo locked lock $f" >&2
+      return 1
+    fi
   fi
 
   # Two ways to produce the candidate. Both end with it frozen in $stage,
@@ -3596,7 +3725,9 @@ do_edit_one() {
   # nothing. The label carries exactly the bytes the header showed before --
   # the path -- so nothing new is disclosed, and the diff painter still
   # recognizes the headers by position.
-  local stage label lhs rhs
+  # A new file's current side is empty: /dev/null, named as the new file.
+  local stage label lhs rhs old="$f"
+  [ "$is_new" -eq 1 ] && old=/dev/null
   if [ -n "$OPT_FROM" ]; then
     # Freeze FIRST. The proposal sits in the invoker's own space, where
     # anything running as the invoker can swap it at any moment; taking it
@@ -3604,6 +3735,7 @@ do_edit_one() {
     # diff a promise instead of a snapshot of one past moment.
     label='diff current -> proposed'
     lhs="current: $f" rhs="proposed: $OPT_FROM"
+    [ "$is_new" -eq 1 ] && lhs="new file: $f"
     stage="$(stage_new)" || return 1
     # The root-side redirect is the point, not an oversight (SC2024): the
     # WRITE has to land in lock-account staging; only the READ drops to
@@ -3618,11 +3750,16 @@ do_edit_one() {
   else
     label='diff current -> edited'
     lhs="current: $f" rhs="edited: $f"
-    # User-owned working copy in a private temp dir.
+    [ "$is_new" -eq 1 ] && lhs="new file: $f"
+    # User-owned working copy in a private temp dir; empty for a new file.
     local editdir copy
     editdir="$(mktemp -d /tmp/locked-edit.XXXXXX)" || return 1
     copy="$editdir/$(basename "$f")"
-    cp -- "$f" "$copy" || { rm -rf -- "$editdir"; return 1; }
+    if [ "$is_new" -eq 1 ]; then
+      : >"$copy" || { rm -rf -- "$editdir"; return 1; }
+    else
+      cp -- "$f" "$copy" || { rm -rf -- "$editdir"; return 1; }
+    fi
     chown -R "$inv" "$editdir" || { rm -rf -- "$editdir"; return 1; }
     chmod 700 "$editdir" || { rm -rf -- "$editdir"; return 1; }
     chmod 600 "$copy" || { rm -rf -- "$editdir"; return 1; }
@@ -3651,8 +3788,16 @@ do_edit_one() {
   fi
 
   # Decided on the frozen bytes, not on the candidate: the no-change check
-  # and the install now agree by construction.
-  if cmp -s -- "$stage" "$f"; then
+  # and the install now agree by construction. An empty new file would
+  # show an empty diff, so it is refused rather than approved unseen.
+  if [ "$is_new" -eq 1 ]; then
+    if [ ! -s "$stage" ]; then
+      rm -f -- "$stage"
+      echo "skip $f: the new file would be empty; nothing to create" >&2
+      log_action edit "$f" refuse-empty-new
+      return 1
+    fi
+  elif cmp -s -- "$stage" "$f"; then
     rm -f -- "$stage"
     echo "no changes: $f"
     log_action edit "$f" skip-unchanged
@@ -3663,26 +3808,55 @@ do_edit_one() {
   # Keeping a sealed file's extended attributes and ACLs is part of what
   # locked is for, so they come from $f -- a re-application onto a
   # candidate that has none of its own, never a merge, and nothing the
-  # candidate might have carried is trusted.
-  local fid
-  fid="$(node_id "$f")" || { rm -f -- "$stage"; return 1; }
-  "$LOCKED_HELPER" xattrs-from --src "$f" --src-id "${fid/./:}" \
-    --dest "$stage" || {
-    rm -f -- "$stage"
-    echo "edit: cannot carry $f's extended attributes onto the candidate" >&2
-    log_action edit "$f" refuse-xattrs
-    return 1
-  }
+  # candidate might have carried is trusted. A new file has none to keep.
+  if [ "$is_new" -eq 0 ]; then
+    local fid
+    fid="$(node_id "$f")" || { rm -f -- "$stage"; return 1; }
+    "$LOCKED_HELPER" xattrs-from --src "$f" --src-id "${fid/./:}" \
+      --dest "$stage" || {
+      rm -f -- "$stage"
+      echo "edit: cannot carry $f's extended attributes onto the candidate" >&2
+      log_action edit "$f" refuse-xattrs
+      return 1
+    }
+  fi
 
   show_diff "$label" "$f" \
-    diff --color=never -u --label "$lhs" --label "$rhs" "$f" "$stage" \
+    diff --color=never -u --label "$lhs" --label "$rhs" "$old" "$stage" \
     || { rm -f -- "$stage"; return 1; }
   echo
-  confirm "Install and reseal $(subj "$f")?" installs || {
+  local ask
+  ask="Install and reseal $(subj "$f")?"
+  [ "$is_new" -eq 1 ] && ask="Create and seal $(subj "$f") in $(subj "$folder")?"
+  confirm "$ask" installs || {
     echo "${E_YEL}aborted; $f unchanged${E_OFF}" >&2
     rm -f -- "$stage"
     return 2
   }
+
+  # In a sealed folder the file follows the folder's record: frozen with
+  # the folder's flag, owned by the lock account, no record of its own.
+  # atomic_replace lifts the folder directory's uchg for the rename.
+  if [ -n "$folder" ]; then
+    if [ "$is_new" -eq 0 ]; then
+      fclear "$flag" "$f" || { rm -f -- "$stage"; return 1; }
+    fi
+    run atomic_replace "$stage" "$f" "${lock_user}:${lock_user}" "$mode" || {
+      rm -f -- "$stage"
+      # The old file is still there: freeze it again before failing.
+      [ "$is_new" -eq 1 ] || fset "$flag" "$f" || true
+      return 1
+    }
+    rm -f -- "$stage"
+    fset "$flag" "$f" || return 1
+    if [ "$is_new" -eq 1 ]; then
+      echo "${C_GRN}✓${C_OFF} created and sealed: $f (in $folder)"
+    else
+      echo "${C_GRN}✓${C_OFF} edited and resealed: $f (in $folder)"
+    fi
+    log_action edit "$f" ok
+    return 0
+  fi
 
   # Snapshot := pre-edit content, so revert undoes exactly this edit.
   run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || { rm -f -- "$stage"; return 1; }

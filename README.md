@@ -46,7 +46,9 @@ Three tiers, named by what they protect:
   staged out of reach, then diff + confirm installs and reseals. The
   file is never left unlocked and no chain release is needed. With
   `--from <copy>` the proposed content comes from a file you prepared
-  instead of from an editor -- see below.
+  instead of from an editor -- see below. Inside a folder locked as a
+  whole, `edit` changes a file, or creates a new one, under the folder's
+  own record, so the folder is never unlocked either.
 - `sudo locked unlock <path>` -- release just that node (snapshot taken);
   `--chain` also drops the ancestors' flags when an edit needs a rename
   into a frozen parent (atomic-save editors).
