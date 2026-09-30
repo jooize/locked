@@ -3789,15 +3789,8 @@ do_edit_one() {
 
   # Decided on the frozen bytes, not on the candidate: the no-change check
   # and the install now agree by construction. An empty new file would
-  # show an empty diff, so it is refused rather than approved unseen.
-  if [ "$is_new" -eq 1 ]; then
-    if [ ! -s "$stage" ]; then
-      rm -f -- "$stage"
-      echo "skip $f: the new file would be empty; nothing to create" >&2
-      log_action edit "$f" refuse-empty-new
-      return 1
-    fi
-  elif cmp -s -- "$stage" "$f"; then
+  # show an empty diff, so it is named as empty instead (below).
+  if [ "$is_new" -eq 0 ] && cmp -s -- "$stage" "$f"; then
     rm -f -- "$stage"
     echo "no changes: $f"
     log_action edit "$f" skip-unchanged
@@ -3821,13 +3814,24 @@ do_edit_one() {
     }
   fi
 
-  show_diff "$label" "$f" \
-    diff --color=never -u --label "$lhs" --label "$rhs" "$old" "$stage" \
-    || { rm -f -- "$stage"; return 1; }
+  # An empty new file has no diff to show, so the block says so, and so
+  # does the question: an empty file is approved knowingly, never unseen.
+  local empty=0
+  [ "$is_new" -eq 1 ] && [ ! -s "$stage" ] && empty=1
+  if [ "$empty" -eq 1 ]; then
+    set_pal
+    printf -- '%s--- %s: %s ---%s\n' "$P_B" "$label" "$f" "$P_OFF"
+    echo "(new file, empty)"
+  else
+    show_diff "$label" "$f" \
+      diff --color=never -u --label "$lhs" --label "$rhs" "$old" "$stage" \
+      || { rm -f -- "$stage"; return 1; }
+  fi
   echo
   local ask
   ask="Install and reseal $(subj "$f")?"
   [ "$is_new" -eq 1 ] && ask="Create and seal $(subj "$f") in $(subj "$folder")?"
+  [ "$empty" -eq 1 ] && ask="Create and seal the empty file $(subj "$f") in $(subj "$folder")?"
   confirm "$ask" installs || {
     echo "${E_YEL}aborted; $f unchanged${E_OFF}" >&2
     rm -f -- "$stage"

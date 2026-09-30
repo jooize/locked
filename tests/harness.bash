@@ -531,9 +531,16 @@ ok   "verify clean after edits in the folder"  locked verify
 
 PROPE="$PROPD/empty.proposed.txt"
 as_user /bin/sh -c ": > '$PROPE'"
-refuse "an empty new file is refused"          "would be empty" \
-       locked edit --yes --from "$PROPE" "$CD/nested/empty.txt"
-deny "the empty file was not created"          test -e "$CD/nested/empty.txt"
+EMO="$SCRATCH/edit-empty.out"
+EMRC=0
+locked edit --yes --from "$PROPE" "$CD/nested/empty.txt" >"$EMO" 2>&1 || EMRC=$?
+check "an empty new file is created"           "0" "$EMRC"
+ok   "the block says the new file is empty"    grep -qF "(new file, empty)" "$EMO"
+# --yes answers without printing the question, so its wording is asserted
+# on the code.
+ok   "the question names it as empty"          grep -qF 'Create and seal the empty file' "$LOCKED"
+check "the empty file has no content"          "0" "$(stat -f '%z' "$CD/nested/empty.txt")"
+check "the empty file is frozen"               "uchg" "$(flags_of "$CD/nested/empty.txt")"
 refuse "a new file outside a sealed folder is refused" "not in pool" \
        locked edit --yes --from "$PROPN" "$FAKE_HOME/sub/nothing.txt"
 
