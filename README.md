@@ -48,7 +48,13 @@ Three tiers, named by what they protect:
   `--from <copy>` the proposed content comes from a file you prepared
   instead of from an editor -- see below. Inside a folder locked as a
   whole, `edit` changes a file, or creates a new one, under the folder's
-  own record, so the folder is never unlocked either.
+  own record, so the folder is never unlocked either. After installing,
+  `edit` checks the file against what you approved: the same bytes, the
+  owner, mode and flag it set, and its folder's flags as they were. A
+  mismatch can only come from root or a bug. It fails the edit, stays on
+  the record as drift for `verify` (and the verify status) until you edit
+  that file again or seal the record afresh, and the status is refreshed
+  at once.
 - `sudo locked unlock <path>` -- release just that node (snapshot taken);
   `--chain` also drops the ancestors' flags when an edit needs a rename
   into a frozen parent (atomic-save editors).
@@ -370,8 +376,9 @@ removes the emptied old root; it refuses to merge a pool found at both.
   `dev.ino` and are rewritten in place on the next root `status`, `lock`
   or `unlock`), `recursive`, `role` (`leaf` for a node you protect,
   `chain` for a directory sealed because one needs it), `state`
-  (`locked`/`unlocked`/`retired`/`suspended`). `verify` compares reality
-  against this. Retired and suspended records carry provenance -- `via`
+  (`locked`/`unlocked`/`retired`/`suspended`), and one `mismatch` line per
+  file whose edit failed its install check (when, what differed, which
+  file). `verify` compares reality against this. Retired and suspended records carry provenance -- `via`
   (`rm`, `trash-finalized`, `assertion` for a human tombstone, `unprotect`,
   or `unneeded` for a chain directory nothing needed any more), `by`,
   `at`, and for a suspension

@@ -637,6 +637,97 @@ ok   "revert the xattr fixture"            locked revert "$XCFG"
 check "the reverted content"               "version 1" "$(head -1 "$XCFG")"
 check "the reverted file keeps its xattr"  "v1" "$(xattr -p house.test "$XCFG")"
 
+note "== cli: an edit checks what it installed =="
+# Nothing running as the invoker can change a file between the install
+# and the check, so the stand-in for root or a bug is a helper whose copy
+# out of edit staging gains one byte after it lands. It forwards every
+# verb to the real helper and sits beside it, root-owned 755, where
+# verify_helper's walk accepts it.
+TAMPER="$HELPERDIR/tamper-helper"
+cat >"$SCRATCH/tamper-helper" <<EOS
+#!/bin/bash
+"$HELPER" "\$@" || exit \$?
+[ "\$1" = copy ] || exit 0
+src="" dest=""
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    --src) src="\$2"; shift ;;
+    --dest) dest="\$2"; shift ;;
+  esac
+  shift
+done
+case "\$(basename "\$src")" in
+  edit.*) printf 'x' >>"\$dest" ;;
+esac
+EOS
+install -o root -g wheel -m 755 "$SCRATCH/tamper-helper" "$TAMPER"
+locked_tamper() { HELPER="$TAMPER" locked "$@"; }
+has_mismatch() { grep -q '^mismatch=' "$1" && grep -qF -- " $2" "$1"; }
+
+FM="$CD/nested/b.txt"
+FA="$CD/a.txt"
+PROPM="$PROPD/mismatch.proposed.txt"
+as_user /bin/sh -c "printf 'approved\n' > '$PROPM'"
+refuse "a folder edit that installs other bytes fails" "not what you approved (content)" \
+       locked_tamper edit --yes --from "$PROPM" "$FM"
+check "the mismatched file is frozen"          "uchg" "$(flags_of "$FM")"
+check "its directory is frozen again"          "uchg" "$(flags_of "$CD/nested")"
+ok   "the folder record carries the mismatch"  has_mismatch "$(pool_meta "$CD")" "content $FM"
+check "the edit refreshed the verify status"   "drifted=1" \
+      "$(grep '^drifted=' "$STATEROOT/$INV/verify")"
+refuse "verify reports the mismatch"           "the edit of $FM at" locked verify
+
+refuse "a second file in the folder mismatches" "not what you approved (content)" \
+       locked_tamper edit --yes --from "$PROPM" "$FA"
+ok   "a clean edit of the first file"          locked edit --yes --from "$PROPM" "$FM"
+check "the first file has the approved bytes"  "approved" "$(cat "$FM")"
+deny "its mismatch is cleared"                 has_mismatch "$(pool_meta "$CD")" "$FM"
+ok   "the second file's mismatch stays"        has_mismatch "$(pool_meta "$CD")" "content $FA"
+refuse "verify still reports the second file"  "the edit of $FA at" locked verify
+
+PROPX="$PROPD/mismatch-accept.proposed.txt"
+as_user /bin/sh -c "printf 'approved\nx' > '$PROPX'"
+ACO="$SCRATCH/edit-accept.out"
+ACRC=0
+locked edit --yes --from "$PROPX" "$FA" >"$ACO" 2>&1 || ACRC=$?
+check "accepting unchanged bytes installs"     "0" "$ACRC"
+ok   "the block says nothing changed"          grep -qF "(no change; a mismatch is recorded" "$ACO"
+ok   "the question names the acceptance"       grep -qF 'install it again and clear the mismatch' "$LOCKED"
+ok   "verify clean after both are resolved"    locked verify
+locked edit --yes --from "$PROPX" "$FA" >"$ACO" 2>&1 || true
+ok   "a later unchanged edit stops early"      grep -qF "no changes: $FA" "$ACO"
+
+refuse "a mismatch before an unlock"           "not what you approved (content)" \
+       locked_tamper edit --yes --from "$PROPM" "$FA"
+ok   "unlock the folder"                       locked unlock "$CD"
+ok   "the unlocked record keeps the mismatch"  has_mismatch "$(pool_meta "$CD")" "content $FA"
+refuse "verify reports it while unlocked"      "the edit of $FA at" locked verify
+ok   "relock the folder"                       locked lock --yes "$CD"
+deny "the relock clears it"                    grep -q '^mismatch=' "$(pool_meta "$CD")"
+ok   "verify clean after the relock"           locked verify
+
+# A file with its own record: the record follows the installed node, so
+# verify names the mismatch and not a replaced identity, and a revert
+# clears it.
+MCFG="$FAKE_HOME/sub/mismatch.txt"
+printf 'version 1\n' >"$MCFG"
+chown "$INV" "$MCFG"
+ok   "lock the mismatch fixture"               locked lock --yes "$MCFG"
+refuse "a file edit that installs other bytes fails" "not what you approved (content)" \
+       locked_tamper edit --yes --from "$PROPM" "$MCFG"
+check "the mismatched file is frozen"          "uchg" "$(flags_of "$MCFG")"
+ok   "its record carries the mismatch"         has_mismatch "$(pool_meta "$MCFG")" "content $MCFG"
+MVO="$SCRATCH/verify-mismatch.out"
+MVRC=0
+locked verify >"$MVO" 2>&1 || MVRC=$?
+check "verify fails on the mismatch"           "5" "$MVRC"
+ok   "verify names the mismatch"               grep -qF "the edit of $MCFG at" "$MVO"
+deny "verify sees no replaced node"            grep -qF "node replaced" "$MVO"
+ok   "revert the mismatch fixture"             locked revert "$MCFG"
+check "the reverted content"                   "version 1" "$(cat "$MCFG")"
+deny "the revert clears it"                    grep -q '^mismatch=' "$(pool_meta "$MCFG")"
+ok   "verify clean after the revert"           locked verify
+
 note "== cli: ~/.ssh class -- anchor only, ownership never changes =="
 as_user mkdir -m 700 -- "$FAKE_HOME/.ssh"
 SSHCFG="$FAKE_HOME/.ssh/config"

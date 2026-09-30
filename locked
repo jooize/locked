@@ -680,7 +680,10 @@ meta_field() {
 # Known keys: owner, group, mode, lockmode, tier, flag, flagsym, id,
 # recursive, role, state, plus the provenance fields the retired/suspended
 # states add -- via, by, at, bin -- and acl, the entry a placement seal
-# added (see placement_entry; no other tier has one). role is leaf (a node
+# added (see placement_entry; no other tier has one), and mismatch, which
+# may repeat: an edit that did not install as approved (see mismatch_kv),
+# carried by every rewrite and dropped only by a fresh seal, a revert, or
+# a clean edit of the same file. role is leaf (a node
 # you named with lock: the intent) or chain (a directory sealed because
 # some leaf needs it; see plan_releases). Nothing here validates the set;
 # the caller emits the full record, because this replaces the file rather
@@ -731,6 +734,32 @@ acl_kv() {
   fi
 }
 
+# mismatch_kv <metafile> [<path>]: the record's mismatch lines, one per
+# file whose edit did not install as approved (see check_install), joined
+# for a rewrite to carry through, less any line that names <path>:
+#   mismatch=<at> <what differed> <path, written as verify_escape writes it>
+# The path goes last because an escaped path may still hold a space. The
+# name to drop travels through the environment, not awk -v, which would
+# read the escapes in it as awk's own.
+mismatch_kv() {
+  local drop=""
+  if [ -n "${2:-}" ]; then
+    drop="$(verify_escape "$2")"
+  fi
+  DROP="$drop" awk '
+    index($0, "mismatch=") != 1 { next }
+    {
+      rest = substr($0, 10)
+      rest = substr(rest, index(rest, " ") + 1)
+      p = substr(rest, index(rest, " ") + 1)
+      if (ENVIRON["DROP"] != "" && p == ENVIRON["DROP"]) next
+      out = out sep $0
+      sep = "\n"
+    }
+    END { printf "%s", out }
+  ' "$1"
+}
+
 # rewrite_meta_id <metafile> <id>
 # The identity record's own migration: same node, newer spelling. Mirrors
 # rewrite_meta_state with the halves swapped -- the state is what is kept
@@ -750,6 +779,7 @@ rewrite_meta_id() {
     "recursive=$(meta_field "$meta" recursive)" \
     "role=$(meta_field "$meta" role)" \
     "$(acl_kv "$meta")" \
+    "$(mismatch_kv "$meta")" \
     "state=$(meta_field "$meta" state)" || return 1
 }
 
@@ -773,6 +803,7 @@ rewrite_meta_state() {
     "recursive=$(meta_field "$meta" recursive)" \
     "role=$(meta_field "$meta" role)" \
     "$(acl_kv "$meta")" \
+    "$(mismatch_kv "$meta")" \
     "state=$state" \
     "$@" || return 1
 }
@@ -794,6 +825,7 @@ rewrite_meta_role() {
     "recursive=$(meta_field "$meta" recursive)" \
     "role=$role" \
     "$(acl_kv "$meta")" \
+    "$(mismatch_kv "$meta")" \
     "state=$(meta_field "$meta" state)" || return 1
 }
 
@@ -1452,12 +1484,27 @@ verify_node() {
     echo "  DRIFT $f: missing"
     return 1
   fi
+  # An edit whose install check failed left a line on the record, and it
+  # stays drift -- unlocked or not -- until an edit of that file installs
+  # cleanly, or the record is sealed afresh (a relock or a revert).
+  local mbad=0 mall mline mrest mat mwhat
+  mall="$(mismatch_kv "$meta")"
+  while [ -n "$mall" ]; do
+    mline="${mall%%$'\n'*}"
+    if [ "$mline" = "$mall" ]; then mall=""; else mall="${mall#*$'\n'}"; fi
+    mrest="${mline#mismatch=}"
+    mat="${mrest%% *}"
+    mrest="${mrest#* }"
+    mwhat="${mrest%% *}"
+    echo "  DRIFT $f: the edit of ${mrest#* } at $mat did not install as approved ($mwhat)"
+    mbad=1
+  done
   if [ "$state" = "unlocked" ]; then
     echo "  open  $f (intentionally unlocked; relock with: sudo locked lock)"
-    return 0
+    return "$mbad"
   fi
 
-  local bad=0 want_owner cur
+  local bad="$mbad" want_owner cur
   case "$tier" in
     content|placement) want_owner="$lu" ;;
     anchor)            want_owner="$owner" ;;
@@ -2468,6 +2515,7 @@ release_node() {
       "recursive=$recursive" \
       "role=$(meta_field "$META" role)" \
       "$(acl_kv "$META")" \
+      "$(mismatch_kv "$META")" \
       "state=unlocked" || return 1
   fi
   echo "${C_GRN}✓${C_OFF} unlocked: $f ($tier)"
@@ -3632,6 +3680,82 @@ sealed_folder_for() { # <path> <is-new>
   EDIT_FOLDER="$d"
 }
 
+# check_install <path> <stage> <owner> <mode> <flag> <dir flags before>:
+# run once an edit has installed and resealed <path>. The file must hold
+# exactly the approved bytes (still in <stage>, out of the invoker's
+# reach), with the owner, mode and flag the edit set, and its directory
+# must carry the flags it had before the install. Only root or a bug could
+# make any of these differ, since nothing running as the invoker can write
+# there. Prints what differs as a comma list (type, content, owner, mode,
+# flags, folder-flags) and returns 1 when anything does.
+check_install() {
+  local f="$1" stage="$2" owner="$3" mode="$4" flag="$5" dflags="$6" bad=""
+  if [ -L "$f" ] || [ ! -f "$f" ]; then
+    printf 'type'
+    return 1
+  fi
+  cmp -s -- "$stage" "$f" || bad="$bad,content"
+  [ "$(stat -f '%Su' "$f")" = "$owner" ] || bad="$bad,owner"
+  [ "$(stat -f '%OLp' "$f")" = "$mode" ] || bad="$bad,mode"
+  case ",$(flags_of "$f")," in
+    *,"$flag",*) ;;
+    *) bad="$bad,flags" ;;
+  esac
+  [ "$(flags_of "$(dirname "$f")")" = "$dflags" ] || bad="$bad,folder-flags"
+  [ -z "$bad" ] && return 0
+  printf '%s' "${bad#,}"
+  return 1
+}
+
+# mismatch_line <path> <what differed>: the record line for a failed
+# check_install, or nothing when it passed.
+mismatch_line() {
+  if [ -n "$2" ]; then
+    printf 'mismatch=%s %s %s' "$(now_utc)" "$2" "$(verify_escape "$1")"
+  fi
+}
+
+# note_folder_install <metafile> <path> <what differed>: puts the outcome
+# of check_install on the folder record that covers <path>. A failure adds
+# a line; a clean install drops any earlier line for the same file, which
+# now holds bytes you approved. Nothing else in the record changes.
+note_folder_install() {
+  local meta="$1" f="$2" what="$3" keep
+  keep="$(mismatch_kv "$meta" "$f")"
+  if [ -z "$what" ] && [ "$keep" = "$(mismatch_kv "$meta")" ]; then
+    return 0
+  fi
+  write_meta "$meta" \
+    "owner=$(meta_field "$meta" owner)" \
+    "group=$(meta_field "$meta" group)" \
+    "mode=$(meta_field "$meta" mode)" \
+    "lockmode=$(meta_field "$meta" lockmode)" \
+    "tier=$(meta_field "$meta" tier)" \
+    "flag=$(meta_field "$meta" flag)" \
+    "flagsym=$(meta_field "$meta" flagsym)" \
+    "id=$(meta_field "$meta" id)" \
+    "recursive=$(meta_field "$meta" recursive)" \
+    "role=$(meta_field "$meta" role)" \
+    "$(acl_kv "$meta")" \
+    "$keep" \
+    "$(mismatch_line "$f" "$what")" \
+    "state=$(meta_field "$meta" state)" || return 1
+}
+
+# report_mismatch <path> <what differed> <record path>: the loud half of a
+# failed check_install. The record already carries the line; a verify run
+# now puts it in the status file, so a statusline shows it at once rather
+# than at the next timer run. Its output is not repeated here: the lines
+# above say what drifted, and `locked verify` prints the rest.
+report_mismatch() {
+  local f="$1" what="$2" rec="$3"
+  echo "${E_RED}${E_B}ERROR:${E_OFF} $f was installed, but it is not what you approved ($what)" >&2
+  echo "  recorded as drift on $rec until you edit the file again, or unlock and relock $rec" >&2
+  log_action edit "$f" "mismatch-${what//,/-}"
+  local OPT_QUIET=1
+  do_verify >/dev/null 2>&1 || true
+}
+
 # sudoedit-style edit: the locked file never spends time unlocked. The
 # editor runs AS THE INVOKER on a user-owned temp copy; the candidate is
 # then pulled into lock-account staging (out of user reach) BEFORE the
@@ -3790,11 +3914,18 @@ do_edit_one() {
   # Decided on the frozen bytes, not on the candidate: the no-change check
   # and the install now agree by construction. An empty new file would
   # show an empty diff, so it is named as empty instead (below).
+  # A file with a recorded mismatch is the exception: installing the same
+  # bytes again is how you accept what it holds, so it goes on to the
+  # question instead of stopping here.
+  local unchanged=0
   if [ "$is_new" -eq 0 ] && cmp -s -- "$stage" "$f"; then
-    rm -f -- "$stage"
-    echo "no changes: $f"
-    log_action edit "$f" skip-unchanged
-    return 0
+    if [ "$(mismatch_kv "$META")" = "$(mismatch_kv "$META" "$f")" ]; then
+      rm -f -- "$stage"
+      echo "no changes: $f"
+      log_action edit "$f" skip-unchanged
+      return 0
+    fi
+    unchanged=1
   fi
 
   # The candidate was read with cat, so it holds content and nothing else.
@@ -3822,6 +3953,10 @@ do_edit_one() {
     set_pal
     printf -- '%s--- %s: %s ---%s\n' "$P_B" "$label" "$f" "$P_OFF"
     echo "(new file, empty)"
+  elif [ "$unchanged" -eq 1 ]; then
+    set_pal
+    printf -- '%s--- %s: %s ---%s\n' "$P_B" "$label" "$f" "$P_OFF"
+    echo "(no change; a mismatch is recorded for this file, see: sudo locked verify)"
   else
     show_diff "$label" "$f" \
       diff --color=never -u --label "$lhs" --label "$rhs" "$old" "$stage" \
@@ -3832,6 +3967,7 @@ do_edit_one() {
   ask="Install and reseal $(subj "$f")?"
   [ "$is_new" -eq 1 ] && ask="Create and seal $(subj "$f") in $(subj "$folder")?"
   [ "$empty" -eq 1 ] && ask="Create and seal the empty file $(subj "$f") in $(subj "$folder")?"
+  [ "$unchanged" -eq 1 ] && ask="Accept what $(subj "$f") holds now, install it again and clear the mismatch?"
   confirm "$ask" installs || {
     echo "${E_YEL}aborted; $f unchanged${E_OFF}" >&2
     rm -f -- "$stage"
@@ -3841,6 +3977,10 @@ do_edit_one() {
   # In a sealed folder the file follows the folder's record: frozen with
   # the folder's flag, owned by the lock account, no record of its own.
   # atomic_replace lifts the folder directory's uchg for the rename.
+  # Either way the install ends with check_install against the approved
+  # bytes, which stay in $stage until then.
+  local dflags what=""
+  dflags="$(flags_of "$(dirname "$f")")"
   if [ -n "$folder" ]; then
     if [ "$is_new" -eq 0 ]; then
       fclear "$flag" "$f" || { rm -f -- "$stage"; return 1; }
@@ -3851,8 +3991,14 @@ do_edit_one() {
       [ "$is_new" -eq 1 ] || fset "$flag" "$f" || true
       return 1
     }
+    fset "$flag" "$f" || { rm -f -- "$stage"; return 1; }
+    what="$(check_install "$f" "$stage" "$lock_user" "$mode" "$flag" "$dflags")" || true
     rm -f -- "$stage"
-    fset "$flag" "$f" || return 1
+    note_folder_install "$META" "$f" "$what" || return 1
+    if [ -n "$what" ]; then
+      report_mismatch "$f" "$what" "$folder"
+      return 1
+    fi
     if [ "$is_new" -eq 1 ]; then
       echo "${C_GRN}✓${C_OFF} created and sealed: $f (in $folder)"
     else
@@ -3869,8 +4015,11 @@ do_edit_one() {
   [ "$tier" = "anchor" ] && install_owner="${owner}:${group}"
   fclear "$flag" "$f" || { rm -f -- "$stage"; return 1; }
   run atomic_replace "$stage" "$f" "$install_owner" "$mode" || { rm -f -- "$stage"; return 1; }
+  fset "$flag" "$f" || { rm -f -- "$stage"; return 1; }
+  what="$(check_install "$f" "$stage" "${install_owner%%:*}" "$mode" "$flag" "$dflags")" || true
   rm -f -- "$stage"
-  fset "$flag" "$f" || return 1
+  # The record follows the installed node either way, so verify reports
+  # the mismatch itself rather than a replaced identity on top of it.
   write_meta "$META" \
     "owner=$owner" \
     "group=$group" \
@@ -3882,7 +4031,13 @@ do_edit_one() {
     "id=$(node_id "$f")" \
     "recursive=0" \
     "role=$(meta_field "$META" role)" \
+    "$(mismatch_kv "$META" "$f")" \
+    "$(mismatch_line "$f" "$what")" \
     "state=locked" || return 1
+  if [ -n "$what" ]; then
+    report_mismatch "$f" "$what" "$f"
+    return 1
+  fi
   echo "${C_GRN}✓${C_OFF} edited and resealed: $f"
   log_action edit "$f" ok
 }
