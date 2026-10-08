@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # locked v2 test harness: flag primitives + CLI end-to-end.
 #
-#   sudo /bin/bash tests/harness.bash
+#   sudo /bin/bash tests/harness.bash [--serial] [section...]
 #
 # Ports the 2026-08-05 probe round to repeatable assertions. Every denial
 # assertion has a flag-vs-noflag control (clear the flag, re-run, expect
@@ -11,11 +11,11 @@
 # `daemon` user (the account's identity is irrelevant to flag mechanics;
 # what matters is that the invoker does not own the node), the state root
 # (pools and verify status), the legacy root the layout conversion reads
-# and the fake home live in a scratch dir, and the cleanup trap clears all
-# flags before removing it. Ancestry fixtures live in a second scratch under
-# /var/db (the 1777 /private/tmp would itself fail the walk), and the
-# window helper this harness builds lives in a third one there for the same
-# reason; both are removed by the trap. Add rights on placement dirs come
+# and the fake home live in scratch dirs, one per section, and the cleanup
+# traps clear all flags before removing them. Ancestry fixtures live in
+# another scratch dir under /var/db (the 1777 /private/tmp would itself
+# fail the walk), and the window helper this harness builds lives in one
+# there for the same reason; the traps remove both. Add rights on placement dirs come
 # from an ACL entry naming the invoker, not from a group, so the daemon
 # stand-in exercises them here too (section 6).
 #
@@ -23,6 +23,16 @@
 # service is reachable from the terminal running it, the trash probe below
 # and the trash success cases put entries in the invoker's real bin. Each
 # one is taken back out again by the case that created it.
+#
+# Section 0 builds the window helper and runs first, in this process. The
+# others then run at the same time, each as its own process in a scratch
+# dir of its own: its own pool, state root, fake home and run lock, so no
+# section sees another's records and the order between them means nothing.
+# Their output is printed in section order, each block as soon as it and
+# the ones before it are done, with the time each took. 7 and 8 share one
+# process, because 8 holds the run lock of the state root 7 converts.
+# --serial runs the same processes one at a time; naming sections (1-8)
+# runs only those, and 0 always.
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -32,19 +42,31 @@ shopt -s nullglob
 INV="${SUDO_USER:-}"
 [ -n "$INV" ] && [ "$INV" != "root" ] || { echo "needs SUDO_USER (invoke via sudo from your user)" >&2; exit 1; }
 
+SERIAL=0
+WANT=" "
+for a in "$@"; do
+  case "$a" in
+    --serial) SERIAL=1 ;;
+    [1-8]) WANT="$WANT$a " ;;
+    *) echo "usage: sudo /bin/bash tests/harness.bash [--serial] [section 1-8...]" >&2; exit 2 ;;
+  esac
+done
+
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 LOCKED="$REPO/locked"
 [ -x "$LOCKED" ] || { echo "locked binary not found at $LOCKED" >&2; exit 1; }
 
-SCRATCH="$(mktemp -d /private/tmp/locked-harness.XXXXXX)"
-chmod 755 "$SCRATCH"   # root-owned 755, no group/other write -> valid chain stop node
-
-cleanup() {
+cleanup_scratch() {
   # Clear every flag we may have set (system flags need root; we are root),
-  # then remove the scratch trees. No flags are ever set under ANC.
-  chflags -R noschg,nosappnd,nouchg,nouappnd "$SCRATCH" 2>/dev/null || true
-  rm -rf -- "$SCRATCH"
+  # then remove this process's scratch trees. No flags are ever set under ANC.
+  if [ -n "${SCRATCH:-}" ]; then
+    chflags -R noschg,nosappnd,nouchg,nouappnd "$SCRATCH" 2>/dev/null || true
+    rm -rf -- "$SCRATCH"
+  fi
   if [ -n "${ANC:-}" ]; then rm -rf -- "$ANC"; fi
+}
+cleanup() {
+  cleanup_scratch
   if [ -n "${HELPERDIR:-}" ]; then rm -rf -- "$HELPERDIR"; fi
 }
 trap cleanup EXIT
@@ -54,8 +76,6 @@ trap cleanup EXIT
 # execute the script directly as root -- sudo's env_reset strips them on
 # real invocations.
 LOCK_ACCT=daemon
-FAKE_HOME="$SCRATCH/home"
-STATEROOT="$SCRATCH/state"
 
 # Every root invocation runs the one-shot layout conversion, which MOVES
 # whatever it finds at the legacy root. Left at its default, one invocation
@@ -63,12 +83,32 @@ STATEROOT="$SCRATCH/state"
 # dir, and the cleanup trap would delete it. Exported rather than passed per
 # call, so every child -- env blocks, expect's spawn -- inherits it whatever
 # its own command line says; the check makes a regression here fatal.
-export LOCKED_LEGACY_ROOT="$SCRATCH/legacy"
-export LOCKED_STATE_ROOT="$STATEROOT"
-case "$LOCKED_LEGACY_ROOT" in
-  "$SCRATCH"/*) ;;
-  *) echo "LOCKED_LEGACY_ROOT is outside the scratch dir; refusing to run" >&2; exit 1 ;;
-esac
+#
+# One scratch dir per process: this one for section 0, and a fresh one for
+# every job at the end. Root-owned 755 with no group/other write, so it is a
+# valid chain stop node.
+new_scratch() {
+  SCRATCH="$(mktemp -d /private/tmp/locked-harness.XXXXXX)"
+  chmod 755 "$SCRATCH"
+  FAKE_HOME="$SCRATCH/home"
+  STATEROOT="$SCRATCH/state"
+  export LOCKED_LEGACY_ROOT="$SCRATCH/legacy"
+  export LOCKED_STATE_ROOT="$STATEROOT"
+  case "$LOCKED_LEGACY_ROOT" in
+    "$SCRATCH"/*) ;;
+    *) echo "LOCKED_LEGACY_ROOT is outside the scratch dir; refusing to run" >&2; exit 1 ;;
+  esac
+  install -d -o "$INV" -g staff "$FAKE_HOME"
+  install -d -o "$INV" -g staff "$SCRATCH/raw"   # user-owned container for raw probes
+  # The editor stand-in for `locked edit --editor` (sections 2 and 4).
+  ED="$SCRATCH/edscript"
+  cat >"$ED" <<'EOS'
+#!/bin/sh
+printf 'edited by script\n' > "$1"
+EOS
+  chmod 755 "$ED"
+}
+new_scratch
 
 locked() {
   env LOCKED_STATE_ROOT="$STATEROOT" \
@@ -143,8 +183,70 @@ locked_notty() {
   locked "$@" </dev/null
 }
 
-install -d -o "$INV" -g staff "$FAKE_HOME"
-install -d -o "$INV" -g staff "$SCRATCH/raw"   # user-owned container for raw probes
+# Shared by sections 2, 5 and 6.
+# Each alternate home gets its own pool, as it would in production: one
+# user, one home, one pool. The needed set a release plan is drawn from is
+# derived against the home's anchor, so two homes sharing one pool is a
+# state no real install reaches -- and one whose releases would be wrong.
+# state_for_home names the home's state root after its root-owned stop
+# directory.
+state_for_home() { printf '%s/states/%s' "$SCRATCH" "$(basename "$(dirname "$1")")"; }
+locked_home() { # <home> <args...>: locked with a different LOCKED_USER_HOME
+  local h="$1"; shift
+  env LOCKED_STATE_ROOT="$(state_for_home "$h")" \
+      INSTALL_TARGET="$SCRATCH/not-installed" \
+      LOCKED_HELPER="$HELPER" \
+      LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
+      LOCKED_USER_HOME="$h" \
+      SUDO_USER="$INV" \
+      /bin/bash "$LOCKED" "$@"
+}
+
+# Shared by sections 4, 5 and 6.
+# Pool-file locations, mirroring locked's encode()/snap_paths().
+enc_path() { printf '%s' "$1" | sed -e 's|%|%25|g' -e 's|/|%2F|g'; }
+# The state root a fixture path's records live under: an alternate home's
+# own (see state_for_home), or the main one.
+state_of() { # <path>
+  local rest
+  case "$1" in
+    "$SCRATCH"/usersdir/*|"$SCRATCH"/ttyusers/*|"$SCRATCH"/lpusers/*|"$SCRATCH"/wpusers/*|"$SCRATCH"/aclusers/*)
+      rest="${1#"$SCRATCH"/}"
+      printf '%s/states/%s' "$SCRATCH" "${rest%%/*}"
+      ;;
+    *) printf '%s' "$STATEROOT" ;;
+  esac
+}
+meta_path() { printf '%s' "$(state_of "$1")/$INV/pool/$(enc_path "$1").meta"; }
+snap_path() { printf '%s' "$(state_of "$1")/$INV/pool/$(enc_path "$1").snap"; }
+meta_get() { # <path> <field>: empty when there is no record
+  local m
+  m="$(meta_path "$1")"
+  [ -f "$m" ] || return 0
+  awk -F= -v f="$2" '$1==f{print substr($0, length(f)+2); exit}' "$m"
+}
+put_id() { # <path> <id>: rewrite just the id field of an existing record
+  local m
+  m="$(meta_path "$1")"
+  sed "s|^id=.*|id=$2|" "$m" >"$m.tmp"
+  mv -f "$m.tmp" "$m"
+  chown "$LOCK_ACCT:$LOCK_ACCT" "$m"
+  chmod 640 "$m"
+}
+id_form_of() { # <id> -> vol|dev, the same test the script makes
+  case "${1%%.*}" in
+    ????????-????-????-????-????????????) printf 'vol' ;;
+    *)                                    printf 'dev' ;;
+  esac
+}
+put_meta() { # <path> <key=value>...: craft a record write_meta would accept
+  local m
+  m="$(meta_path "$1")"
+  shift
+  printf '%s\n' "$@" >"$m"
+  chown "$LOCK_ACCT:$LOCK_ACCT" "$m"
+  chmod 640 "$m"
+}
 
 # ---- 0. window helper ------------------------------------------------------
 #
@@ -226,6 +328,7 @@ else
 fi
 
 # ---- 1. raw flag primitives ------------------------------------------------
+section_1() {
 
 note "== raw primitives: uchg file =="
 F="$SCRATCH/raw/uchg-file.txt"
@@ -295,7 +398,10 @@ deny "user clear of schg (own file)"     as_user chflags -- noschg "$SC"
 chflags -- noschg "$SC"
 ok   "control: write after noschg"       as_user /bin/sh -c "echo x >> '$SC'"
 
+}
+
 # ---- 2. CLI end-to-end -----------------------------------------------------
+section_2() {
 
 note "== cli: no-arg status on an empty pool =="
 # Runs before the first lock, so the pool genuinely has no metas yet.
@@ -419,12 +525,6 @@ check "home resealed sappnd"             "sappnd" "$(flags_of "$FAKE_HOME")"
 ok   "verify clean after chain reseal"   locked verify
 
 note "== cli: locked edit -- sudoedit-style, no unlock window =="
-ED="$SCRATCH/edscript"
-cat >"$ED" <<'EOS'
-#!/bin/sh
-printf 'edited by script\n' > "$1"
-EOS
-chmod 755 "$ED"
 ok   "edit installs via staging"         locked edit --yes --editor "$ED" "$CFG"
 check "edited content installed"         "edited by script" "$(head -1 "$CFG")"
 check "still locked after edit"          "uchg" "$(flags_of "$CFG")"
@@ -930,23 +1030,6 @@ note "== cli: chain stop node whose group is not wheel =="
 # The real ~ walk stops at /Users, which macOS ships root:admin 755. The
 # stop-node check pins the owner and the mode, not the group name, so this
 # shape must lock exactly like a root:wheel stop node does.
-# Each alternate home gets its own pool, as it would in production: one
-# user, one home, one pool. The needed set a release plan is drawn from is
-# derived against the home's anchor, so two homes sharing one pool is a
-# state no real install reaches -- and one whose releases would be wrong.
-# state_for_home names the home's state root after its root-owned stop
-# directory.
-state_for_home() { printf '%s/states/%s' "$SCRATCH" "$(basename "$(dirname "$1")")"; }
-locked_home() { # <home> <args...>: locked with a different LOCKED_USER_HOME
-  local h="$1"; shift
-  env LOCKED_STATE_ROOT="$(state_for_home "$h")" \
-      INSTALL_TARGET="$SCRATCH/not-installed" \
-      LOCKED_HELPER="$HELPER" \
-      LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
-      LOCKED_USER_HOME="$h" \
-      SUDO_USER="$INV" \
-      /bin/bash "$LOCKED" "$@"
-}
 ADMSTOP="$SCRATCH/usersdir"
 install -d -m 755 -o root -g admin "$ADMSTOP"
 ADMHOME="$ADMSTOP/home"
@@ -1214,7 +1297,10 @@ ok   "a malformed status says so"               grep -qF "last verify: ✗  $VFX
 rm -f -- "$VFX/verify"
 rmdir -- "$VFX"
 
+}
+
 # ---- 3. nix deploy guards --------------------------------------------------
+section_3() {
 #
 # The store-ancestry acceptance and the setup refusal ride the same seams
 # as everything above. Fixtures needing a STRICT root-owned chain live in
@@ -1318,11 +1404,14 @@ if [ -e /run/current-system ]; then
 fi
 refuse "setup refused when nix-managed" "nix-managed" locked_it "$SETUP_IT" setup
 
+}
+
 # ---- 4. mediated placement verbs -------------------------------------------
+section_4() {
 #
-# Deliberately last: this section leaves retired, suspended and re-keyed
-# records in the pool, and section 3 walks the whole pool with `verify
-# --quiet` on every one of its assertions.
+# This section leaves retired, suspended and re-keyed records in its pool.
+# The pool is its own (see "run the sections" at the end), so no other
+# section's whole-pool verify ever meets them.
 #
 # Fixtures live under MED, whose stop node is SCRATCH (root:wheel 755).
 # Placement dirs are created 777 so the invoker keeps write through the
@@ -1335,50 +1424,6 @@ MED="$SCRATCH/med"
 install -d -o "$INV" -g staff -m 777 "$MED"
 OUTF="$SCRATCH/mediated-out.txt"
 
-# Pool-file locations, mirroring locked's encode()/snap_paths().
-enc_path() { printf '%s' "$1" | sed -e 's|%|%25|g' -e 's|/|%2F|g'; }
-# The state root a fixture path's records live under: an alternate home's
-# own (see state_for_home), or the main one.
-state_of() { # <path>
-  local rest
-  case "$1" in
-    "$SCRATCH"/usersdir/*|"$SCRATCH"/ttyusers/*|"$SCRATCH"/lpusers/*|"$SCRATCH"/wpusers/*|"$SCRATCH"/aclusers/*)
-      rest="${1#"$SCRATCH"/}"
-      printf '%s/states/%s' "$SCRATCH" "${rest%%/*}"
-      ;;
-    *) printf '%s' "$STATEROOT" ;;
-  esac
-}
-meta_path() { printf '%s' "$(state_of "$1")/$INV/pool/$(enc_path "$1").meta"; }
-snap_path() { printf '%s' "$(state_of "$1")/$INV/pool/$(enc_path "$1").snap"; }
-meta_get() { # <path> <field>: empty when there is no record
-  local m
-  m="$(meta_path "$1")"
-  [ -f "$m" ] || return 0
-  awk -F= -v f="$2" '$1==f{print substr($0, length(f)+2); exit}' "$m"
-}
-put_id() { # <path> <id>: rewrite just the id field of an existing record
-  local m
-  m="$(meta_path "$1")"
-  sed "s|^id=.*|id=$2|" "$m" >"$m.tmp"
-  mv -f "$m.tmp" "$m"
-  chown "$LOCK_ACCT:$LOCK_ACCT" "$m"
-  chmod 640 "$m"
-}
-id_form_of() { # <id> -> vol|dev, the same test the script makes
-  case "${1%%.*}" in
-    ????????-????-????-????-????????????) printf 'vol' ;;
-    *)                                    printf 'dev' ;;
-  esac
-}
-put_meta() { # <path> <key=value>...: craft a record write_meta would accept
-  local m
-  m="$(meta_path "$1")"
-  shift
-  printf '%s\n' "$@" >"$m"
-  chown "$LOCK_ACCT:$LOCK_ACCT" "$m"
-  chmod 640 "$m"
-}
 
 note "== mediated rm: plain entries under a sealed parent =="
 RMD="$MED/rmarea"
@@ -1889,10 +1934,8 @@ ok   "per-path status shows the bin line"      grep -qF "bin: $VD/bin/back.txt" 
 
 note "== mediated: the pool is left consistent =="
 # The reappearance fixture is deliberate drift, and the status rows above
-# are its last consumer. Drop it HERE, not at the end of the file: every
-# whole-pool verify a later section runs would otherwise inherit its
-# drift, and what this harness leaves behind should be only what it meant
-# to leave.
+# are its last consumer. Drop it HERE: every whole-pool verify below would
+# otherwise inherit its drift.
 rm -f -- "$(meta_path "$BACK")"
 ok   "verify clean once the drift fixture is gone" locked verify --quiet
 
@@ -1904,10 +1947,10 @@ ok   "why names the sealed ancestor"           grep -qF "note: $MED is flagged u
 ok   "why offers the mediated rm"              grep -qF "sudo locked rm $WHYF" "$OUTF"
 ok   "why offers the mediated trash"           grep -qF "sudo locked trash $WHYF" "$OUTF"
 ok   "why offers the mediated mv"              grep -qF "sudo locked mv $WHYF" "$OUTF"
-locked why "$CFG" >"$OUTF" 2>&1 || true
+locked why "$XAF" >"$OUTF" 2>&1 || true
 ok   "why names an immutable pool leaf"        grep -qF "is immutable (uchg)" "$OUTF"
-ok   "why offers edit on a pool leaf"          grep -qF "sudo locked edit $CFG" "$OUTF"
-ok   "why offers unlock on a pool leaf"        grep -qF "sudo locked unlock $CFG" "$OUTF"
+ok   "why offers edit on a pool leaf"          grep -qF "sudo locked edit $XAF" "$OUTF"
+ok   "why offers unlock on a pool leaf"        grep -qF "sudo locked unlock $XAF" "$OUTF"
 FGN="$MED/foreign.txt"
 as_user /bin/sh -c "echo f > '$FGN'"
 chflags -- uchg "$FGN"
@@ -2088,6 +2131,12 @@ check "and still points where it did"          "$DNGT" "$(readlink "$DNG")"
 
 # Under ~/.ssh the path takes the anchor tier, and a link cannot: the OS
 # checks resolve the path, so they judge the target and never the link.
+# The ~/.ssh this needs is the one section 2 builds, sealed sappnd by an
+# anchor-tier leaf in it; this section has its own fake home, so it builds
+# the same shape here.
+as_user mkdir -m 700 -- "$FAKE_HOME/.ssh"
+as_user /bin/sh -c "printf 'Host example\n' > '$FAKE_HOME/.ssh/config'"
+ok   "an anchor-tier leaf seals ~/.ssh"        locked lock --yes "$FAKE_HOME/.ssh/config"
 LNK2="$FAKE_HOME/.ssh/link2"
 as_user ln -s "$LNKT" "$LNK2"
 refuse "a link under ~/.ssh is refused"        "does not apply to a link" \
@@ -2150,7 +2199,10 @@ ok   "a whole chain asks nothing"              grep -qF "already locked: $PLANF"
 deny "and prints no plan"                      grep -qF "plan for" "$OUTF"
 ok   "verify clean after the plan round"       locked verify --quiet
 
+}
+
 # ---- 5. the pool is what you asked to protect --------------------------------
+section_5() {
 #
 # You name the leaves; every chain directory is derived from them. A node is
 # held in place by its own flag or by an append-only parent and by nothing
@@ -2520,7 +2572,10 @@ check "the home stays the anchor"              "sappnd" "$(flags_of "$WPHOME")"
 check "the link is still sealed as itself"     "uchg" "$(flags_of "$WPHOME/.claude/settings.json")"
 ok   "verify clean after the unprotect"        locked_home "$WPHOME" verify --quiet
 
+}
+
 # ---- 6. placement: the way in is one ACL entry -------------------------------
+section_6() {
 #
 # A placement seal hands the directory to the lock account, keeps its group
 # and mode, and lets the invoker back in through one ACL entry: add rights,
@@ -2655,7 +2710,10 @@ check "back to the invoker, unflagged"         "$INV staff 700 -" "$(stat -f '%S
 check "with only Apple's entry left"           "group:everyone deny delete" "$(acl_h "$ACL7")"
 ok   "verify clean after the releases"         locked_home "$ACHOME" verify --quiet
 
+}
+
 # ---- 7. one-shot layout conversion -----------------------------------------
+section_7() {
 #
 # 0.14.0 kept each pool at <legacy root>/<user>; the first root invocation
 # of 0.15.0 moves it to <state root>/<user>/pool. Own roots here, so the
@@ -2705,7 +2763,10 @@ ok   "and is left where it was"                test -d "$CONV_LEGACY/.stray"
 rm -rf -- "$CONV_LEGACY"
 ok   "with the legacy root gone, runs pass"    locked_conv verify --quiet
 
+}
+
 # ---- 8. one root run at a time ---------------------------------------------
+section_8() {
 #
 # Every root run holds the run lock from the convergence to its exit. The
 # holder here is a stand-in that takes the lock on fd 9 the way locked does
@@ -2760,9 +2821,104 @@ refuse "a run lock others can read refuses"    "$RUNLOCK is not a root-owned 600
 chmod 600 "$RUNLOCK"
 ok   "at 600 again, runs pass"                 locked_conv verify --quiet
 
+}
+
+# ---- run the sections ------------------------------------------------------
+#
+# Section 0 ran above, in this process: it built the helper every other
+# section execs. The rest run as jobs, each a separate process in a scratch
+# dir of its own (new_scratch), all at once unless --serial. 7 and 8 are one
+# job, because 8 holds the run lock of the state root 7 converts. A job's
+# stdin is /dev/null, as for any background command: no case reads the
+# terminal, and the gate cases bring their own (</dev/null, or expect's pty).
+# Each job's output goes to a file and is printed in job order, so the log
+# reads the same either way.
+JOBS=("1" "2" "3" "4" "5" "6" "7 8")
+RESULTS="$SCRATCH/results"
+install -d -m 700 "$RESULTS"
+
+job_wanted() { # <job>: true when no section was named, or one of this job's was
+  local sec secs
+  [ "$WANT" = " " ] && return 0
+  IFS=' ' read -r -a secs <<<"$1"
+  for sec in "${secs[@]}"; do
+    case "$WANT" in *" $sec "*) return 0 ;; esac
+  done
+  return 1
+}
+
+run_job() { # <job>: run its sections, in the subshell the caller made for it
+  JOB_ID="${1%% *}"
+  JOB_T0=$SECONDS
+  JOB_DONE=0
+  IFS=' ' read -r -a JOB_SECS <<<"$1"
+  # SCRATCH is still the parent's here, and the parent removes its own. Clear
+  # it before the trap goes in, so a failure inside new_scratch cannot take
+  # the parent's dir with it. The trap writes the counts even when a failed
+  # command under set -e ends the job early; JOB_DONE says which it was.
+  SCRATCH=""
+  ANC=""
+  trap 'printf "%s %s %s %s\n" "$PASS" "$FAIL" "$JOB_DONE" "$((SECONDS - JOB_T0))" >"$RESULTS/$JOB_ID.count"; cleanup_scratch' EXIT
+  new_scratch
+  PASS=0
+  FAIL=0
+  for JOB_SEC in "${JOB_SECS[@]}"; do "section_$JOB_SEC"; done
+  JOB_DONE=1
+}
+
+finish_job() { # <job> <pid>: wait for it, print what it printed, add its counts
+  local id="${1%% *}" label="section $1" rc=0 p f d t
+  case "$1" in *" "*) label="sections ${1// / and }" ;; esac
+  wait "$2" || rc=$?
+  cat "$RESULTS/$id.log"
+  d=0 t="?"
+  if [ -f "$RESULTS/$id.count" ] && IFS=' ' read -r p f d t <"$RESULTS/$id.count"; then
+    PASS=$((PASS + p))
+    FAIL=$((FAIL + f))
+  fi
+  if [ "$d" != 1 ]; then
+    FAIL=$((FAIL + 1))
+    note "  FAIL  $label stopped early (exit $rc); its output above ends where it stopped"
+  fi
+  note "  time  $label: ${t}s"
+}
+
+# Ctrl-C reaches only this process: background jobs ignore SIGINT when job
+# control is off. So end them here, and the commands they are running, and
+# let each job's own trap clear its scratch dir.
+PIDS=()
+stop_jobs() {
+  local pid
+  for pid in ${PIDS[@]+"${PIDS[@]}"}; do
+    pkill -TERM -P "$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+  done
+  wait 2>/dev/null || true
+}
+trap 'stop_jobs; exit 130' INT TERM
+
+RUN=()
+for job in "${JOBS[@]}"; do
+  job_wanted "$job" || continue
+  ( run_job "$job" ) >"$RESULTS/${job%% *}.log" 2>&1 &
+  PIDS+=("$!")
+  RUN+=("$job")
+  if [ "$SERIAL" -eq 1 ]; then
+    finish_job "$job" "$!"
+  fi
+done
+if [ "$SERIAL" -eq 0 ]; then
+  i=0
+  while [ "$i" -lt "${#RUN[@]}" ]; do
+    finish_job "${RUN[$i]}" "${PIDS[$i]}"
+    i=$((i + 1))
+  done
+fi
+
 # ---- summary ---------------------------------------------------------------
 
 echo
+note "  time  all: ${SECONDS}s"
 echo "passed: $PASS  failed: $FAIL"
 if [ "$FAIL" -gt 0 ]; then
   exit 1

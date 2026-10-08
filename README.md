@@ -101,7 +101,9 @@ Three tiers, named by what they protect:
 - `sudo locked setup` -- one-shot install + provision (see below).
 
 Tests: `sudo /bin/bash tests/harness.bash` (scratch-dir only; stands in
-`daemon` for the lock account, no global state touched).
+`daemon` for the lock account, no global state touched). Its sections run
+at the same time, each in a scratch dir of its own; `--serial` runs them one
+at a time, and section numbers run only those.
 
 ### Proposed edits from a tool
 
