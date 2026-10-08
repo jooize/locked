@@ -355,10 +355,12 @@ run() {
 }
 
 # ONE implementation of the gate contract, shared by every y/N prompt and
-# every `next:` gate here, which had agreed on Enter and on little else.
+# every gate here, which had agreed on Enter and on little else.
 # `y`/`yes` continue, `n`/`no` decline, Enter takes the site's default, and
-# ANYTHING ELSE IS NOT ACTED ON: one yellow line says so -- a correction,
-# not a refusal -- and the gate asks again. A case whose last arm is the
+# ANYTHING ELSE IS NOT ACTED ON: a yellow `not an answer` says so -- a
+# correction, not a refusal -- and the next answer is read at the end of
+# that line. The gate line stays where it is, one line up, so it is not
+# printed again. A case whose last arm is the
 # continue turns a typo, a stray paste or a leaned-on key into consent at
 # exactly the moment a human is being asked to take responsibility. End of
 # input declines: a closed stdin is not consent, and these gates fail closed.
@@ -371,15 +373,15 @@ run() {
 # stderr and fd 1 its stdout. A caller whose own stdout is redirected away
 # from the tty never reaches a gate -- both sites test the tty first -- so
 # the fd is a sound stand-in for the stream here.
-gate_answer() { # <fd> <rendered gate line> <Enter continues: 0|1> <unknown-input tail>
-  local fd="$1" line="$2" enter_yes="$3" tail="$4" reply yel off
+gate_answer() { # <fd> <rendered gate line> <Enter continues: 0|1>
+  local fd="$1" line="$2" enter_yes="$3" reply yel off
   if [ "$fd" -eq 1 ]; then
     yel="$C_YEL" off="$C_OFF"
   else
     yel="$E_YEL" off="$E_OFF"
   fi
+  printf '%s' "$line" >&"$fd"
   while :; do
-    printf '%s' "$line" >&"$fd"
     if ! IFS= read -r reply; then
       printf '\n' >&"$fd"   # no echoed Enter closed the gate line
       return 1
@@ -398,13 +400,12 @@ gate_answer() { # <fd> <rendered gate line> <Enter continues: 0|1> <unknown-inpu
     # notice, because they just answered wrong. What was typed is NEVER
     # echoed: the terminal already showed it as it was typed, and a pasted
     # control sequence printed raw could rewrite the very line the human is
-    # about to answer. No key coloring inside it either -- one role per
-    # line, and attention wins.
-    printf '%snot an answer; %s%s\n' "$yel" "$tail" "$off" >&"$fd"
+    # about to answer. It lists no keys: the gate line above names them.
+    printf '%snot an answer%s ' "$yel" "$off" >&"$fd"
   done
 }
 
-confirm() { # <prompt> [<what y does; default "continues">]
+confirm() { # <prompt>
   # Returns 0 on yes. Fail closed: non-tty without --yes aborts.
   [ "$OPT_YES" -eq 1 ] && return 0
   if [ ! -t 0 ]; then
@@ -420,10 +421,10 @@ confirm() { # <prompt> [<what y does; default "continues">]
   # re-opens bold after its own reset, because the reset clears it.
   printf -v line '%s%s [%sy%s%s/%sN%s%s]%s ' \
     "$E_B" "$1" "$E_BLU" "$E_OFF" "$E_B" "$E_BLU" "$E_OFF" "$E_B" "$E_OFF"
-  gate_answer 2 "$line" 0 "y ${2:-continues}, Enter or n aborts"
+  gate_answer 2 "$line" 0
 }
 
-confirm_hard() { # <prompt> [<what y does; default "continues">]
+confirm_hard() { # <prompt>
   # High-signal prompts (node identity changed): --yes does NOT satisfy
   # this; a human at a tty must answer.
   if [ ! -t 0 ]; then
@@ -434,7 +435,7 @@ confirm_hard() { # <prompt> [<what y does; default "continues">]
   # Same shape as confirm: bold sentence, bold-blue keys.
   printf -v line '%s%s [%sy%s%s/%sN%s%s]%s ' \
     "$E_B" "$1" "$E_BLU" "$E_OFF" "$E_B" "$E_BLU" "$E_OFF" "$E_B" "$E_OFF"
-  gate_answer 2 "$line" 0 "y ${2:-continues}, Enter or n aborts"
+  gate_answer 2 "$line" 0
 }
 
 # During an unlock window a released ancestor can be swapped by anything
@@ -993,8 +994,13 @@ do_setup() {
   log_action setup "" ok
   echo
   echo "setup complete."
-  echo "  test:  sudo locked status /nonexistent    # should print 'not in pool'"
-  echo "  next:  sudo locked lock <path>            # adopt a first target"
+  # A suggestion block (commands the human may type later) keeps its own
+  # label, a sentence -- never `next:`, the label gates used to wear.
+  echo
+  echo "To check the pool, then adopt a first target, run:"
+  echo
+  echo "  sudo locked status /nonexistent    # should print 'not in pool'"
+  echo "  sudo locked lock <path>"
 }
 
 if [ "$action" = "setup" ]; then
@@ -1913,7 +1919,7 @@ diff_filter() { /usr/bin/perl -e "$DIFF_FILTER" "$1"; }
 # only the encoded one is ever shown; a filter that cannot run refuses the
 # display rather than falling back to raw bytes. Line count comes off the
 # encoded file, which is what the gate is about to page. Short output
-# prints inline; long output on a tty is announced by a next: gate and
+# prints inline; long output on a tty is announced by a gate and
 # paged (less -RF; an early pager quit is not an error), plain cat off-tty.
 # The header starts FLUSH -- the caller owns any blank line before this
 # block -- and the block ends with the diff's own final newline.
@@ -1951,18 +1957,17 @@ show_diff() { # <label> <path> <diff-cmd>...
   rm -f -- "$raw"
   lines="$(wc -l <"$enc" | tr -d ' ')"
   if [ -t 0 ] && [ -t 1 ] && [ "$lines" -gt 24 ]; then
-    # Three weights, one per job (terminal-output): bold runs from `next:`
-    # through the `;` because that clause IS the decision, the mechanics
-    # after it are plain so the bold has something to stand against, and the
+    # Three weights, one per job (terminal-output): bold runs to the `;`
+    # because that clause IS the decision, the mechanics after it are plain so the bold has something to stand against, and the
     # tail is dim because it is the alternative, not the offer. Both keys the
     # human may type are bold blue. Dim is re-opened after the key's reset,
     # which clears it. Declining here only skips the pager -- the confirm
     # that follows still asks.
     local gate
-    printf -v gate '%snext: diff (%s lines);%s %sEnter%s opens the diff %s· %s%sn%s%s skips%s ' \
+    printf -v gate '%sshow the diff (%s lines);%s %sEnter%s open %s· %s%sn%s%s skip%s ' \
       "$P_B" "$lines" "$P_OFF" "$P_BLU" "$P_OFF" \
       "$P_DIM" "$P_OFF" "$P_BLU" "$P_OFF" "$P_DIM" "$P_OFF"
-    if gate_answer 1 "$gate" 1 "Enter or y opens the diff, n skips"; then
+    if gate_answer 1 "$gate" 1; then
       /usr/bin/less -RF -- "$enc" || true
     fi
   else
@@ -3380,7 +3385,7 @@ EOF
   else
     q="Apply the plan for $(subj "$f") ($(change_counts protect "$protects" release "$releases"))?"
   fi
-  confirm "$q" "applies it" || {
+  confirm "$q" || {
     # The decline is the decision this run made, so it goes in the log
     # beside the seals that were taken -- and it is the whole record of
     # the run, since not one node was touched.
@@ -3554,7 +3559,7 @@ do_unprotect_one() {
   elif [ "$nr" -gt 1 ]; then
     q="Stop protecting $(subj "$f") and release $nr directories?"
   fi
-  confirm "$q" "applies it" || {
+  confirm "$q" || {
     log_action unprotect "$f" abort
     echo "${E_YEL}aborted: $f${E_OFF}" >&2
     return 2
