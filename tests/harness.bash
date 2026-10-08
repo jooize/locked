@@ -1038,6 +1038,45 @@ EOF
   check "the declined leaf carries no flag"    "" "$(flags_of "$TTYDEC")"
   check "the home anchor is still sealed"      "sappnd" "$(flags_of "$TTYHOME")"
 
+  # A wrong answer is not acted on: a yellow `not an answer` on its own
+  # line, then the gate printed again, and the answer after it decides. The
+  # second [y/N] match is the reprinted gate; without it expect times out.
+  TTYWRONG="$TTYHOME/wrong-answer.txt"
+  as_user /bin/sh -c "printf 'x\n' > '$TTYWRONG'"
+  TTYEXP2B="$SCRATCH/tty-wrong-answer.exp"
+  cat >"$TTYEXP2B" <<EOF
+set timeout 15
+set ynp {\[(\x1b\[[0-9;]*m)*y(\x1b\[[0-9;]*m)*/(\x1b\[[0-9;]*m)*N(\x1b\[[0-9;]*m)*\]}
+spawn env LOCKED_STATE_ROOT=$(state_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME SUDO_USER=$INV /bin/bash $LOCKED lock $TTYWRONG
+expect {
+  timeout { exit 1 }
+  eof     { exit 1 }
+  -re \$ynp
+}
+send "zzz\r"
+expect {
+  timeout { exit 1 }
+  eof     { exit 1 }
+  "not an answer"
+}
+expect {
+  timeout { exit 1 }
+  eof     { exit 1 }
+  -re \$ynp
+}
+send "n\r"
+expect {
+  timeout { exit 1 }
+  eof
+}
+catch wait result
+exit [lindex \$result 3]
+EOF
+  TTYWRC=0
+  /usr/bin/expect -f "$TTYEXP2B" >/dev/null 2>&1 || TTYWRC=$?
+  check "a wrong answer reprints the gate, then n exits 2" "2" "$TTYWRC"
+  check "the wrong answer sealed nothing"      "" "$(flags_of "$TTYWRONG")"
+
   # The unprotect gate names what else goes. Nothing else under this home
   # is protected, so the anchor would be released along with the file.
   TTYEXP3="$SCRATCH/tty-unprotect.exp"

@@ -357,10 +357,10 @@ run() {
 # ONE implementation of the gate contract, shared by every y/N prompt and
 # every gate here, which had agreed on Enter and on little else.
 # `y`/`yes` continue, `n`/`no` decline, Enter takes the site's default, and
-# ANYTHING ELSE IS NOT ACTED ON: a yellow `not an answer` says so -- a
-# correction, not a refusal -- and the next answer is read at the end of
-# that line. The gate line stays where it is, one line up, so it is not
-# printed again. A case whose last arm is the
+# ANYTHING ELSE IS NOT ACTED ON: a yellow `not an answer` says so on its
+# own line -- a correction, not a refusal -- the gate line is printed
+# again, and the next answer is read at the end of it. A case whose last
+# arm is the
 # continue turns a typo, a stray paste or a leaned-on key into consent at
 # exactly the moment a human is being asked to take responsibility. End of
 # input declines: a closed stdin is not consent, and these gates fail closed.
@@ -400,8 +400,9 @@ gate_answer() { # <fd> <rendered gate line> <Enter continues: 0|1>
     # notice, because they just answered wrong. What was typed is NEVER
     # echoed: the terminal already showed it as it was typed, and a pasted
     # control sequence printed raw could rewrite the very line the human is
-    # about to answer. It lists no keys: the gate line above names them.
-    printf '%snot an answer%s ' "$yel" "$off" >&"$fd"
+    # about to answer. It lists no keys: the gate line follows again, so
+    # the answer is always typed beside them.
+    printf '%snot an answer%s\n%s' "$yel" "$off" "$line" >&"$fd"
   done
 }
 
