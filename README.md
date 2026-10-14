@@ -103,7 +103,9 @@ Three tiers, named by what they protect:
 Tests: `sudo /bin/bash tests/harness.bash` (scratch-dir only; stands in
 `daemon` for the lock account, no global state touched). Its sections run
 at the same time, each in a scratch dir of its own; `--serial` runs them one
-at a time, and section numbers run only those.
+at a time, and section numbers run only those. Its stdout is a TAP 14
+stream, so `prove -v --exec 'sudo /bin/bash' tests/harness.bash` (TAP::Harness
+3.50 or later) can check it.
 
 ### Proposed edits from a tool
 
