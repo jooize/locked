@@ -151,6 +151,27 @@ value_rows() {
   done
 }
 
+# ok_row <words> <value> [note]: a verdict on stdout, `✓ <words>: <value>`.
+# The value -- a path, whose length locked does not choose -- ends the
+# line, so a bounded field (a tier, a flag word) goes in <words>, before
+# the colon, and a sentence about it goes on a dim line under the row,
+# starting in the value's column (terminal-output Rows).
+ok_row() {
+  printf '%s✓%s %s: %s\n' "$C_GRN" "$C_OFF" "$1" "$2"
+  if [ -n "${3:-}" ]; then
+    printf '%*s%s%s%s\n' $(( ${#1} + 4 )) '' "$C_DIM" "$3" "$C_OFF"
+  fi
+}
+
+# ok_move <words> <old> <new>: the verdict for a path that changed. The
+# new path takes the line under the old one, `→` hanging in the gutter so
+# the two start in the same column (`→` counted as one, as Ghostty draws
+# it).
+ok_move() {
+  printf '%s✓%s %s: %s\n' "$C_GRN" "$C_OFF" "$1" "$2"
+  printf '%*s→ %s\n' $(( ${#1} + 2 )) '' "$3"
+}
+
 usage() {
   cat <<EOF
 usage: sudo locked <action> [options] [args]
@@ -490,7 +511,7 @@ check_reseal_identity() { # <path> <metafile>
   if [ "$sn" -eq 2 ]; then
     # Same inode, pre-0.6.0 spelling: the seal's own write_meta records the
     # volume form a line later, so the note is all this owes.
-    echo "  note: identity record upgraded (dev.ino -> volume uuid)"
+    echo "  note: identity record upgraded (dev.ino → volume uuid)"
     return 0
   fi
   # An alarm can fire anywhere, so the block owns one leading blank line.
@@ -1454,7 +1475,7 @@ upgrade_identity_record() { # <path> <metafile> <live id>
     return 0
   fi
   if rewrite_meta_id "$meta" "$cur"; then
-    echo "  info  $f: identity record upgraded (dev.ino -> volume uuid)"
+    echo "  info  $f: identity record upgraded (dev.ino → volume uuid)"
     return 0
   fi
   echo "  DRIFT $f: identity record could not be upgraded ($meta)"
@@ -2429,7 +2450,7 @@ seal_content() {
       "role=leaf" \
       "state=locked" || return 1
   fi
-  echo "${C_GRN}✓${C_OFF} locked: $f (content)"
+  ok_row "locked (content)" "$f"
   log_action lock "$f" ok
 }
 
@@ -2467,7 +2488,7 @@ seal_placement() {
         "$(acl_kv "$META")" \
         "state=locked" || return 1
     fi
-    echo "${C_GRN}✓${C_OFF} relocked: $d (placement)"
+    ok_row "relocked (placement)" "$d"
     log_action lock "$d" ok
     return 0
   fi
@@ -2505,7 +2526,7 @@ seal_placement() {
       "acl=$entry" \
       "state=locked" || return 1
   fi
-  echo "${C_GRN}✓${C_OFF} locked: $d (placement)"
+  ok_row "locked (placement)" "$d"
   log_action lock "$d" ok
 }
 
@@ -2569,7 +2590,7 @@ seal_anchor() {
       "role=$role" \
       "state=locked" || return 1
   fi
-  echo "${C_GRN}✓${C_OFF} locked: $f (anchor $flagword)"
+  ok_row "locked (anchor $flagword)" "$f"
   log_action lock "$f" ok
 }
 
@@ -2668,7 +2689,7 @@ release_node() {
       "$(mismatch_kv "$META")" \
       "state=unlocked" || return 1
   fi
-  echo "${C_GRN}✓${C_OFF} unlocked: $f ($tier)"
+  ok_row "unlocked ($tier)" "$f"
   if [ "$tier" = "content" ] && [ "$recursive" != "1" ] && [ "$is_link" -eq 0 ]; then
     echo "  snapshot: $SNAP"
   fi
@@ -2737,9 +2758,9 @@ release_chain_node() { # <dir>
   fi
   retire_record "$d" unneeded quiet || return 1
   if [ "$tier" = "placement" ]; then
-    echo "${C_GRN}✓${C_OFF} released: $d (back to ${owner}:${group} $mode)"
+    ok_row released "$d" "back to $mode ${owner}:${group}"
   else
-    echo "${C_GRN}✓${C_OFF} released: $d ($flag cleared)"
+    ok_row "released ($flag cleared)" "$d"
   fi
   log_action release "$d" ok
 }
@@ -3076,7 +3097,8 @@ rekey_record() { # <oldpath> <newpath>
       mv -f -- "$src" "$dst" || return 1
     fi
   done
-  echo "  record re-keyed: $old -> $new"
+  # The new key hangs under the old one, `→` in the gutter.
+  printf '  record re-keyed: %s\n%*s→ %s\n' "$old" 17 '' "$new"
 }
 
 # ---- subtree scan ----------------------------------------------------------
@@ -3559,7 +3581,7 @@ EOF
       protect)
         snap_paths "${plan_paths[$i]}"
         rewrite_meta_role "$META" leaf || return 1
-        echo "${C_GRN}✓${C_OFF} protected: ${plan_paths[$i]} (already sealed; now yours by name)"
+        ok_row protected "${plan_paths[$i]}" "already sealed; now yours by name"
         log_action lock "${plan_paths[$i]}" protect
         ;;
       *)
@@ -3777,7 +3799,7 @@ unprotect_leaf() {
     esac
   fi
   retire_record "$f" unprotect quiet || return 1
-  echo "${C_GRN}✓${C_OFF} unprotected: $f ($back)"
+  ok_row unprotected "$f" "$back"
   log_action unprotect "$f" ok
 }
 
@@ -4188,9 +4210,9 @@ do_edit_one() {
       return 1
     fi
     if [ "$is_new" -eq 1 ]; then
-      echo "${C_GRN}✓${C_OFF} created and sealed: $f (in $folder)"
+      ok_row "created and sealed" "$f"
     else
-      echo "${C_GRN}✓${C_OFF} edited and resealed: $f (in $folder)"
+      ok_row "edited and resealed" "$f"
     fi
     log_action edit "$f" ok
     return 0
@@ -4226,7 +4248,7 @@ do_edit_one() {
     report_mismatch "$f" "$what" "$f"
     return 1
   fi
-  echo "${C_GRN}✓${C_OFF} edited and resealed: $f"
+  ok_row "edited and resealed" "$f"
   log_action edit "$f" ok
 }
 
@@ -4295,7 +4317,7 @@ do_revert_one() {
   else
     run atomic_replace "$SNAP" "$f" "${owner:-$inv}:${group:-staff}" "$mode" || return 1
   fi
-  echo "${C_GRN}✓${C_OFF} reverted: $f from snapshot"
+  ok_row "reverted from snapshot" "$f"
   echo "  discarded content saved to: $ATTIC"
   log_action revert "$f" ok
 }
@@ -4400,7 +4422,7 @@ do_rm_one() {
   helper_outcome rm "$f" || return 1
 
   local rc=0
-  echo "${C_GRN}✓${C_OFF} removed: $f"
+  ok_row removed "$f"
   apply_subtree_effect rm "$f" || rc=1
   apply_releases || rc=1
   if [ "$HELPER_ANOMALY" -eq 1 ]; then
@@ -4501,14 +4523,14 @@ do_trash_one() {
 
   local bin rc=0
   bin="$(helper_line_value binurl)"
-  echo "${C_GRN}✓${C_OFF} trashed: $f"
+  ok_row trashed "$f"
   if [ -n "$bin" ]; then
     echo "  bin: $bin"
   elif [ "$OPT_DRY" -eq 0 ]; then
     # Without the destination the suspension cannot be finalized later,
     # and Put Back would resurrect an unsealed node with nothing watching.
     echo >&2
-    echo "${E_RED}${E_B}!!! $f: the helper reported no bin location !!!${E_OFF}" >&2
+    echo "${E_RED}${E_B}!!! the helper reported no bin location !!!${E_OFF}" >&2
     echo "    The record is suspended without one, so verify cannot finalize" >&2
     echo "    it. Find where it went and re-key or tombstone the record." >&2
     rc=3
@@ -4578,7 +4600,7 @@ do_mv() { # <old> <new>
   helper_outcome mv "$old" || return 1
 
   local rc=0
-  echo "${C_GRN}✓${C_OFF} moved: $old -> $new"
+  ok_move moved "$old" "$new"
   # A rename keeps the inode, so no recorded field changes -- only the key.
   rekey_subtree "$old" "$new" || rc=1
   if [ "$HELPER_ANOMALY" -eq 1 ]; then
@@ -4694,7 +4716,7 @@ do_tombstone_one() {
     echo "${E_YEL}aborted; record unchanged${E_OFF}" >&2; return 2
   }
   retire_record "$f" assertion || return 1
-  echo "${C_GRN}✓${C_OFF} tombstoned: $f"
+  ok_row tombstoned "$f"
   log_action tombstone "$f" ok
 }
 

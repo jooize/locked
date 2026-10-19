@@ -2131,7 +2131,7 @@ check "and keeps its own mode"                 "750" "$(stat -f '%OLp' "$PLD")"
 mkdir -p -- "$PLD/sub"
 chgrp wheel "$PLD/sub"
 locked lock --yes "$PLL" >"$OUTF" 2>&1 || true
-ok   "the leaf's plan relocks it as placement" grep -qF "relocked: $PLD (placement)" "$OUTF"
+ok   "the leaf's plan relocks it as placement" grep -qF "relocked (placement): $PLD" "$OUTF"
 deny "and never mentions mixed ownership"      grep -qF "mixed ownership" "$OUTF"
 deny "and never calls the placement mode drift" grep -qF "mode drifted" "$OUTF"
 check "the relocked dir is uappnd again"       "uappnd" "$(flags_of "$PLD")"
@@ -2419,16 +2419,22 @@ check "without a tty or --yes it declines"     "2" "$LPRC"
 check "and the record is untouched"            "locked" "$(meta_get "$LPF" state)"
 
 locked_home "$LPHOME" unprotect --yes "$LPF" >"$LPOUT" 2>&1 || true
-ok   "the file is unprotected"                 grep -qF "✓ unprotected: $LPF ($LPF_BACK0)" "$LPOUT"
+# A verdict ends with its path; what the node went back to is a dim line
+# under it, in the path's column.
+ok   "the file is unprotected"                 grep -qxF "✓ unprotected: $LPF" "$LPOUT"
+check "and says what it went back to"          "$LPF_BACK0" \
+      "$(grep -A1 -xF "✓ unprotected: $LPF" "$LPOUT" | tail -n1 | sed 's/^ *//')"
 check "it is the invoker's again"              "$LPF_ID0" "$(stat -f '%Su:%Sg %OLp' "$LPF")"
 check "with no flag"                           "" "$(flags_of "$LPF")"
 check "its record is retired"                  "retired" "$(meta_get "$LPF" state)"
 check "via unprotect"                          "unprotect" "$(meta_get "$LPF" via)"
-ok   "the grandparent is released"             grep -qF "✓ released: $LPA (back to $INV:staff 777)" "$LPOUT"
+ok   "the grandparent is released"             grep -qxF "✓ released: $LPA" "$LPOUT"
+check "and says what it went back to"          "back to 777 $INV:staff" \
+      "$(grep -A1 -xF "✓ released: $LPA" "$LPOUT" | tail -n1 | sed 's/^ *//')"
 check "back to its own identity"               "$INV staff 777" "$(stat -f '%Su %Sg %OLp' "$LPA")"
 check "with no flag"                           "" "$(flags_of "$LPA")"
 check "its record retired as unneeded"         "unneeded" "$(meta_get "$LPA" via)"
-ok   "the anchor is released"                  grep -qF "✓ released: $LPHOME (sappnd cleared)" "$LPOUT"
+ok   "the anchor is released"                  grep -qxF "✓ released (sappnd cleared): $LPHOME" "$LPOUT"
 check "the home carries no flag"               "" "$(flags_of "$LPHOME")"
 check "and never changed owner"                "$INV" "$(owner_of "$LPHOME")"
 deny "one result line per release"             grep -qF "record retired:" "$LPOUT"
@@ -2502,7 +2508,9 @@ ok   "the pool listing notes it"               grep -qF "no protected file needs
 ok   "by name"                                 grep -qF "      $ORD" "$LPOUT"
 locked_home "$LPHOME" lock --yes "$SH1" >"$LPOUT" 2>&1 || true
 ok   "an unrelated lock plans the release"     grep -q "^  release  *unused  $ORD\$" "$LPOUT"
-ok   "and applies it"                          grep -qF "✓ released: $ORD (back to $INV:staff 777)" "$LPOUT"
+ok   "and applies it"                          grep -qxF "✓ released: $ORD" "$LPOUT"
+check "back to the invoker's identity"         "back to 777 $INV:staff" \
+      "$(grep -A1 -xF "✓ released: $ORD" "$LPOUT" | tail -n1 | sed 's/^ *//')"
 deny "the whole chain asked for no seal"       grep -q "^  seal " "$LPOUT"
 check "the dir carries no flag"                "" "$(flags_of "$ORD")"
 check "its record retired as unneeded"         "unneeded" "$(meta_get "$ORD" via)"
@@ -2523,7 +2531,9 @@ ok   "by name and reason"                      grep -q "release  *unused  $RMD\$
 ok   "the file it removes has its own row"     grep -qxF "file:  $RMF" "$LPOUT"
 deny "the file is gone"                        test -e "$RMF"
 check "its record retired via rm"              "rm" "$(meta_get "$RMF" via)"
-ok   "the chain dir was released after it"     grep -qF "✓ released: $RMD (back to $INV:staff 777)" "$LPOUT"
+ok   "the chain dir was released after it"     grep -qxF "✓ released: $RMD" "$LPOUT"
+check "back to the invoker's identity"         "back to 777 $INV:staff" \
+      "$(grep -A1 -xF "✓ released: $RMD" "$LPOUT" | tail -n1 | sed 's/^ *//')"
 check "and carries no flag"                    "" "$(flags_of "$RMD")"
 check "the grandparent above stays for the others" "uappnd" "$(flags_of "$LPA")"
 ok   "verify clean after the rm"               locked_home "$LPHOME" verify --quiet
@@ -2786,7 +2796,7 @@ refuse "a relock without the entry is refused" "no longer carries its ACL entry"
 check "and leaves the dir unflagged"           "" "$(flags_of "$ACD")"
 chmod +a "$ACE" "$ACD"
 locked_home "$ACHOME" lock --yes "$ACD/app/a.conf" >"$ACOUT" 2>&1 || true
-ok   "with the entry back, the plan relocks it" grep -qF "relocked: $ACD (placement)" "$ACOUT"
+ok   "with the entry back, the plan relocks it" grep -qF "relocked (placement): $ACD" "$ACOUT"
 check "the relocked dir is uappnd again"       "uappnd" "$(flags_of "$ACD")"
 ok   "verify clean after the relock"           locked_home "$ACHOME" verify --quiet
 
