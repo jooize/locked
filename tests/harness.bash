@@ -1190,10 +1190,12 @@ expect {
 }
 # The path row, then the consequence line with the counts, then the
 # question, and the question line holds no path: exit 3 if a / shows on it.
+# The row label is bold and its colon follows the reset, so an SGR run may
+# sit between the two.
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
-  -re {path:[^\n]*\n[^\n]*This seals 2 nodes\.[^\n]*\n([^\n]*)as listed\?}
+  -re {path(?:\x1b\[[0-9;]*m)*:[^\n]*\n[^\n]*This seals 2 nodes\.[^\n]*\n([^\n]*)as listed\?}
 }
 if {[string first "/" \$expect_out(1,string)] >= 0} { exit 3 }
 expect {
