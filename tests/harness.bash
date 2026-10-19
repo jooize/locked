@@ -1285,8 +1285,9 @@ EOF
   check "a wrong answer reprints the gate, then n exits 2" "2" "$TTYWRC"
   check "the wrong answer sealed nothing"      "" "$(flags_of "$TTYWRONG")"
 
-  # The unprotect gate names what else goes. Nothing else under this home
-  # is protected, so the anchor would be released along with the file.
+  # The unprotect gate names what else goes, on the consequence line
+  # above its question. Nothing else under this home is protected, so the
+  # anchor would be released along with the file.
   TTYEXP3="$SCRATCH/tty-unprotect.exp"
   cat >"$TTYEXP3" <<EOF
 set timeout 15
@@ -1294,7 +1295,7 @@ spawn env LOCKED_STATE_ROOT=$(state_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
-  "and release 1 directory"
+  "This also releases 1 directory."
 }
 send "n\r"
 expect {
