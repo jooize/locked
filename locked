@@ -135,9 +135,15 @@ set_pal   # initialize for set -u; callers on a redirected fd re-run it
 # U+3000, U+3164, U+FE00-FE0F, U+FEFF, U+FFA0, U+FFF9-FFFB,
 # U+E0000-E007F, U+E0100-E01EF. A plain space is not on it. A literal
 # backslash followed by u{, or by x and a hex digit, shows as \u{5C}, so
-# that a backslash-u on screen can only ever begin an escape. Each escape
-# wears reverse red, the one style that means hidden; under no color the
-# escape text alone carries the fact.
+# that a backslash-u on screen can only ever begin an escape.
+#
+# Two kinds of escape. A hidden-list character's escape wears reverse
+# red, the one style that means hidden, because the raw character could
+# make the name read as one thing and act as another. The kept escapes --
+# an invalid byte, an escaped backslash -- are shown as exactly what they
+# are and cannot pass for anything else, so they take no style of their
+# own and read in the value's. Under no color the escape text alone
+# carries the fact.
 #
 # Display only: records, logs and the verify status keep the raw bytes
 # (verify_escape writes its own form for its machine-read file), and the
@@ -177,15 +183,16 @@ sub mb {
         : (($b[0] & 0x07) << 18) | (($b[1] & 0x3F) << 12) | (($b[2] & 0x3F) << 6) | ($b[3] & 0x3F);
   return hidden($p) ? esc($p) : $m;
 }
-$s =~ s/([\x20-\x5B\x5D-\x7E]+)|(\\(?=u\{|x[0-9A-Fa-f]))|(\\)|([\x00-\x1F\x7F])|([\xC2-\xDF][\x80-\xBF]|\xE0[\xA0-\xBF][\x80-\xBF]|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}|\xED[\x80-\x9F][\x80-\xBF]|\xF0[\x90-\xBF][\x80-\xBF]{2}|[\xF1-\xF3][\x80-\xBF]{3}|\xF4[\x80-\x8F][\x80-\xBF]{2})|([\x80-\xFF])/defined $1 ? $1 : defined $2 ? esc(0x5C) : defined $3 ? "\\" : defined $4 ? esc(ord $4) : defined $5 ? mb($5) : $o . sprintf("\\x%02X", ord $6) . $c/ge;
+$s =~ s/([\x20-\x5B\x5D-\x7E]+)|(\\(?=u\{|x[0-9A-Fa-f]))|(\\)|([\x00-\x1F\x7F])|([\xC2-\xDF][\x80-\xBF]|\xE0[\xA0-\xBF][\x80-\xBF]|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}|\xED[\x80-\x9F][\x80-\xBF]|\xF0[\x90-\xBF][\x80-\xBF]{2}|[\xF1-\xF3][\x80-\xBF]{3}|\xF4[\x80-\x8F][\x80-\xBF]{2})|([\x80-\xFF])/defined $1 ? $1 : defined $2 ? "\\u{5C}" : defined $3 ? "\\" : defined $4 ? esc(ord $4) : defined $5 ? mb($5) : sprintf("\\x%02X", ord $6)/ge;
 print STDOUT $s or exit 1;
 close(STDOUT) or exit 1;
 '
 
 # esc_into <var> <text> [<escape style> [<resume style>]]: <text> as the
 # reader is shown it, into <var>. <escape style> is the stream's reverse
-# red (C_RV, E_RV or P_RV); after each escape the style resets and
-# <resume style> -- the color the value is in -- picks up again. Printable
+# red (C_RV, E_RV or P_RV), worn by hidden-list escapes only; after each
+# one the style resets and <resume style> -- the color the value is in --
+# picks up again. Printable
 # ASCII with no backslash is its own escaped form and skips the process
 # (the case runs under LC_ALL=C, where [:print:] is that range).
 #
