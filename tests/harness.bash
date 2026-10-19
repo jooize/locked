@@ -2313,6 +2313,18 @@ ok   "dry run prints the plan"                 grep -qxF "plan (tier content):" 
 ok   "dry run says nothing changed"            grep -qF "dry run: nothing changed" "$OUTF"
 check "dry run left the leaf's owner"          "$INV" "$(owner_of "$PLANF")"
 check "dry run left no flag on it"             "" "$(flags_of "$PLANF")"
+
+# A path is shown as the characters that are there (untrusted-text): a
+# zero-width space and a literal backslash-u in a file name are escaped
+# on every row that names it, and the raw bytes never reach the screen.
+HIDF="$PLAND/inner/hid"$'\342\200\213'"den\\u{41}.txt"
+# shellcheck disable=SC2016  # $1 is the inner shell's argument
+as_user /bin/sh -c 'echo h > "$1"' sh "$HIDF"
+locked lock --dry-run --yes "$HIDF" >"$OUTF" 2>&1 || true
+ok   "a hidden character in a name shows escaped" \
+     grep -qF 'hid\u{200B}den\u{5C}u{41}.txt' "$OUTF"
+deny "and never raw"                           grep -qF $'\342\200\213' "$OUTF"
+as_user /bin/rm -f -- "$HIDF"
 deny "dry run wrote no record"                 test -f "$(meta_path "$PLANF")"
 
 ok   "the leaf seals after the previews"       locked lock --yes "$PLANF"

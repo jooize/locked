@@ -80,7 +80,8 @@ VERSION=0.15.5
 # what-am-I-looking-at one level down, as in pinned), cyan = identifiers
 # and commands, yellow = attention (notes, drift, aborts), green/red =
 # verdict glyphs and refusals, dim = meta, bold = the decision sentence
-# and structure.
+# and structure, reverse red = a hidden character shown escaped (see
+# esc_into), and nothing else.
 #
 # Gated PER STREAM: C_* follows stdout, E_* follows stderr, so a piped
 # stdout stays byte-identical for anything parsing it while an alarm on the
@@ -90,16 +91,16 @@ VERSION=0.15.5
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   C_OFF=$'\033[0m' C_B=$'\033[1m' C_DIM=$'\033[2m'
   C_RED=$'\033[31m' C_GRN=$'\033[32m' C_YEL=$'\033[33m'
-  C_CYN=$'\033[36m' C_MAG=$'\033[35m' C_BLU=$'\033[1;34m'
+  C_CYN=$'\033[36m' C_MAG=$'\033[35m' C_BLU=$'\033[1;34m' C_RV=$'\033[7;31m'
 else
-  C_OFF='' C_B='' C_DIM='' C_RED='' C_GRN='' C_YEL='' C_CYN='' C_MAG='' C_BLU=''
+  C_OFF='' C_B='' C_DIM='' C_RED='' C_GRN='' C_YEL='' C_CYN='' C_MAG='' C_BLU='' C_RV=''
 fi
 if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
   E_OFF=$'\033[0m' E_B=$'\033[1m' E_DIM=$'\033[2m'
   E_RED=$'\033[31m' E_GRN=$'\033[32m' E_YEL=$'\033[33m'
-  E_CYN=$'\033[36m' E_MAG=$'\033[35m' E_BLU=$'\033[1;34m'
+  E_CYN=$'\033[36m' E_MAG=$'\033[35m' E_BLU=$'\033[1;34m' E_RV=$'\033[7;31m'
 else
-  E_OFF='' E_B='' E_DIM='' E_RED='' E_YEL='' E_GRN='' E_CYN='' E_MAG='' E_BLU=''
+  E_OFF='' E_B='' E_DIM='' E_RED='' E_YEL='' E_GRN='' E_CYN='' E_MAG='' E_BLU='' E_RV=''
 fi
 
 # Palette for a function whose stdout the CALL SITE may redirect
@@ -110,12 +111,100 @@ set_pal() {
   if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     P_OFF=$'\033[0m' P_B=$'\033[1m' P_DIM=$'\033[2m'
     P_RED=$'\033[31m' P_GRN=$'\033[32m' P_YEL=$'\033[33m'
-    P_CYN=$'\033[36m' P_MAG=$'\033[35m' P_BLU=$'\033[1;34m'
+    P_CYN=$'\033[36m' P_MAG=$'\033[35m' P_BLU=$'\033[1;34m' P_RV=$'\033[7;31m'
   else
-    P_OFF='' P_B='' P_DIM='' P_RED='' P_GRN='' P_YEL='' P_CYN='' P_MAG='' P_BLU=''
+    P_OFF='' P_B='' P_DIM='' P_RED='' P_GRN='' P_YEL='' P_CYN='' P_MAG='' P_BLU='' P_RV=''
   fi
 }
 set_pal   # initialize for set -u; callers on a redirected fd re-run it
+
+# ---- third-party text --------------------------------------------------------
+#
+# WHAT THE READER SEES IS THE TEXT THAT IS THERE (untrusted-text). A path
+# is the user's own file name, and a name in it may hold characters that
+# draw nothing, draw as something else, or reorder what follows them.
+# Every character on the hidden list shows as an escape, never raw and
+# never dropped:
+#
+#   \u{HEX}   a hidden code point, uppercase hex with no leading zeros
+#   \xHH      a byte that is not part of valid UTF-8, one escape per byte
+#
+# The hidden list: U+0000-001F (line feed and tab included: a value sits
+# on one row), U+007F-009F, U+00A0, U+00AD, U+034F, U+061C, U+115F-1160,
+# U+17B4-17B5, U+180B-180E, U+2000-200F, U+2028-202F, U+205F-206F,
+# U+3000, U+3164, U+FE00-FE0F, U+FEFF, U+FFA0, U+FFF9-FFFB,
+# U+E0000-E007F, U+E0100-E01EF. A plain space is not on it. A literal
+# backslash followed by u{, or by x and a hex digit, shows as \u{5C}, so
+# that a backslash-u on screen can only ever begin an escape. Each escape
+# wears reverse red, the one style that means hidden; under no color the
+# escape text alone carries the fact.
+#
+# Display only: records, logs and the verify status keep the raw bytes
+# (verify_escape writes its own form for its machine-read file), and the
+# diff witness has its own filter (DIFF_FILTER).
+#
+# Perl, in bytes from end to end, for the reason DIFF_FILTER gives. The
+# source is a single-quoted bash string holding no single quote, so bash
+# expands nothing in it.
+# shellcheck disable=SC2016  # the single quotes are the point: no expansion
+readonly UNTRUSTED_PL='
+use strict;
+my ($o, $c) = @ARGV;
+$o = "" unless defined $o;
+$c = "" unless defined $c;
+binmode(STDIN);
+binmode(STDOUT);
+local $/;
+my $s = <STDIN>;
+$s = "" unless defined $s;
+sub hidden {
+  my $p = shift;
+  return $p <= 0x1F || ($p >= 0x7F && $p <= 0x9F) || $p == 0xA0 || $p == 0xAD
+    || $p == 0x34F || $p == 0x61C || ($p >= 0x115F && $p <= 0x1160)
+    || ($p >= 0x17B4 && $p <= 0x17B5) || ($p >= 0x180B && $p <= 0x180E)
+    || ($p >= 0x2000 && $p <= 0x200F) || ($p >= 0x2028 && $p <= 0x202F)
+    || ($p >= 0x205F && $p <= 0x206F) || $p == 0x3000 || $p == 0x3164
+    || ($p >= 0xFE00 && $p <= 0xFE0F) || $p == 0xFEFF || $p == 0xFFA0
+    || ($p >= 0xFFF9 && $p <= 0xFFFB) || ($p >= 0xE0000 && $p <= 0xE007F)
+    || ($p >= 0xE0100 && $p <= 0xE01EF);
+}
+sub esc { return $o . sprintf("\\u{%X}", $_[0]) . $c; }
+sub mb {
+  my $m = shift;
+  my @b = unpack("C*", $m);
+  my $p = @b == 2 ? (($b[0] & 0x1F) << 6) | ($b[1] & 0x3F)
+        : @b == 3 ? (($b[0] & 0x0F) << 12) | (($b[1] & 0x3F) << 6) | ($b[2] & 0x3F)
+        : (($b[0] & 0x07) << 18) | (($b[1] & 0x3F) << 12) | (($b[2] & 0x3F) << 6) | ($b[3] & 0x3F);
+  return hidden($p) ? esc($p) : $m;
+}
+$s =~ s/([\x20-\x5B\x5D-\x7E]+)|(\\(?=u\{|x[0-9A-Fa-f]))|(\\)|([\x00-\x1F\x7F])|([\xC2-\xDF][\x80-\xBF]|\xE0[\xA0-\xBF][\x80-\xBF]|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}|\xED[\x80-\x9F][\x80-\xBF]|\xF0[\x90-\xBF][\x80-\xBF]{2}|[\xF1-\xF3][\x80-\xBF]{3}|\xF4[\x80-\x8F][\x80-\xBF]{2})|([\x80-\xFF])/defined $1 ? $1 : defined $2 ? esc(0x5C) : defined $3 ? "\\" : defined $4 ? esc(ord $4) : defined $5 ? mb($5) : $o . sprintf("\\x%02X", ord $6) . $c/ge;
+print STDOUT $s or exit 1;
+close(STDOUT) or exit 1;
+'
+
+# esc_into <var> <text> [<escape style> [<resume style>]]: <text> as the
+# reader is shown it, into <var>. <escape style> is the stream's reverse
+# red (C_RV, E_RV or P_RV); after each escape the style resets and
+# <resume style> -- the color the value is in -- picks up again. Printable
+# ASCII with no backslash is its own escaped form and skips the process
+# (the case runs under LC_ALL=C, where [:print:] is that range).
+#
+# FAIL CLOSED: a text that cannot be rendered is never shown raw. Called
+# directly, never inside a command substitution, so the exit ends locked
+# and not a subshell.
+esc_into() {
+  local _ei_out LC_ALL=C
+  case "$2" in
+    *[![:print:]]*|*\\*) ;;
+    *) printf -v "$1" '%s' "$2"; return 0 ;;
+  esac
+  _ei_out="$(printf '%s' "$2" | /usr/bin/perl -e "$UNTRUSTED_PL" -- \
+    "${3:-}" "${3:+$'\033[0m'${4:-}}" && printf x)" || {
+    echo "locked: cannot render a path for display; its raw bytes are never shown" >&2
+    exit 1
+  }
+  printf -v "$1" '%s' "${_ei_out%x}"
+}
 
 # value_rows <indent> [<label> <role> <value>]...: the labeled rows a
 # question or gate stands on (terminal-output). A path, a name, anything
@@ -146,6 +235,7 @@ value_rows() {
       id)      st="$P_CYN" ;;
       *)       st="" ;;
     esac
+    esc_into val "$val" "$P_RV" "$st"
     printf '%s%s%s:%s%*s%s%s%s\n' "$indent" "$P_B" "$lab" "$P_OFF" \
       $(( w - ${#lab} - 1 + 2 )) '' "$st" "$val" "$P_OFF"
   done
@@ -157,9 +247,12 @@ value_rows() {
 # the colon, and a sentence about it goes on a dim line under the row,
 # starting in the value's column (terminal-output Rows).
 ok_row() {
-  printf '%s✓%s %s: %s\n' "$C_GRN" "$C_OFF" "$1" "$2"
-  if [ -n "${3:-}" ]; then
-    printf '%*s%s%s%s\n' $(( ${#1} + 4 )) '' "$C_DIM" "$3" "$C_OFF"
+  local v n=""
+  esc_into v "$2" "$C_RV"
+  [ -z "${3:-}" ] || esc_into n "$3" "$C_RV" "$C_DIM"
+  printf '%s✓%s %s: %s\n' "$C_GRN" "$C_OFF" "$1" "$v"
+  if [ -n "$n" ]; then
+    printf '%*s%s%s%s\n' $(( ${#1} + 4 )) '' "$C_DIM" "$n" "$C_OFF"
   fi
 }
 
@@ -168,8 +261,11 @@ ok_row() {
 # the two start in the same column (`→` counted as one, as Ghostty draws
 # it).
 ok_move() {
-  printf '%s✓%s %s: %s\n' "$C_GRN" "$C_OFF" "$1" "$2"
-  printf '%*s→ %s\n' $(( ${#1} + 2 )) '' "$3"
+  local a b
+  esc_into a "$2" "$C_RV"
+  esc_into b "$3" "$C_RV"
+  printf '%s✓%s %s: %s\n' "$C_GRN" "$C_OFF" "$1" "$a"
+  printf '%*s→ %s\n' $(( ${#1} + 2 )) '' "$b"
 }
 
 usage() {
@@ -527,7 +623,9 @@ check_reseal_identity() { # <path> <metafile>
     # Nobody can answer, so no rows (a refusal prints none); the refusal
     # names the node, last.
     echo "${E_RED}${E_B}!!! a node was REPLACED while unlocked !!!${E_OFF}" >&2
-    echo "refusing to re-seal it without a human at a tty (--yes does not apply): $n" >&2
+    local en
+    esc_into en "$n" "$E_RV"
+    echo "refusing to re-seal it without a human at a tty (--yes does not apply): $en" >&2
     return 1
   fi
   value_rows "" node subject "$n" id id "$prev_id → $cur_id" >&2
@@ -1865,12 +1963,13 @@ cell() {
 # <path> [dim]: one plan row on stderr. A qualifier width of 0 means the
 # plan has no qualifier column.
 plan_row() {
-  local on="" off=""
+  local on="" off="" p
   if [ -n "${7:-}" ]; then on="$E_DIM" off="$E_OFF"; fi
+  esc_into p "$6" "$E_RV" "$on"
   {
     printf '%s%s%s  ' "$on" "$1" "$(cell "$2" "$3")"
     [ "$4" -eq 0 ] || printf '%-*s  ' "$4" "$5"
-    printf '%s%s\n' "$6" "$off"
+    printf '%s%s\n' "$p" "$off"
   } >&2
 }
 
@@ -1886,7 +1985,9 @@ plan_col() {
 # its own under the row, starting in the path's column. The path ends its
 # line, so what qualifies it cannot follow it there.
 note_row() {
-  printf '%*s%s%s%s\n' "$1" '' "$E_DIM" "$2" "$E_OFF" >&2
+  local t
+  esc_into t "$2" "$E_RV" "$E_DIM"
+  printf '%*s%s%s%s\n' "$1" '' "$E_DIM" "$t" "$E_OFF" >&2
 }
 
 # release_qual <i>: the qualifier word for RELEASE_PATHS[i].
@@ -2325,7 +2426,8 @@ plan_node() {
 # its target, which is one line rather than a diff. The block owns its
 # trailing blank line, which separates it from the plan below it.
 lock_witness() { # <path> <tier>
-  local f="$1" t="$2" shown=0 live=0
+  local f="$1" t="$2" shown=0 live=0 ef
+  esc_into ef "$f" "$C_RV"
   [ "$t" = "placement" ] && return 0
   snap_paths "$f"
   # A retired record's snapshot is the content of a protection that ended;
@@ -2352,13 +2454,13 @@ lock_witness() { # <path> <tier>
         show_diff 'diff snapshot → current' path "$f" \
           diff --color=never -ruN "$SNAPDIR" "$f" || return 1
       else
-        echo "adopting into pool (no prior snapshot): $f"
+        echo "adopting into pool (no prior snapshot): $ef"
       fi
       shown=1
     fi
   elif [ "$live" -eq 1 ] && [ -f "$SNAP" ]; then
     if cmp -s "$SNAP" "$f"; then
-      echo "no changes since unlock: $f"
+      echo "no changes since unlock: $ef"
     else
       # Named by role and subject path: the snapshot sits in the pool under
       # a name that tells the reader nothing. The -ru directory case above
@@ -2370,7 +2472,7 @@ lock_witness() { # <path> <tier>
     fi
     shown=1
   else
-    echo "adopting into pool (no prior snapshot): $f"
+    echo "adopting into pool (no prior snapshot): $ef"
     shown=1
   fi
   if [ "$shown" -eq 1 ]; then
@@ -3098,7 +3200,10 @@ rekey_record() { # <oldpath> <newpath>
     fi
   done
   # The new key hangs under the old one, `→` in the gutter.
-  printf '  record re-keyed: %s\n%*s→ %s\n' "$old" 17 '' "$new"
+  local eo en
+  esc_into eo "$old" "$C_RV"
+  esc_into en "$new" "$C_RV"
+  printf '  record re-keyed: %s\n%*s→ %s\n' "$eo" 17 '' "$en"
 }
 
 # ---- subtree scan ----------------------------------------------------------
@@ -3500,7 +3605,9 @@ EOF
   # A chain that is already whole asks nothing: there is no change to
   # consent to, and a gate over an empty set trains the eye to say yes.
   if [ $((seals + protects + releases)) -eq 0 ]; then
-    echo "already locked: $f"
+    local ef
+    esc_into ef "$f" "$C_RV"
+    echo "already locked: $ef"
     log_action lock "$f" skip-already-locked
     return 0
   fi
@@ -4693,7 +4800,9 @@ do_tombstone_one() {
   fi
   state="$(meta_field "$META" state)"
   if [ "$state" = "retired" ]; then
-    echo "already retired (via $(meta_field "$META" via)): $f"
+    local ef
+    esc_into ef "$f" "$C_RV"
+    echo "already retired (via $(meta_field "$META" via)): $ef"
     return 0
   fi
   # The question holds no value: the path, where it was trashed to and the
@@ -5225,7 +5334,10 @@ case "$action" in
         [ "$idx" -gt 1 ] && echo
         case "$action" in
           status|why) ;;
-          *) printf '%s[%d/%d]%s %s\n' "$C_DIM" "$idx" "$total" "$C_OFF" "$f" ;;
+          *)
+            esc_into ef "$f" "$C_RV"
+            printf '%s[%d/%d]%s %s\n' "$C_DIM" "$idx" "$total" "$C_OFF" "$ef"
+            ;;
         esac
       fi
       rc=0
