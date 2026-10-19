@@ -433,13 +433,23 @@ gate_answer() { # <fd> <rendered gate line> <Enter continues: 0|1>
   done
 }
 
-confirm() { # <prompt>
+# asking: true when the next confirm goes ahead -- a human at a tty, or
+# --yes answering in advance. The rows a question stands on print only
+# then: a refusal prints none (terminal-output), and under --yes they are
+# the record of what was done.
+asking() { [ "$OPT_YES" -eq 1 ] || [ -t 0 ]; }
+
+confirm() { # <question> [consequence]
   # Returns 0 on yes. Fail closed: non-tty without --yes aborts.
   [ "$OPT_YES" -eq 1 ] && return 0
   if [ ! -t 0 ]; then
     echo "stdin is not a tty and --yes not given; aborting" >&2
     return 1
   fi
+  # A question is one verb and its noun; what a yes also does is a
+  # sentence on the line of its own above it (terminal-output). Printed
+  # only when the question is: under --yes nobody is asked.
+  [ -z "${2:-}" ] || echo "$2" >&2
   local line
   # Bold carries the decision (terminal-output): the whole sentence,
   # `[y/N]` included, is the authoritative register of this screen. The two
@@ -483,17 +493,25 @@ check_reseal_identity() { # <path> <metafile>
     echo "  note: identity record upgraded (dev.ino -> volume uuid)"
     return 0
   fi
-  # An alarm can fire anywhere, so it owns one leading blank line.
+  # An alarm can fire anywhere, so the block owns one leading blank line.
+  # Inside it, the question block's order (terminal-output): the advice,
+  # locked's own words; the rows; the alarm, flush; then the question.
+  # The node is a path and ends its row; the two identities are fields of
+  # a known form, so they share one row as a transition.
   echo >&2
-  # The path and the two identities each take a row of their own, directly
-  # above the question, which names the node with a noun.
+  echo "If you did not swap this node yourself, stop and investigate" >&2
+  echo "(compare against the snapshot; check: ${E_CYN}log show --predicate" >&2
+  echo "'eventMessage CONTAINS \"locked:\"' --last 1h${E_OFF})." >&2
+  if [ ! -t 0 ]; then
+    # Nobody can answer, so no rows (a refusal prints none); the refusal
+    # names the node, last.
+    echo "${E_RED}${E_B}!!! a node was REPLACED while unlocked !!!${E_OFF}" >&2
+    echo "refusing to re-seal it without a human at a tty (--yes does not apply): $n" >&2
+    return 1
+  fi
+  value_rows "" node subject "$n" id id "$prev_id → $cur_id" >&2
   echo "${E_RED}${E_B}!!! a node was REPLACED while unlocked !!!${E_OFF}" >&2
-  echo "    If you did not swap this node yourself, STOP and investigate" >&2
-  echo "    (compare against the snapshot; check: ${E_CYN}log show --predicate" >&2
-  echo "    'eventMessage CONTAINS \"locked:\"' --last 1h${E_OFF})." >&2
-  value_rows "    " node subject "$n" "recorded id" id "$prev_id" \
-    "current id" id "$cur_id" >&2
-  confirm_hard "Re-seal the replaced node anyway?"
+  confirm_hard "re-seal the replaced node anyway?"
 }
 
 # ---- shared helpers --------------------------------------------------------
@@ -2353,7 +2371,7 @@ seal_placement() {
     # one live question left in an applying seal, because it reports an
     # anomaly the plan could not have shown as routine.
     check_reseal_identity "$d" "$META" || {
-      echo "${E_YEL}aborted: $d${E_OFF}" >&2; return 2
+      echo "${E_YEL}aborted; node not re-sealed${E_OFF}" >&2; return 2
     }
     fset uappnd "$d" || return 1
     if [ "$OPT_DRY" -eq 0 ]; then
@@ -2443,7 +2461,7 @@ seal_anchor() {
   # file's inode.) This is the one live question left in an applying seal.
   if [ "$live" -eq 1 ] && [ "$is_file" -eq 0 ]; then
     check_reseal_identity "$f" "$META" || {
-      echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
+      echo "${E_YEL}aborted; node not re-sealed${E_OFF}" >&2; return 2
     }
   fi
 
@@ -3428,20 +3446,21 @@ EOF
     return 0
   fi
 
-  # The question holds no value: the path stands on the row above it.
+  # The question holds no value and is one verb and its noun: the path
+  # stands on the row above it, and the counts are the consequence line.
   local q
   if [ "$seals" -gt 0 ]; then
-    q="Seal this path as listed ($(change_counts seal "$seals" protect "$protects" release "$releases"))?"
+    q="seal this path as listed?"
   else
-    q="Apply the plan for this path ($(change_counts protect "$protects" release "$releases"))?"
+    q="apply the plan for this path?"
   fi
-  value_rows "" path subject "$f" >&2
-  confirm "$q" || {
+  asking && value_rows "" path subject "$f" >&2
+  confirm "$q" "$(change_sentence "$seals" "$protects" "$releases")" || {
     # The decline is the decision this run made, so it goes in the log
     # beside the seals that were taken -- and it is the whole record of
     # the run, since not one node was touched.
     log_action lock "$f" abort
-    echo "${E_YEL}aborted: $f${E_OFF}" >&2
+    echo "${E_YEL}aborted; nothing changed${E_OFF}" >&2
     return 2
   }
 
@@ -3490,18 +3509,33 @@ EOF
   done
 }
 
-# change_counts <kind> <n>...: "2 seals, 1 release" -- the kinds with a
-# nonzero count, in the order given, so a gate names what it is asking.
-change_counts() {
-  local out="" kind cnt
-  while [ $# -ge 2 ]; do
-    kind="$1" cnt="$2"
-    shift 2
-    [ "$cnt" -gt 0 ] || continue
-    [ "$cnt" -eq 1 ] || kind="${kind}s"
-    if [ -z "$out" ]; then out="$cnt $kind"; else out="$out, $cnt $kind"; fi
+# change_sentence <seals> <protects> <releases>: what a yes to the plan
+# does, as the consequence line above its question -- "This seals 2 nodes
+# and releases 1 directory." Only the kinds with a nonzero count, in that
+# order.
+change_sentence() {
+  local parts=() out="" i n
+  [ "$1" -eq 0 ] || parts+=("seals $1 $(plural "$1" node nodes)")
+  [ "$2" -eq 0 ] || parts+=("protects $2 $(plural "$2" node nodes) by name")
+  [ "$3" -eq 0 ] || parts+=("releases $3 $(plural "$3" directory directories)")
+  n="${#parts[@]}"
+  [ "$n" -gt 0 ] || return 0
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    if [ "$i" -eq 0 ]; then
+      out="${parts[$i]}"
+    elif [ "$i" -eq $((n - 1)) ]; then
+      out="$out and ${parts[$i]}"
+    else
+      out="$out, ${parts[$i]}"
+    fi
+    i=$((i + 1))
   done
-  printf '%s' "$out"
+  printf 'This %s.' "$out"
+}
+
+plural() { # <n> <one> <many>
+  if [ "$1" -eq 1 ]; then printf '%s' "$2"; else printf '%s' "$3"; fi
 }
 
 do_unlock_one() {
@@ -3605,17 +3639,16 @@ do_unprotect_one() {
     return 0
   fi
 
-  # The question holds no value: the path stands on the row above it.
-  local q="Stop protecting this path?" nr="${#RELEASE_PATHS[@]}"
-  if [ "$nr" -eq 1 ]; then
-    q="Stop protecting this path and release 1 directory?"
-  elif [ "$nr" -gt 1 ]; then
-    q="Stop protecting this path and release $nr directories?"
+  # The question holds no value and is one verb and its noun: the path
+  # stands on the row above it, the releases are the consequence line.
+  local c="" nr="${#RELEASE_PATHS[@]}"
+  if [ "$nr" -gt 0 ]; then
+    c="This also releases $nr $(plural "$nr" directory directories)."
   fi
-  value_rows "" path subject "$f" >&2
-  confirm "$q" || {
+  asking && value_rows "" path subject "$f" >&2
+  confirm "stop protecting this path?" "$c" || {
     log_action unprotect "$f" abort
-    echo "${E_YEL}aborted: $f${E_OFF}" >&2
+    echo "${E_YEL}aborted; protection unchanged${E_OFF}" >&2
     return 2
   }
 
@@ -4021,19 +4054,25 @@ do_edit_one() {
   fi
   echo
   # The question holds no value: the file, and for a new one its sealed
-  # folder, stand on the rows above it.
-  local ask
-  ask="Install and reseal this file?"
-  [ "$is_new" -eq 1 ] && ask="Create and seal this file in this folder?"
-  [ "$empty" -eq 1 ] && ask="Create and seal this empty file in this folder?"
-  [ "$unchanged" -eq 1 ] && ask="Accept what this file holds now, install it again and clear the mismatch?"
-  if [ "$is_new" -eq 1 ]; then
-    value_rows "" path subject "$f" folder id "$folder" >&2
-  else
-    value_rows "" path subject "$f" >&2
+  # folder, stand on the rows above it, labeled by the nouns the question
+  # names them with. What a yes also does is the consequence line.
+  local ask c=""
+  ask="install and reseal this file?"
+  [ "$is_new" -eq 1 ] && ask="create and seal this file in this folder?"
+  [ "$empty" -eq 1 ] && ask="create and seal this empty file in this folder?"
+  if [ "$unchanged" -eq 1 ]; then
+    ask="accept what this file holds now?"
+    c="This installs it again and clears the mismatch."
   fi
-  confirm "$ask" installs || {
-    echo "${E_YEL}aborted; $f unchanged${E_OFF}" >&2
+  if asking; then
+    if [ "$is_new" -eq 1 ]; then
+      value_rows "" file subject "$f" folder id "$folder" >&2
+    else
+      value_rows "" file subject "$f" >&2
+    fi
+  fi
+  confirm "$ask" "$c" || {
+    echo "${E_YEL}aborted; file unchanged${E_OFF}" >&2
     rm -f -- "$stage"
     return 2
   }
@@ -4210,14 +4249,12 @@ do_rm_one() {
     fi
   fi
 
+  # The kind of node is the question's noun and its row's label.
   local what="file"
   if [ -L "$f" ]; then
     what="symlink"
   elif [ -d "$f" ]; then
-    what="empty directory"
-    if [ "$OPT_RECURSIVE" -eq 1 ]; then
-      what="directory and everything under it"
-    fi
+    what="directory"
   fi
   # Removing a protected file can leave chain directories nothing needs any
   # more. They are released under this same question, after the removal
@@ -4246,22 +4283,22 @@ do_rm_one() {
     RELEASE_PATHS=(${keep_p[@]+"${keep_p[@]}"})
     RELEASE_REASONS=(${keep_r[@]+"${keep_r[@]}"})
   fi
-  # The question holds no value: the path stands on the row above it, and
-  # the question names it by what it is.
-  local q="Permanently remove this $what?" nr="${#RELEASE_PATHS[@]}"
+  # The question holds no value and is one verb and its noun: the path
+  # stands on the row above it, labeled with the kind of node the question
+  # names, and what a yes also does is the consequence line.
+  local c="This removes it permanently" nr="${#RELEASE_PATHS[@]}"
+  if [ "$what" = "directory" ] && [ "$OPT_RECURSIVE" -eq 1 ]; then
+    c="This removes it and everything under it permanently"
+  fi
   if [ "$nr" -gt 0 ]; then
     echo "${E_B}removing it also releases:${E_OFF}" >&2
     release_rows "  " 7
     echo >&2
-    if [ "$nr" -eq 1 ]; then
-      q="Permanently remove this $what, and release 1 directory?"
-    else
-      q="Permanently remove this $what, and release $nr directories?"
-    fi
+    c="$c, and releases $nr $(plural "$nr" directory directories)"
   fi
-  value_rows "" path subject "$f" >&2
-  confirm "$q" || {
-    echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
+  asking && value_rows "" "$what" subject "$f" >&2
+  confirm "remove this $what?" "$c." || {
+    echo "${E_YEL}aborted; $what unchanged${E_OFF}" >&2; return 2
   }
 
   local parent args=()
@@ -4549,7 +4586,7 @@ do_tombstone_one() {
   fi
   state="$(meta_field "$META" state)"
   if [ "$state" = "retired" ]; then
-    echo "already retired: $f (via $(meta_field "$META" via))"
+    echo "already retired (via $(meta_field "$META" via)): $f"
     return 0
   fi
   # The question holds no value: the path, where it was trashed to and the
@@ -4560,14 +4597,16 @@ do_tombstone_one() {
     echo "${C_YEL}note:${C_OFF} this path is suspended (in the trash). Tombstoning asserts"
     echo "      it is gone for good, so verify stops watching for a Put Back."
   fi
-  if [ -n "$bin" ]; then
+  if ! asking; then
+    :
+  elif [ -n "$bin" ]; then
     value_rows "" path subject "$f" "trashed to" id "$bin" \
       "asserted by" plain "$inv" >&2
   else
     value_rows "" path subject "$f" "asserted by" plain "$inv" >&2
   fi
-  confirm "Record this path as gone (retired)?" || {
-    echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
+  confirm "record this path as gone?" "This retires its record." || {
+    echo "${E_YEL}aborted; record unchanged${E_OFF}" >&2; return 2
   }
   retire_record "$f" assertion || return 1
   echo "${C_GRN}✓${C_OFF} tombstoned: $f"

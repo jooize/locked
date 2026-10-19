@@ -101,10 +101,11 @@ You name what to protect; `locked lock <leaf>` derives and provisions the
    one line per node, root-most first, the ones that need nothing shown as
    `already locked`, and any directory the pool no longer needs as a
    `release` row with its reason on the line below it -- and then one
-   `[y/N]` for the lot, directly under a `path:` row naming the leaf. The
-   question holds no value and names what it covers (`Seal this path as
-   listed (2 seals, 1 release)?`, or `Apply the plan for this path (1
-   release)?` when the leaf's chain is already whole). Declining changes nothing at all. `--yes`
+   `[y/N]` for the lot, under a `path:` row naming the leaf and a line
+   saying what a yes does (`This seals 2 nodes and releases 1
+   directory.`). The question holds no value and is one verb and its noun
+   (`seal this path as listed?`, or `apply the plan for this path?` when
+   the leaf's chain is already whole). Declining changes nothing at all. `--yes`
    answers that gate, `--dry-run` prints the plan and stops before it. Each
    seal used to ask for itself, which meant declining an ancestor left the
    leaf sealed under a parent nobody had protected. The only question left
@@ -184,8 +185,8 @@ live record with no role, or a live leaf whose chain cannot be derived
 edit window and keeps the record, the snapshot and the chain; `unprotect`
 ends the protection -- flag off, the pre-lock identity back, the record
 retired with `via=unprotect` -- and releases the chain nodes nothing else
-needs, under one question (`Stop protecting this path and release 2
-directories?`, under a `path:` row naming the leaf). Protecting that path again later is a first seal: a retired
+needs, under one question (`stop protecting this path?`, under a `path:`
+row naming the leaf and the line `This also releases 2 directories.`). Protecting that path again later is a first seal: a retired
 record is history, so the identity comes from the live node and the
 snapshot is taken fresh.
 

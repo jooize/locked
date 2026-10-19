@@ -742,21 +742,22 @@ check "an empty new file is created"           "0" "$EMRC"
 ok   "the block says the new file is empty"    grep -qF "(new file, empty)" "$EMO"
 # --yes answers without printing the question, so its wording is asserted
 # on the code.
-ok   "the question names it as empty"          grep -qF 'Create and seal this empty file' "$LOCKED"
-ok   "the block names the new file on its own row" grep -qxF "path:  $CD/nested/empty.txt" "$EMO"
-ok   "and the question's rows name it and its folder" grep -qxF "folder:  $CD" "$EMO"
+ok   "the question names it as empty"          grep -qF 'create and seal this empty file' "$LOCKED"
+ok   "the rows name the new file by the question's noun" grep -qxF "file:    $CD/nested/empty.txt" "$EMO"
+ok   "and its folder"                          grep -qxF "folder:  $CD" "$EMO"
 
 # Every question holds no value: a path, a name or an identity stands on a
 # labeled row above it, and the question names it with a noun. Asserted on
 # the code, since --yes prints no question: each literal question, with the
-# counts and the kind of node (program-chosen words) taken out, holds no $.
+# kind of node (program-chosen words) taken out, holds no $. Questions are
+# lowercase, so a capitalized literal is a sentence (a consequence line).
 QLIT="$SCRATCH/questions.txt"
-grep -E '(^|[[:space:]])(q|ask)="[A-Z]|confirm(_hard)? "[A-Z]' "$LOCKED" \
-  | sed -E -e 's/\$\(change_counts[^)]*\)//g' \
+grep -E '(^|[[:space:]])(q|ask)="[a-z]|confirm(_hard)? "[a-z]' "$LOCKED" \
   | grep -oE '(q|ask)="[^"]*"|confirm(_hard)? "[^"]*"' \
-  | sed -E 's/\$(nr|what)([^A-Za-z_]|$)/\2/g' >"$QLIT" || true
-check "all 14 questions are found"             "14" "$(grep -c . "$QLIT" | tr -d ' ')"
+  | sed -E 's/\$what([^A-Za-z_]|$)/\1/g' >"$QLIT" || true
+check "all 10 questions are found"             "10" "$(grep -c . "$QLIT" | tr -d ' ')"
 deny "no question holds a value"               grep -q '\$' "$QLIT"
+deny "no question is capitalized"              grep -qE '(q|ask)="[A-Z]|confirm(_hard)? "[A-Z]' "$LOCKED"
 check "the empty file has no content"          "0" "$(stat -f '%z' "$CD/nested/empty.txt")"
 check "the empty file is frozen"               "uchg" "$(flags_of "$CD/nested/empty.txt")"
 refuse "a new file outside a sealed folder is refused" "not in pool" \
@@ -1187,12 +1188,12 @@ expect {
   eof     { exit 1 }
   "plan (tier "
 }
-# The path row stands directly above the question, and the question line
-# holds no path: exit 3 if a / shows before its counts.
+# The path row, then the consequence line with the counts, then the
+# question, and the question line holds no path: exit 3 if a / shows on it.
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
-  -re {path:[^\n]*\n([^\n]*)\(2 seals\)}
+  -re {path:[^\n]*\n[^\n]*This seals 2 nodes\.[^\n]*\n([^\n]*)as listed\?}
 }
 if {[string first "/" \$expect_out(1,string)] >= 0} { exit 3 }
 expect {
@@ -1226,7 +1227,7 @@ spawn env LOCKED_STATE_ROOT=$(state_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
-  "(1 seal)"
+  "This seals 1 node."
 }
 send "n\r"
 expect {
@@ -1776,7 +1777,7 @@ check "state is retired"                       "retired" "$(meta_get "$TSF" stat
 check "provenance is the assertion"            "assertion" "$(meta_get "$TSF" via)"
 check "asserted by the invoker"                "$INV" "$(meta_get "$TSF" by)"
 locked tombstone --yes "$TSF" >"$OUTF" 2>&1 || true
-ok   "tombstone is idempotent"                 grep -qF "already retired: $TSF" "$OUTF"
+ok   "tombstone is idempotent"                 grep -qF "already retired (via assertion): $TSF" "$OUTF"
 check "still retired via assertion"            "assertion" "$(meta_get "$TSF" via)"
 
 note "helper exit codes: stand-in helpers"
@@ -2287,7 +2288,7 @@ PLANRC=0
 locked_notty lock "$PLANF" >"$OUTF" 2>&1 || PLANRC=$?
 check "an unanswerable gate declines"          "2" "$PLANRC"
 ok   "the plan is printed before the gate"     grep -qxF "plan (tier content):" "$OUTF"
-ok   "the path the gate is about has its own row" grep -qxF "path:  $PLANF" "$OUTF"
+deny "a refusal prints no row for the path"  grep -qxF "path:  $PLANF" "$OUTF"
 ok   "the plan lists the leaf"                 grep -q "seal content  *$PLANF" "$OUTF"
 ok   "the plan lists the grandparent"          grep -q "seal placement  *$PLAND$" "$OUTF"
 deny "and never the leaf parent"               grep -q "seal placement  *$PLAND/inner$" "$OUTF"
@@ -2516,7 +2517,7 @@ ok   "the gate lists what goes with it"        grep -qF "removing it also releas
 ok   "by name"                                 grep -q "release  *$RMD\$" "$LPOUT"
 check "and reason, on the row below"           "(no protected file needs it)" \
       "$(grep -A1 "release  *$RMD\$" "$LPOUT" | tail -n1 | sed 's/^ *//')"
-ok   "the path it removes has its own row"     grep -qxF "path:  $RMF" "$LPOUT"
+ok   "the file it removes has its own row"     grep -qxF "file:  $RMF" "$LPOUT"
 deny "the file is gone"                        test -e "$RMF"
 check "its record retired via rm"              "rm" "$(meta_get "$RMF" via)"
 ok   "the chain dir was released after it"     grep -qF "✓ released: $RMD (back to $INV:staff 777)" "$LPOUT"
