@@ -1978,10 +1978,13 @@ diff_filter() { /usr/bin/perl -e "$DIFF_FILTER" "$1"; }
 # prints inline; long output on a tty is announced by a gate and
 # paged (less -RF; an early pager quit is not an error), plain cat off-tty.
 # The header starts FLUSH -- the caller owns any blank line before this
-# block -- and the block ends with the diff's own final newline.
-show_diff() { # <label> <path> <diff-cmd>...
-  local label="$1" path="$2" raw enc rc=0 lines dcolor
-  shift 2
+# block. A diff that was shown ends with a closing rule: the diff is the
+# candidate's bytes, and a soft-wrapped line of it restarts at column 0,
+# where it could pose as one of the rows or the question below
+# (terminal-output, third-party text has no position).
+show_diff() { # <rule> <row label> <path> <diff-cmd>...
+  local label="$1" rowlabel="$2" path="$3" raw enc rc=0 lines dcolor shown=0
+  shift 3
   raw="$(mktemp "${TMPDIR:-/tmp}/locked-diff.XXXXXX")" || return 1
   enc="$(mktemp "${TMPDIR:-/tmp}/locked-diff.XXXXXX")" || { rm -f -- "$raw"; return 1; }
   "$@" >"$raw" 2>&1 || rc=$?
@@ -1994,7 +1997,7 @@ show_diff() { # <label> <path> <diff-cmd>...
     rm -f -- "$raw" "$enc"
     return 1
   fi
-  diff_header "$label" "$path"
+  diff_header "$label" "$rowlabel" "$path"
   if [ "$rc" -eq 0 ]; then
     echo "(no changes)"
     rm -f -- "$raw" "$enc"
@@ -2024,22 +2027,29 @@ show_diff() { # <label> <path> <diff-cmd>...
       "$P_DIM" "$P_OFF" "$P_BLU" "$P_OFF" "$P_DIM" "$P_OFF"
     if gate_answer 1 "$gate" 1; then
       /usr/bin/less -RF -- "$enc" || true
+      shown=1
     fi
   else
     cat -- "$enc"
+    shown=1
   fi
   rm -f -- "$enc"
+  if [ "$shown" -eq 1 ]; then
+    printf -- '%s--- end of diff ---%s\n' "$P_B" "$P_OFF"
+  fi
   return 0
 }
 
-# diff_header <label> <path>: the section rule over a diff witness, then
-# the path it is about on a row of its own -- a path ends its line, so it
-# never sits inside the rule -- directly above the diff or the gate that
-# offers it.
+# diff_header <rule> [<row label> <path>]: the section rule over a diff
+# witness, holding locked's own words only, then the path it is about on a
+# row of its own -- a path ends its line, so it never sits inside the rule
+# -- directly above the diff or the gate that offers it. Without a row
+# label the rule stands alone: the caller's question rows, right below it,
+# name the path, and a row already on screen is not printed again.
 diff_header() {
   set_pal
   printf -- '%s--- %s ---%s\n' "$P_B" "$1" "$P_OFF"
-  value_rows "" path subject "$2"
+  [ -z "${2:-}" ] || value_rows "" "$2" subject "$3"
 }
 
 # ---- planning --------------------------------------------------------------
@@ -2250,7 +2260,7 @@ lock_witness() { # <path> <tier>
       if [ "$live" -eq 1 ] && [ -d "$SNAPDIR" ]; then
         # -N: a file added while unlocked shows its whole content, not
         # only its name, so what the seal is about to freeze is on screen.
-        show_diff 'diff snapshot -> current' "$f" \
+        show_diff 'diff snapshot → current' path "$f" \
           diff --color=never -ruN "$SNAPDIR" "$f" || return 1
       else
         echo "adopting into pool (no prior snapshot): $f"
@@ -2265,7 +2275,7 @@ lock_witness() { # <path> <tier>
       # a name that tells the reader nothing. The -ru directory case above
       # keeps diff's own headers -- it names one pair per file, and a
       # single --label pair would mislabel every one of them.
-      show_diff 'diff snapshot -> current' "$f" \
+      show_diff 'diff snapshot → current' path "$f" \
         diff --color=never -u --label "snapshot: $f" --label "current: $f" \
         "$SNAP" "$f" || return 1
     fi
@@ -3949,7 +3959,7 @@ do_edit_one() {
     # anything running as the invoker can swap it at any moment; taking it
     # out of reach before a single byte is displayed is what makes the
     # diff a promise instead of a snapshot of one past moment.
-    label='diff current -> proposed'
+    label='diff current → proposed'
     lhs="current: $f" rhs="proposed: $OPT_FROM"
     [ "$is_new" -eq 1 ] && lhs="new file: $f"
     stage="$(stage_new)" || return 1
@@ -3964,7 +3974,7 @@ do_edit_one() {
       return 1
     }
   else
-    label='diff current -> edited'
+    label='diff current → edited'
     lhs="current: $f" rhs="edited: $f"
     [ "$is_new" -eq 1 ] && lhs="new file: $f"
     # User-owned working copy in a private temp dir; empty for a new file.
@@ -4041,14 +4051,17 @@ do_edit_one() {
   # does the question: an empty file is approved knowingly, never unseen.
   local empty=0
   [ "$is_new" -eq 1 ] && [ ! -s "$stage" ] && empty=1
+  # With no diff to show, the rule stands over a note of locked's own and
+  # the question's file: row comes right after it; a shown diff gets a
+  # file: row of its own, as the question's rows are a diff away from it.
   if [ "$empty" -eq 1 ]; then
-    diff_header "$label" "$f"
+    diff_header "$label"
     echo "(new file, empty)"
   elif [ "$unchanged" -eq 1 ]; then
-    diff_header "$label" "$f"
+    diff_header "$label"
     echo "(no change; a mismatch is recorded for this file, see: sudo locked verify)"
   else
-    show_diff "$label" "$f" \
+    show_diff "$label" file "$f" \
       diff --color=never -u --label "$lhs" --label "$rhs" "$old" "$stage" \
       || { rm -f -- "$stage"; return 1; }
   fi
