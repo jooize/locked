@@ -117,12 +117,39 @@ set_pal() {
 }
 set_pal   # initialize for set -u; callers on a redirected fd re-run it
 
-# The bold-magenta subject of a decision screen -- what the y/N is about
-# (the diff filter paints file headers the same, see paint). Emits a
-# re-bold after its own reset so it can sit inside the bold prompt
-# sentence without turning the tail plain. Stderr palette: prompts live
-# there.
-subj() { printf '%s%s%s%s' "$E_B$E_MAG" "$1" "$E_OFF" "$E_B"; }
+# value_rows <indent> [<label> <role> <value>]...: the labeled rows a
+# question or gate stands on (terminal-output). A path, a name, anything
+# whose length locked does not choose, ends its line, and a question holds
+# no such value: each one gets a row here, directly above the question,
+# which names it with a noun ("this path"). The rows repeat what scrolled
+# away. One gutter for the block, the longest label plus two spaces; the
+# label bold, the padding outside it. <role> styles the value: subject
+# (bold magenta, the one thing the y/N is about -- the diff filter paints
+# file headers the same, see paint), id (cyan: a path or an identity),
+# plain. Prints on stdout with set_pal, so a caller sends it to stderr
+# with >&2 beside the prompt and keeps its colour.
+value_rows() {
+  local indent="$1" w=0 i lab role val st
+  set_pal
+  shift
+  i=1
+  while [ "$i" -le "$#" ]; do
+    lab="${!i}"
+    if [ $(( ${#lab} + 1 )) -gt "$w" ]; then w=$(( ${#lab} + 1 )); fi
+    i=$((i + 3))
+  done
+  while [ "$#" -ge 3 ]; do
+    lab="$1" role="$2" val="$3"
+    shift 3
+    case "$role" in
+      subject) st="$P_B$P_MAG" ;;
+      id)      st="$P_CYN" ;;
+      *)       st="" ;;
+    esac
+    printf '%s%s%s:%s%*s%s%s%s\n' "$indent" "$P_B" "$lab" "$P_OFF" \
+      $(( w - ${#lab} - 1 + 2 )) '' "$st" "$val" "$P_OFF"
+  done
+}
 
 usage() {
   cat <<EOF
@@ -458,12 +485,15 @@ check_reseal_identity() { # <path> <metafile>
   fi
   # An alarm can fire anywhere, so it owns one leading blank line.
   echo >&2
-  echo "${E_RED}${E_B}!!! $n was REPLACED while unlocked !!!${E_OFF}" >&2
-  echo "    identity $prev_id -> $cur_id" >&2
+  # The path and the two identities each take a row of their own, directly
+  # above the question, which names the node with a noun.
+  echo "${E_RED}${E_B}!!! a node was REPLACED while unlocked !!!${E_OFF}" >&2
   echo "    If you did not swap this node yourself, STOP and investigate" >&2
   echo "    (compare against the snapshot; check: ${E_CYN}log show --predicate" >&2
   echo "    'eventMessage CONTAINS \"locked:\"' --last 1h${E_OFF})." >&2
-  confirm_hard "Re-seal the replaced node $(subj "$n") anyway?"
+  value_rows "    " node subject "$n" "recorded id" id "$prev_id" \
+    "current id" id "$cur_id" >&2
+  confirm_hard "Re-seal the replaced node anyway?"
 }
 
 # ---- shared helpers --------------------------------------------------------
@@ -1771,10 +1801,17 @@ release_rows() { # <indent> <width>
   local ind="$1" w="$2" i
   i=$((${#RELEASE_PATHS[@]} - 1))
   while [ "$i" -ge 0 ]; do
-    printf '%s%-*s  %s %s(%s)%s\n' "$ind" "$w" release "${RELEASE_PATHS[$i]}" \
-      "$E_DIM" "${RELEASE_REASONS[$i]}" "$E_OFF" >&2
+    printf '%s%-*s  %s\n' "$ind" "$w" release "${RELEASE_PATHS[$i]}" >&2
+    note_row "$ind" "$w" "${RELEASE_REASONS[$i]}"
     i=$((i - 1))
   done
+}
+
+# note_row <indent> <width> <text>: a plan row's qualifier, dim and in
+# parentheses, on a line of its own under the row's path. The path ends its
+# line, so what qualifies it cannot follow it there.
+note_row() {
+  printf '%s%*s  %s(%s)%s\n' "$1" "$2" '' "$E_DIM" "$3" "$E_OFF" >&2
 }
 
 # apply_releases: run the planned releases, deepest first.
@@ -1939,8 +1976,7 @@ show_diff() { # <label> <path> <diff-cmd>...
     rm -f -- "$raw" "$enc"
     return 1
   fi
-  set_pal
-  printf -- '%s--- %s: %s ---%s\n' "$P_B" "$label" "$path" "$P_OFF"
+  diff_header "$label" "$path"
   if [ "$rc" -eq 0 ]; then
     echo "(no changes)"
     rm -f -- "$raw" "$enc"
@@ -1976,6 +2012,16 @@ show_diff() { # <label> <path> <diff-cmd>...
   fi
   rm -f -- "$enc"
   return 0
+}
+
+# diff_header <label> <path>: the section rule over a diff witness, then
+# the path it is about on a row of its own -- a path ends its line, so it
+# never sits inside the rule -- directly above the diff or the gate that
+# offers it.
+diff_header() {
+  set_pal
+  printf -- '%s--- %s ---%s\n' "$P_B" "$1" "$P_OFF"
+  value_rows "" path subject "$2"
 }
 
 # ---- planning --------------------------------------------------------------
@@ -2173,11 +2219,13 @@ lock_witness() { # <path> <tier>
     # not a refusal -- the target may still arrive -- but it is the one
     # thing about this seal a reader cannot see from the link text, so the
     # witness says it and the gate below answers for it.
+    # The link text is a value of its own, so it ends a row of its own.
     if [ ! -e "$f" ]; then
-      echo "symlink -> $(readlink "$f") (target missing; the link node is sealed, not its target)"
+      echo "symlink, target missing (the link node is sealed, not its target)"
     else
-      echo "symlink -> $(readlink "$f") (the link node is sealed, not its target)"
+      echo "symlink (the link node is sealed, not its target)"
     fi
+    value_rows "" target id "$(readlink "$f")"
     shown=1
   elif [ -d "$f" ]; then
     if [ "$t" = "content" ]; then
@@ -3353,7 +3401,7 @@ EOF
   # not offer. Releases follow the chain in the same column, each with the
   # reason a reader needs: a directory leaving the pool is the one row that
   # is not self-explanatory.
-  echo "${E_B}plan for $f (tier $leaf_tier):${E_OFF}" >&2
+  echo "${E_B}plan (tier $leaf_tier):${E_OFF}" >&2
   i=$((n - 1))
   while [ "$i" -ge 0 ]; do
     case "${plan_actions[$i]}" in
@@ -3362,8 +3410,8 @@ EOF
           "${plan_paths[$i]}" "$E_OFF" >&2
         ;;
       protect)
-        printf '  %-*s  %s %s(already sealed; now protected by name)%s\n' "$w" \
-          protect "${plan_paths[$i]}" "$E_DIM" "$E_OFF" >&2
+        printf '  %-*s  %s\n' "$w" protect "${plan_paths[$i]}" >&2
+        note_row "  " "$w" "already sealed; now protected by name"
         ;;
       *)
         printf '  %-*s  %s\n' "$w" "${plan_actions[$i]}" "${plan_paths[$i]}" >&2
@@ -3380,12 +3428,14 @@ EOF
     return 0
   fi
 
+  # The question holds no value: the path stands on the row above it.
   local q
   if [ "$seals" -gt 0 ]; then
-    q="Seal $(subj "$f") as listed ($(change_counts seal "$seals" protect "$protects" release "$releases"))?"
+    q="Seal this path as listed ($(change_counts seal "$seals" protect "$protects" release "$releases"))?"
   else
-    q="Apply the plan for $(subj "$f") ($(change_counts protect "$protects" release "$releases"))?"
+    q="Apply the plan for this path ($(change_counts protect "$protects" release "$releases"))?"
   fi
+  value_rows "" path subject "$f" >&2
   confirm "$q" || {
     # The decline is the decision this run made, so it goes in the log
     # beside the seals that were taken -- and it is the whole record of
@@ -3543,8 +3593,9 @@ do_unprotect_one() {
   esac
 
   local w=9
-  echo "${E_B}plan for $f:${E_OFF}" >&2
-  printf '  %-*s  %s %s(%s)%s\n' "$w" unprotect "$f" "$E_DIM" "$back" "$E_OFF" >&2
+  echo "${E_B}plan:${E_OFF}" >&2
+  printf '  %-*s  %s\n' "$w" unprotect "$f" >&2
+  note_row "  " "$w" "$back"
   release_rows "  " "$w"
   echo >&2
 
@@ -3554,12 +3605,14 @@ do_unprotect_one() {
     return 0
   fi
 
-  local q="Stop protecting $(subj "$f")?" nr="${#RELEASE_PATHS[@]}"
+  # The question holds no value: the path stands on the row above it.
+  local q="Stop protecting this path?" nr="${#RELEASE_PATHS[@]}"
   if [ "$nr" -eq 1 ]; then
-    q="Stop protecting $(subj "$f") and release 1 directory?"
+    q="Stop protecting this path and release 1 directory?"
   elif [ "$nr" -gt 1 ]; then
-    q="Stop protecting $(subj "$f") and release $nr directories?"
+    q="Stop protecting this path and release $nr directories?"
   fi
+  value_rows "" path subject "$f" >&2
   confirm "$q" || {
     log_action unprotect "$f" abort
     echo "${E_YEL}aborted: $f${E_OFF}" >&2
@@ -3956,12 +4009,10 @@ do_edit_one() {
   local empty=0
   [ "$is_new" -eq 1 ] && [ ! -s "$stage" ] && empty=1
   if [ "$empty" -eq 1 ]; then
-    set_pal
-    printf -- '%s--- %s: %s ---%s\n' "$P_B" "$label" "$f" "$P_OFF"
+    diff_header "$label" "$f"
     echo "(new file, empty)"
   elif [ "$unchanged" -eq 1 ]; then
-    set_pal
-    printf -- '%s--- %s: %s ---%s\n' "$P_B" "$label" "$f" "$P_OFF"
+    diff_header "$label" "$f"
     echo "(no change; a mismatch is recorded for this file, see: sudo locked verify)"
   else
     show_diff "$label" "$f" \
@@ -3969,11 +4020,18 @@ do_edit_one() {
       || { rm -f -- "$stage"; return 1; }
   fi
   echo
+  # The question holds no value: the file, and for a new one its sealed
+  # folder, stand on the rows above it.
   local ask
-  ask="Install and reseal $(subj "$f")?"
-  [ "$is_new" -eq 1 ] && ask="Create and seal $(subj "$f") in $(subj "$folder")?"
-  [ "$empty" -eq 1 ] && ask="Create and seal the empty file $(subj "$f") in $(subj "$folder")?"
-  [ "$unchanged" -eq 1 ] && ask="Accept what $(subj "$f") holds now, install it again and clear the mismatch?"
+  ask="Install and reseal this file?"
+  [ "$is_new" -eq 1 ] && ask="Create and seal this file in this folder?"
+  [ "$empty" -eq 1 ] && ask="Create and seal this empty file in this folder?"
+  [ "$unchanged" -eq 1 ] && ask="Accept what this file holds now, install it again and clear the mismatch?"
+  if [ "$is_new" -eq 1 ]; then
+    value_rows "" path subject "$f" folder id "$folder" >&2
+  else
+    value_rows "" path subject "$f" >&2
+  fi
   confirm "$ask" installs || {
     echo "${E_YEL}aborted; $f unchanged${E_OFF}" >&2
     rm -f -- "$stage"
@@ -4188,17 +4246,20 @@ do_rm_one() {
     RELEASE_PATHS=(${keep_p[@]+"${keep_p[@]}"})
     RELEASE_REASONS=(${keep_r[@]+"${keep_r[@]}"})
   fi
-  local q="Permanently remove $(subj "$f") ($what)?" nr="${#RELEASE_PATHS[@]}"
+  # The question holds no value: the path stands on the row above it, and
+  # the question names it by what it is.
+  local q="Permanently remove this $what?" nr="${#RELEASE_PATHS[@]}"
   if [ "$nr" -gt 0 ]; then
     echo "${E_B}removing it also releases:${E_OFF}" >&2
     release_rows "  " 7
     echo >&2
     if [ "$nr" -eq 1 ]; then
-      q="Permanently remove $(subj "$f") ($what) and release 1 directory?"
+      q="Permanently remove this $what, and release 1 directory?"
     else
-      q="Permanently remove $(subj "$f") ($what) and release $nr directories?"
+      q="Permanently remove this $what, and release $nr directories?"
     fi
   fi
+  value_rows "" path subject "$f" >&2
   confirm "$q" || {
     echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
   }
@@ -4491,12 +4552,21 @@ do_tombstone_one() {
     echo "already retired: $f (via $(meta_field "$META" via))"
     return 0
   fi
+  # The question holds no value: the path, where it was trashed to and the
+  # name the assertion is recorded under stand on the rows above it.
+  local bin=""
   if [ "$state" = "suspended" ]; then
-    echo "${C_YEL}note:${C_OFF} $f is suspended, trashed to $(meta_field "$META" bin)."
-    echo "      Tombstoning asserts it is gone for good, so verify stops"
-    echo "      watching for a Put Back."
+    bin="$(meta_field "$META" bin)"
+    echo "${C_YEL}note:${C_OFF} this path is suspended (in the trash). Tombstoning asserts"
+    echo "      it is gone for good, so verify stops watching for a Put Back."
   fi
-  confirm "Record $(subj "$f") as gone (retired, asserted by $inv)?" || {
+  if [ -n "$bin" ]; then
+    value_rows "" path subject "$f" "trashed to" id "$bin" \
+      "asserted by" plain "$inv" >&2
+  else
+    value_rows "" path subject "$f" "asserted by" plain "$inv" >&2
+  fi
+  confirm "Record this path as gone (retired)?" || {
     echo "${E_YEL}aborted: $f${E_OFF}" >&2; return 2
   }
   retire_record "$f" assertion || return 1

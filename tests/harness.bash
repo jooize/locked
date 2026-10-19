@@ -742,7 +742,21 @@ check "an empty new file is created"           "0" "$EMRC"
 ok   "the block says the new file is empty"    grep -qF "(new file, empty)" "$EMO"
 # --yes answers without printing the question, so its wording is asserted
 # on the code.
-ok   "the question names it as empty"          grep -qF 'Create and seal the empty file' "$LOCKED"
+ok   "the question names it as empty"          grep -qF 'Create and seal this empty file' "$LOCKED"
+ok   "the block names the new file on its own row" grep -qxF "path:  $CD/nested/empty.txt" "$EMO"
+ok   "and the question's rows name it and its folder" grep -qxF "folder:  $CD" "$EMO"
+
+# Every question holds no value: a path, a name or an identity stands on a
+# labeled row above it, and the question names it with a noun. Asserted on
+# the code, since --yes prints no question: each literal question, with the
+# counts and the kind of node (program-chosen words) taken out, holds no $.
+QLIT="$SCRATCH/questions.txt"
+grep -E '(^|[[:space:]])(q|ask)="[A-Z]|confirm(_hard)? "[A-Z]' "$LOCKED" \
+  | sed -E -e 's/\$\(change_counts[^)]*\)//g' \
+  | grep -oE '(q|ask)="[^"]*"|confirm(_hard)? "[^"]*"' \
+  | sed -E 's/\$(nr|what)([^A-Za-z_]|$)/\2/g' >"$QLIT" || true
+check "all 14 questions are found"             "14" "$(grep -c . "$QLIT" | tr -d ' ')"
+deny "no question holds a value"               grep -q '\$' "$QLIT"
 check "the empty file has no content"          "0" "$(stat -f '%z' "$CD/nested/empty.txt")"
 check "the empty file is frozen"               "uchg" "$(flags_of "$CD/nested/empty.txt")"
 refuse "a new file outside a sealed folder is refused" "not in pool" \
@@ -1171,13 +1185,16 @@ spawn env LOCKED_STATE_ROOT=$(state_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
-  "plan for "
+  "plan (tier "
 }
+# The path row stands directly above the question, and the question line
+# holds no path: exit 3 if a / shows before its counts.
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
-  "(2 seals)"
+  -re {path:[^\n]*\n([^\n]*)\(2 seals\)}
 }
+if {[string first "/" \$expect_out(1,string)] >= 0} { exit 3 }
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
@@ -1191,7 +1208,8 @@ expect {
 catch wait result
 exit [lindex \$result 3]
 EOF
-  ok   "interactive lock answers one gate for the chain" /usr/bin/expect -f "$TTYEXP"
+  ok   "interactive lock answers one gate for the chain, under its path row, naming no path" \
+    /usr/bin/expect -f "$TTYEXP"
   check "interactive leaf sealed uchg"         "uchg" "$(flags_of "$TTYCFG")"
   check "interactive home anchored sappnd"     "sappnd" "$(flags_of "$TTYHOME")"
 
@@ -2268,7 +2286,8 @@ as_user /bin/sh -c "echo plan > '$PLANF'"
 PLANRC=0
 locked_notty lock "$PLANF" >"$OUTF" 2>&1 || PLANRC=$?
 check "an unanswerable gate declines"          "2" "$PLANRC"
-ok   "the plan is printed before the gate"     grep -qF "plan for $PLANF (tier content)" "$OUTF"
+ok   "the plan is printed before the gate"     grep -qxF "plan (tier content):" "$OUTF"
+ok   "the path the gate is about has its own row" grep -qxF "path:  $PLANF" "$OUTF"
 ok   "the plan lists the leaf"                 grep -q "seal content  *$PLANF" "$OUTF"
 ok   "the plan lists the grandparent"          grep -q "seal placement  *$PLAND$" "$OUTF"
 deny "and never the leaf parent"               grep -q "seal placement  *$PLAND/inner$" "$OUTF"
@@ -2289,7 +2308,7 @@ ok   "the plan shows the sealed ancestor"      grep -q "already locked  *$PLAND"
 ok   "and still offers the leaf"               grep -q "seal content  *$PLANF" "$OUTF"
 
 locked lock --dry-run --yes "$PLANF" >"$OUTF" 2>&1 || true
-ok   "dry run prints the plan"                 grep -qF "plan for $PLANF (tier content)" "$OUTF"
+ok   "dry run prints the plan"                 grep -qxF "plan (tier content):" "$OUTF"
 ok   "dry run says nothing changed"            grep -qF "dry run: nothing changed" "$OUTF"
 check "dry run left the leaf's owner"          "$INV" "$(owner_of "$PLANF")"
 check "dry run left no flag on it"             "" "$(flags_of "$PLANF")"
@@ -2299,7 +2318,7 @@ ok   "the leaf seals after the previews"       locked lock --yes "$PLANF"
 check "the leaf is sealed"                     "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$PLANF")"
 locked lock --yes "$PLANF" >"$OUTF" 2>&1 || true
 ok   "a whole chain asks nothing"              grep -qF "already locked: $PLANF" "$OUTF"
-deny "and prints no plan"                      grep -qF "plan for" "$OUTF"
+deny "and prints no plan"                      grep -qF "plan (" "$OUTF"
 ok   "verify clean after the plan round"       locked verify --quiet
 
 }
@@ -2377,11 +2396,15 @@ ok   "verify clean after the controls"         locked_home "$LPHOME" verify --qu
 
 note "unprotect: the file goes home, and so does the chain nothing else needs"
 locked_home "$LPHOME" unprotect --dry-run "$LPF" >"$LPOUT" 2>&1 || true
-ok   "the plan names the file and its identity" grep -qF "$LPF (back to $LPF_ID0)" "$LPOUT"
-ok   "the plan releases the grandparent"       grep -q "^  release  *$LPA (no protected file needs it)" "$LPOUT"
-ok   "and the home anchor"                     grep -q "^  release  *$LPHOME (no protected file needs it)" "$LPOUT"
-LPR_A="$(grep -n "release  *$LPA " "$LPOUT" | cut -d: -f1)"
-LPR_H="$(grep -n "release  *$LPHOME " "$LPOUT" | cut -d: -f1)"
+ok   "the plan names the file, which ends its row" grep -qx "  unprotect  $LPF" "$LPOUT"
+check "and its identity on the row below"      "(back to $LPF_ID0)" \
+      "$(grep -A1 -x "  unprotect  $LPF" "$LPOUT" | tail -n1 | sed 's/^ *//')"
+ok   "the plan releases the grandparent"       grep -q "^  release  *$LPA\$" "$LPOUT"
+check "and says why on the row below"          "(no protected file needs it)" \
+      "$(grep -A1 "^  release  *$LPA\$" "$LPOUT" | tail -n1 | sed 's/^ *//')"
+ok   "and the home anchor"                     grep -q "^  release  *$LPHOME\$" "$LPOUT"
+LPR_A="$(grep -n "release  *$LPA\$" "$LPOUT" | cut -d: -f1)"
+LPR_H="$(grep -n "release  *$LPHOME\$" "$LPOUT" | cut -d: -f1)"
 ok   "releases read root-most first"           test "$LPR_H" -lt "$LPR_A"
 ok   "the dry run says nothing changed"        grep -qF "dry run: nothing changed" "$LPOUT"
 check "the dry run left the file sealed"       "uchg" "$(flags_of "$LPF")"
@@ -2490,7 +2513,10 @@ ok   "lock the file to be removed"             locked_home "$LPHOME" lock --yes 
 check "its grandparent took placement"         "uappnd" "$(flags_of "$RMD")"
 locked_home "$LPHOME" rm --yes "$RMF" >"$LPOUT" 2>&1 || true
 ok   "the gate lists what goes with it"        grep -qF "removing it also releases:" "$LPOUT"
-ok   "by name and reason"                      grep -q "release  *$RMD (no protected file needs it)" "$LPOUT"
+ok   "by name"                                 grep -q "release  *$RMD\$" "$LPOUT"
+check "and reason, on the row below"           "(no protected file needs it)" \
+      "$(grep -A1 "release  *$RMD\$" "$LPOUT" | tail -n1 | sed 's/^ *//')"
+ok   "the path it removes has its own row"     grep -qxF "path:  $RMF" "$LPOUT"
 deny "the file is gone"                        test -e "$RMF"
 check "its record retired via rm"              "rm" "$(meta_get "$RMF" via)"
 ok   "the chain dir was released after it"     grep -qF "✓ released: $RMD (back to $INV:staff 777)" "$LPOUT"
