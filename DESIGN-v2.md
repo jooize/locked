@@ -167,12 +167,13 @@ clears the flag, takes off the seal's ACL entry, and restores owner, group
 That is deliberately unlike `unlock` of a placement node, which keeps
 lock-account ownership and the entry because the seal is coming back.
 An anchor chain node loses only its flag. Each release row carries its
-reason:
+reason as a word in the plan's qualifier column, before the path:
 
-- `not needed: <dir above> keeps it in place` when the directory still
-  holds a protected file -- without it, the row reads as if that file
-  needed it;
-- `no protected file needs it` otherwise.
+- `kept` when the directory still holds a protected file -- without it,
+  the row reads as if that file needed it -- with a dim line under the
+  row naming what keeps it in place (`its parent keeps it in place:
+  <dir above>`);
+- `unused` otherwise.
 
 Seals stay with the verb's own leaves. A pool-wide re-seal would close the
 window an `unlock --chain` deliberately left open for another leaf.

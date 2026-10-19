@@ -298,9 +298,10 @@ What follows, all of it visible in the plan before the one question:
   grandparent-or-higher. There it does real work, so it stays sealed.
 - A sealed directory nothing needs any more -- its file was unprotected,
   removed, or moved elsewhere -- is released: flag off, owner, group and
-  mode back to what they were, record retired. The plan row says why:
-  `release  ~/.claude  (not needed: /Users/you keeps it in place)` or
-  `(no protected file needs it)`. `lock`, `unprotect`, `rm` and the lock
+  mode back to what they were, record retired. The plan row says why, in
+  a word before the path: `release  unused  ~/.config/old`, or
+  `release  kept    ~/.claude` with a line under it,
+  `its parent keeps it in place: /Users/you`. `lock`, `unprotect`, `rm` and the lock
   plan `mv` runs for a moved file all do this; `status` names any that are
   waiting.
 - If any record in the pool cannot be read for this (written before

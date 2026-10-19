@@ -1716,7 +1716,7 @@ record_live() { # <metafile>
 # cannot be derived empties the plan and says why.
 
 RELEASE_PATHS=()
-RELEASE_REASONS=()
+RELEASE_HOLDERS=()
 
 # in_lines <line> <list>: true when <line> is one of the newline-separated
 # lines of <list>, matched literally (the pattern is quoted, so a path with
@@ -1731,11 +1731,12 @@ in_lines() {
 # plan_releases <exclude> <add>: fill RELEASE_PATHS (deepest first) with the
 # live chain records nothing needs once the leaves in <exclude> are gone and
 # those in <add> are protected; both are newline-separated path lists.
-# RELEASE_REASONS holds the matching plan reason for each.
+# RELEASE_HOLDERS holds the matching reason for each: empty when no
+# protected file needs the directory, or the parent that keeps it in place.
 plan_releases() {
   local exclude="$1" add="$2" meta q st role leaves="" needed="" c cands l held
   RELEASE_PATHS=()
-  RELEASE_REASONS=()
+  RELEASE_HOLDERS=()
   for meta in "$USER_POOL"/*.meta; do
     [ -f "$meta" ] || continue
     record_live "$meta" || continue
@@ -1803,9 +1804,9 @@ $leaves
 EOF
     RELEASE_PATHS+=("$q")
     if [ "$held" -eq 1 ]; then
-      RELEASE_REASONS+=("not needed: $(dirname "$q") keeps it in place")
+      RELEASE_HOLDERS+=("$(dirname "$q")")
     else
-      RELEASE_REASONS+=("no protected file needs it")
+      RELEASE_HOLDERS+=("")
     fi
   done 3<<EOF
 $cands
@@ -1813,23 +1814,90 @@ EOF
   return 0
 }
 
-# release_rows <indent> <width>: the plan rows for RELEASE_PATHS, root-most
-# first like every other plan row, the reason dim after the path.
-release_rows() { # <indent> <width>
-  local ind="$1" w="$2" i
-  i=$((${#RELEASE_PATHS[@]} - 1))
-  while [ "$i" -ge 0 ]; do
-    printf '%s%-*s  %s\n' "$ind" "$w" release "${RELEASE_PATHS[$i]}" >&2
-    note_row "$ind" "$w" "${RELEASE_REASONS[$i]}"
-    i=$((i - 1))
-  done
+# ---- plan rows --------------------------------------------------------------
+#
+# One plan row per node (terminal-output Rows): the action, then -- when the
+# plan has one -- a qualifier column of fixed words, blank on a row without
+# one, then the path, which ends its line. A qualifier that is a sentence,
+# or names a path of its own, goes on a dim line under the row, starting in
+# the path's column. The release reasons are the qualifier words:
+#   release  unused  /Users/me/.config/old
+#   release  kept    /Users/me/.config
+#                    its parent keeps it in place: /Users/me
+
+# dispw <text>: the columns <text> takes, counting `→` as one, as Ghostty
+# draws it. Every other cell text here is ASCII, so the rest is bytes.
+dispw() {
+  local LC_ALL=C t
+  t="${1//→/}"
+  printf '%s' $(( ${#t} + (${#1} - ${#t}) / 3 ))
 }
 
-# note_row <indent> <width> <text>: a plan row's qualifier, dim and in
-# parentheses, on a line of its own under the row's path. The path ends its
+# cell <width> <text>: <text> padded out to <width> columns.
+cell() {
+  local n
+  n="$(dispw "$2")"
+  printf '%s%*s' "$2" $(( $1 > n ? $1 - n : 0 )) ''
+}
+
+# plan_row <indent> <action width> <action> <qualifier width> <qualifier>
+# <path> [dim]: one plan row on stderr. A qualifier width of 0 means the
+# plan has no qualifier column.
+plan_row() {
+  local on="" off=""
+  if [ -n "${7:-}" ]; then on="$E_DIM" off="$E_OFF"; fi
+  {
+    printf '%s%s%s  ' "$on" "$1" "$(cell "$2" "$3")"
+    [ "$4" -eq 0 ] || printf '%-*s  ' "$4" "$5"
+    printf '%s%s\n' "$6" "$off"
+  } >&2
+}
+
+# plan_col <indent> <action width> <qualifier width>: the column the plan's
+# paths start in, where a note under a row starts too.
+plan_col() {
+  local c=$(( ${#1} + $2 + 2 ))
+  [ "$3" -eq 0 ] || c=$(( c + $3 + 2 ))
+  printf '%s' "$c"
+}
+
+# note_row <column> <text>: a row's qualifier sentence, dim, on a line of
+# its own under the row, starting in the path's column. The path ends its
 # line, so what qualifies it cannot follow it there.
 note_row() {
-  printf '%s%*s  %s(%s)%s\n' "$1" "$2" '' "$E_DIM" "$3" "$E_OFF" >&2
+  printf '%*s%s%s%s\n' "$1" '' "$E_DIM" "$2" "$E_OFF" >&2
+}
+
+# release_qual <i>: the qualifier word for RELEASE_PATHS[i].
+release_qual() {
+  if [ -n "${RELEASE_HOLDERS[$1]}" ]; then printf 'kept'; else printf 'unused'; fi
+}
+
+# release_qwidth: the width of the qualifier column the planned releases
+# need, 0 with none planned.
+release_qwidth() {
+  local i=0 w=0 q
+  while [ "$i" -lt "${#RELEASE_PATHS[@]}" ]; do
+    q="$(release_qual "$i")"
+    [ "${#q}" -le "$w" ] || w="${#q}"
+    i=$((i + 1))
+  done
+  printf '%s' "$w"
+}
+
+# release_rows <indent> <action width> <qualifier width>: the plan rows for
+# RELEASE_PATHS, root-most first like every other plan row.
+release_rows() {
+  local ind="$1" w="$2" qw="$3" i
+  i=$((${#RELEASE_PATHS[@]} - 1))
+  while [ "$i" -ge 0 ]; do
+    plan_row "$ind" "$w" release "$qw" "$(release_qual "$i")" "${RELEASE_PATHS[$i]}"
+    if [ -n "${RELEASE_HOLDERS[$i]}" ]; then
+      note_row "$(plan_col "$ind" "$w" "$qw")" \
+        "its parent keeps it in place: ${RELEASE_HOLDERS[$i]}"
+    fi
+    i=$((i - 1))
+  done
 }
 
 # apply_releases: run the planned releases, deepest first.
@@ -2205,7 +2273,7 @@ plan_node() {
       if [ "$state" = "locked" ]; then
         # Tier-internal escalation (sappnd <-> schg): a normal relock that
         # clears the previous system flag before applying the new one.
-        printf 'reflag anchor (%s -> %s)' "$prev_flag" "$fl"
+        printf 'reflag anchor (%s → %s)' "$prev_flag" "$fl"
         return 0
       fi
       ;;
@@ -3401,8 +3469,8 @@ EOF
       protect) protects=$((protects + 1)) ;;
       *) seals=$((seals + 1)) ;;
     esac
-    if [ "${#plan_actions[$i]}" -gt "$w" ]; then
-      w="${#plan_actions[$i]}"
+    if [ "$(dispw "${plan_actions[$i]}")" -gt "$w" ]; then
+      w="$(dispw "${plan_actions[$i]}")"
     fi
     i=$((i + 1))
   done
@@ -3427,27 +3495,28 @@ EOF
   # prompt's stream, so redirecting stdout can never separate the gate from
   # the list it is about. Already-locked rows are dim -- they are context,
   # not offer. Releases follow the chain in the same column, each with the
-  # reason a reader needs: a directory leaving the pool is the one row that
-  # is not self-explanatory.
+  # reason a reader needs in the qualifier column: a directory leaving the
+  # pool is the one row that is not self-explanatory.
+  local qw
+  qw="$(release_qwidth)"
   echo "${E_B}plan (tier $leaf_tier):${E_OFF}" >&2
   i=$((n - 1))
   while [ "$i" -ge 0 ]; do
     case "${plan_actions[$i]}" in
       "already locked")
-        printf '%s  %-*s  %s%s\n' "$E_DIM" "$w" "${plan_actions[$i]}" \
-          "${plan_paths[$i]}" "$E_OFF" >&2
+        plan_row "  " "$w" "${plan_actions[$i]}" "$qw" "" "${plan_paths[$i]}" dim
         ;;
       protect)
-        printf '  %-*s  %s\n' "$w" protect "${plan_paths[$i]}" >&2
-        note_row "  " "$w" "already sealed; now protected by name"
+        plan_row "  " "$w" protect "$qw" "" "${plan_paths[$i]}"
+        note_row "$(plan_col "  " "$w" "$qw")" "already sealed; now protected by name"
         ;;
       *)
-        printf '  %-*s  %s\n' "$w" "${plan_actions[$i]}" "${plan_paths[$i]}" >&2
+        plan_row "  " "$w" "${plan_actions[$i]}" "$qw" "" "${plan_paths[$i]}"
         ;;
     esac
     i=$((i - 1))
   done
-  release_rows "  " "$w"
+  release_rows "  " "$w" "$qw"
   echo >&2
 
   if [ "$OPT_DRY" -eq 1 ]; then
@@ -3590,10 +3659,12 @@ EOF
 # directory no other protected file needs is released in the same plan and
 # under the same one question.
 
-# identity_text <metafile>: "jooize:staff 644" for the result and plan rows.
+# identity_text <metafile>: "644 jooize:staff" for the result and plan rows:
+# the mode is a field of known width, the owner and group are names, which
+# end the line.
 identity_text() {
-  printf '%s:%s %s' "$(meta_field "$1" owner)" "$(meta_field "$1" group)" \
-    "$(meta_field "$1" mode)"
+  printf '%s %s:%s' "$(meta_field "$1" mode)" "$(meta_field "$1" owner)" \
+    "$(meta_field "$1" group)"
 }
 
 do_unprotect_one() {
@@ -3636,11 +3707,12 @@ do_unprotect_one() {
       ;;
   esac
 
-  local w=9
+  local w=9 qw
+  qw="$(release_qwidth)"
   echo "${E_B}plan:${E_OFF}" >&2
-  printf '  %-*s  %s\n' "$w" unprotect "$f" >&2
-  note_row "  " "$w" "$back"
-  release_rows "  " "$w"
+  plan_row "  " "$w" unprotect "$qw" "" "$f"
+  note_row "$(plan_col "  " "$w" "$qw")" "$back"
+  release_rows "  " "$w" "$qw"
   echo >&2
 
   if [ "$OPT_DRY" -eq 1 ]; then
@@ -4280,7 +4352,7 @@ do_rm_one() {
     rm_leaves="$rm_leaves$p"$'\n'
   done
   RELEASE_PATHS=()
-  RELEASE_REASONS=()
+  RELEASE_HOLDERS=()
   if [ -n "$rm_leaves" ]; then
     plan_releases "$rm_leaves" ""
     local -a keep_p keep_r
@@ -4289,12 +4361,12 @@ do_rm_one() {
     while [ "$i" -lt "${#RELEASE_PATHS[@]}" ]; do
       case "${RELEASE_PATHS[$i]}" in
         "$f"|"$f"/*) ;;
-        *) keep_p+=("${RELEASE_PATHS[$i]}"); keep_r+=("${RELEASE_REASONS[$i]}") ;;
+        *) keep_p+=("${RELEASE_PATHS[$i]}"); keep_r+=("${RELEASE_HOLDERS[$i]}") ;;
       esac
       i=$((i + 1))
     done
     RELEASE_PATHS=(${keep_p[@]+"${keep_p[@]}"})
-    RELEASE_REASONS=(${keep_r[@]+"${keep_r[@]}"})
+    RELEASE_HOLDERS=(${keep_r[@]+"${keep_r[@]}"})
   fi
   # The question holds no value and is one verb and its noun: the path
   # stands on the row above it, labeled with the kind of node the question
@@ -4305,7 +4377,7 @@ do_rm_one() {
   fi
   if [ "$nr" -gt 0 ]; then
     echo "${E_B}removing it also releases:${E_OFF}" >&2
-    release_rows "  " 7
+    release_rows "  " 7 "$(release_qwidth)"
     echo >&2
     c="$c, and releases $nr $(plural "$nr" directory directories)"
   fi

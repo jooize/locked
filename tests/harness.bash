@@ -2350,6 +2350,8 @@ LPF="$LPB/leaf.txt"
 as_user /bin/sh -c "echo lp > '$LPF'"
 LPB_BEFORE="$(stat -f '%Su %Sg %OLp' "$LPB")"
 LPF_ID0="$(stat -f '%Su:%Sg %OLp' "$LPF")"
+# The same identity as locked words it: the mode first, the names last.
+LPF_BACK0="back to $(stat -f '%OLp %Su:%Sg' "$LPF")"
 LPOUT="$SCRATCH/leafparent.out"
 
 locked_home "$LPHOME" lock --yes "$LPF" >"$LPOUT" 2>&1 || true
@@ -2397,15 +2399,16 @@ ok   "verify clean after the controls"         locked_home "$LPHOME" verify --qu
 
 note "unprotect: the file goes home, and so does the chain nothing else needs"
 locked_home "$LPHOME" unprotect --dry-run "$LPF" >"$LPOUT" 2>&1 || true
-ok   "the plan names the file, which ends its row" grep -qx "  unprotect  $LPF" "$LPOUT"
-check "and its identity on the row below"      "(back to $LPF_ID0)" \
-      "$(grep -A1 -x "  unprotect  $LPF" "$LPOUT" | tail -n1 | sed 's/^ *//')"
-ok   "the plan releases the grandparent"       grep -q "^  release  *$LPA\$" "$LPOUT"
-check "and says why on the row below"          "(no protected file needs it)" \
-      "$(grep -A1 "^  release  *$LPA\$" "$LPOUT" | tail -n1 | sed 's/^ *//')"
-ok   "and the home anchor"                     grep -q "^  release  *$LPHOME\$" "$LPOUT"
-LPR_A="$(grep -n "release  *$LPA\$" "$LPOUT" | cut -d: -f1)"
-LPR_H="$(grep -n "release  *$LPHOME\$" "$LPOUT" | cut -d: -f1)"
+# A plan row: the action, the qualifier column (blank where a row has
+# none), the path last; a sentence about the row goes on a dim line under
+# it, in the path's column.
+ok   "the plan names the file, which ends its row" grep -qx "  unprotect  *$LPF" "$LPOUT"
+check "and its identity on the row below"      "$LPF_BACK0" \
+      "$(grep -A1 -x "  unprotect  *$LPF" "$LPOUT" | tail -n1 | sed 's/^ *//')"
+ok   "the plan releases the grandparent, unused" grep -q "^  release  *unused  $LPA\$" "$LPOUT"
+ok   "and the home anchor"                     grep -q "^  release  *unused  $LPHOME\$" "$LPOUT"
+LPR_A="$(grep -n "release  *unused  $LPA\$" "$LPOUT" | cut -d: -f1)"
+LPR_H="$(grep -n "release  *unused  $LPHOME\$" "$LPOUT" | cut -d: -f1)"
 ok   "releases read root-most first"           test "$LPR_H" -lt "$LPR_A"
 ok   "the dry run says nothing changed"        grep -qF "dry run: nothing changed" "$LPOUT"
 check "the dry run left the file sealed"       "uchg" "$(flags_of "$LPF")"
@@ -2416,7 +2419,7 @@ check "without a tty or --yes it declines"     "2" "$LPRC"
 check "and the record is untouched"            "locked" "$(meta_get "$LPF" state)"
 
 locked_home "$LPHOME" unprotect --yes "$LPF" >"$LPOUT" 2>&1 || true
-ok   "the file is unprotected"                 grep -qF "✓ unprotected: $LPF (back to $LPF_ID0)" "$LPOUT"
+ok   "the file is unprotected"                 grep -qF "✓ unprotected: $LPF ($LPF_BACK0)" "$LPOUT"
 check "it is the invoker's again"              "$LPF_ID0" "$(stat -f '%Su:%Sg %OLp' "$LPF")"
 check "with no flag"                           "" "$(flags_of "$LPF")"
 check "its record is retired"                  "retired" "$(meta_get "$LPF" state)"
@@ -2458,15 +2461,17 @@ ok   "lock the deeper leaf"                    locked_home "$LPHOME" lock --yes 
 check "its grandparent took placement"         "uappnd" "$(flags_of "$SHD")"
 locked_home "$LPHOME" lock --yes "$SH1" >"$LPOUT" 2>&1 || true
 check "the shallow leaf is sealed"             "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$SH1")"
-deny "its plan never offers to release the shared node" grep -q "release  *$SHD " "$LPOUT"
+deny "its plan never offers to release the shared node" grep -q "release  *[a-z]*  *$SHD\$" "$LPOUT"
 check "the shared node kept its flag"          "uappnd" "$(flags_of "$SHD")"
 locked_home "$LPHOME" status "$SH1" >"$LPOUT" 2>&1 || true
 ok   "a recorded leaf parent prints as placement" grep -qF "✓  $SHD (placement uappnd)" "$LPOUT"
 deny "and not as the context row"              grep -qF "$SHD (not needed" "$LPOUT"
 
 locked_home "$LPHOME" unprotect --dry-run "$SH2" >"$LPOUT" 2>&1 || true
-ok   "a leaf's own parent says what holds it"  grep -qF "$SHD (not needed: $LPA keeps it in place)" "$LPOUT"
-deny "and the grandparent stays: another leaf needs it" grep -q "release  *$LPA " "$LPOUT"
+ok   "a leaf's own parent is released as kept" grep -q "release  *kept  *$SHD\$" "$LPOUT"
+check "and says what holds it on the row below" "its parent keeps it in place: $LPA" \
+      "$(grep -A1 "release  *kept  *$SHD\$" "$LPOUT" | tail -n1 | sed 's/^ *//')"
+deny "and the grandparent stays: another leaf needs it" grep -q "release  *[a-z]*  *$LPA\$" "$LPOUT"
 ok   "unprotect the deeper leaf"               locked_home "$LPHOME" unprotect --yes "$SH2"
 check "the shared node went home"              "$INV staff 777" "$(stat -f '%Su %Sg %OLp' "$SHD")"
 check "with no flag"                           "" "$(flags_of "$SHD")"
@@ -2496,7 +2501,7 @@ locked_home "$LPHOME" status >"$LPOUT" 2>&1 || true
 ok   "the pool listing notes it"               grep -qF "no protected file needs these any more:" "$LPOUT"
 ok   "by name"                                 grep -qF "      $ORD" "$LPOUT"
 locked_home "$LPHOME" lock --yes "$SH1" >"$LPOUT" 2>&1 || true
-ok   "an unrelated lock plans the release"     grep -q "^  release  *$ORD (no protected file needs it)" "$LPOUT"
+ok   "an unrelated lock plans the release"     grep -q "^  release  *unused  $ORD\$" "$LPOUT"
 ok   "and applies it"                          grep -qF "✓ released: $ORD (back to $INV:staff 777)" "$LPOUT"
 deny "the whole chain asked for no seal"       grep -q "^  seal " "$LPOUT"
 check "the dir carries no flag"                "" "$(flags_of "$ORD")"
@@ -2514,9 +2519,7 @@ ok   "lock the file to be removed"             locked_home "$LPHOME" lock --yes 
 check "its grandparent took placement"         "uappnd" "$(flags_of "$RMD")"
 locked_home "$LPHOME" rm --yes "$RMF" >"$LPOUT" 2>&1 || true
 ok   "the gate lists what goes with it"        grep -qF "removing it also releases:" "$LPOUT"
-ok   "by name"                                 grep -q "release  *$RMD\$" "$LPOUT"
-check "and reason, on the row below"           "(no protected file needs it)" \
-      "$(grep -A1 "release  *$RMD\$" "$LPOUT" | tail -n1 | sed 's/^ *//')"
+ok   "by name and reason"                      grep -q "release  *unused  $RMD\$" "$LPOUT"
 ok   "the file it removes has its own row"     grep -qxF "file:  $RMF" "$LPOUT"
 deny "the file is gone"                        test -e "$RMF"
 check "its record retired via rm"              "rm" "$(meta_get "$RMF" via)"
@@ -2539,7 +2542,7 @@ ok   "the file moved"                          test -f "$MTD/in/m.txt"
 check "still sealed as itself"                 "uchg" "$(flags_of "$MTD/in/m.txt")"
 ok   "the lock plan sealed the new chain"      grep -q "seal placement  *$MTD\$" "$LPOUT"
 check "the new grandparent is placement"       "uappnd" "$(flags_of "$MTD")"
-ok   "and released the old one"                grep -q "release  *$MFD (no protected file needs it)" "$LPOUT"
+ok   "and released the old one"                grep -q "release  *unused  $MFD\$" "$LPOUT"
 check "the old grandparent carries no flag"    "" "$(flags_of "$MFD")"
 # Off a tty the move still happens (it has no gate of its own), the lock
 # plan declines, and the output says how to finish.
@@ -2690,9 +2693,11 @@ ok   "verify clean across the worked pool"     locked_home "$WPHOME" verify --qu
 # Stop protecting the nested settings file: its whole chain up to .config
 # goes, because nothing else needs it; Library stays for the ghostty prefs.
 locked_home "$WPHOME" unprotect --yes "$WPHOME/.config/agents/claude/settings/settings.json" >"$WPOUT" 2>&1 || true
-ok   ".config/agents/claude is released"       grep -q "release  *$WPHOME/.config/agents/claude (no protected file needs it)" "$WPOUT"
-ok   ".config/agents too"                      grep -q "release  *$WPHOME/.config/agents (no protected file needs it)" "$WPOUT"
-ok   ".config says what holds it now"          grep -qF "$WPHOME/.config (not needed: $WPHOME keeps it in place)" "$WPOUT"
+ok   ".config/agents/claude is released"       grep -q "release  *unused  $WPHOME/.config/agents/claude\$" "$WPOUT"
+ok   ".config/agents too"                      grep -q "release  *unused  $WPHOME/.config/agents\$" "$WPOUT"
+ok   ".config is released as kept"             grep -q "release  *kept  *$WPHOME/.config\$" "$WPOUT"
+check ".config says what holds it now"         "its parent keeps it in place: $WPHOME" \
+      "$(grep -A1 "release  *kept  *$WPHOME/.config\$" "$WPOUT" | tail -n1 | sed 's/^ *//')"
 for d in .config .config/agents .config/agents/claude; do
   check "$d is back to the invoker, unflagged" "$INV staff 777 -" \
         "$(stat -f '%Su %Sg %OLp %Sf' "$WPHOME/$d")"
