@@ -44,9 +44,11 @@ let
   # records the period readers judge its age against.
   #
   # Deliberate non-rewrites, unlike pinned's module: the shebang is
-  # already /bin/bash in the repo (see the script's own header -- sudo
-  # passes the caller's PATH through, so `env bash` would let the invoker
-  # pick root's interpreter), and PATH is NOT profile-prepended: every
+  # already `/bin/bash -p` in the repo (see the script's own header --
+  # sudo passes the caller's PATH through, so `env bash` would let the
+  # invoker pick root's interpreter, and -p keeps bash from reading
+  # BASH_ENV, SHELLOPTS and exported functions before line one, with or
+  # without sudo's env_reset), and PATH is NOT profile-prepended: every
   # probe in locked speaks BSD (stat -f, chflags, dscl), and a GNU
   # coreutils `stat` from the profile would shadow it with different
   # semantics. The OS-only PATH is correct here.

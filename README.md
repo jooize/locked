@@ -196,6 +196,13 @@ sudo install -d -m 755 -o root -g wheel /usr/local/sbin
 sudo install -m 755 -o root -g wheel ./locked /usr/local/sbin/locked
 ```
 
+Always run it by its path, as above and as the sudoers entry names it.
+Its first line is `#!/bin/bash -p`: privileged mode keeps bash from
+sourcing the file `BASH_ENV` names, taking options from `SHELLOPTS` and
+importing exported shell functions before the script's first line runs,
+with or without sudo (`status` and `why` run without it). `bash locked`
+reads no first line, so it runs without that protection.
+
 Build and install the window helper alongside (needs the Xcode command
 line tools; the mediated verbs and every snapshot copy go through it,
 and `locked` verifies its ownership and ancestry on each use):

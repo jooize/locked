@@ -1,10 +1,20 @@
-#!/bin/bash
+#!/bin/bash -p
 # locked v2 -- three-tier BSD-flag protection for user-space trust surfaces.
 #
 # /bin/bash, not `env bash`: sudo passes the caller's PATH through (probed
 # live 2026-08-06), and env resolves the interpreter from it BEFORE the
 # PATH pin below runs -- a user-writable bash would run as root. /bin/bash
 # is SIP-sealed and present on every macOS, and this tool is Darwin-only.
+#
+# -p (privileged mode), for the same reason: before line one runs, a
+# plain bash sources the file $BASH_ENV names, takes set options from
+# SHELLOPTS, and imports shell functions from the environment -- a
+# BASH_FUNC_exec%% variable replaces `exec` itself (verified on /bin/bash
+# 3.2, 2026-10-20). -p turns all three off. sudo's env_reset strips those
+# variables today, but status and why run without sudo, and the flag must
+# not hang on sudo's policy. It holds only when the kernel reads this
+# line: `bash locked` runs without it, so the script is always executed
+# by its path.
 #
 # Tiers (see DESIGN-v2.md):
 #   content    uchg,  owned by _<user>-lock; leaf files, or leaf dirs (recursive)
