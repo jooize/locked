@@ -57,7 +57,12 @@ let
   # probe in locked speaks BSD (stat -f, chflags, dscl), and a GNU
   # coreutils `stat` from the profile would shadow it with different
   # semantics. The OS-only PATH is correct here.
-  anchors = [
+  #
+  # Each anchor is a whole line, a line feed on both sides (line), so a
+  # comment that quotes one -- `: "${VAR:=...}"` mid-sentence -- is never
+  # rewritten, and a line that merely starts the same way never matches.
+  line = l: "\n" + l + "\n";
+  anchors = map (a: { from = line a.from; to = line a.to; }) [
     {
       from = '': "''${INSTALL_TARGET:=/usr/local/sbin/locked}"'';
       to = '': "''${INSTALL_TARGET:=${cfg.installPath}}"'';
@@ -71,8 +76,8 @@ let
       to = '': "''${LOCKED_VERIFY_INTERVAL:=${toString cfg.verifyInterval}}"'';
     }
     {
-      from = "readonly LOCKED_GIT=/Library/Developer/CommandLineTools/usr/bin/git\n";
-      to = "readonly LOCKED_GIT=${pkgs.git}/bin/git\n";
+      from = "readonly LOCKED_GIT=/Library/Developer/CommandLineTools/usr/bin/git";
+      to = "readonly LOCKED_GIT=${pkgs.git}/bin/git";
     }
   ];
   scriptText =
