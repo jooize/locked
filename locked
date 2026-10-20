@@ -196,7 +196,13 @@ set_pal   # initialize for set -u; callers on a redirected fd re-run it
 # (verify_escape writes its own form for its machine-read file).
 #
 # Perl, in bytes from end to end: it reads no locale, which it has to,
-# because sudo's env_reset strips LANG before locked ever runs. The UTF-8
+# because sudo's env_reset strips LANG before locked ever runs. Every perl
+# locked runs, this one and the small ones elsewhere, starts under env -i:
+# PERL5OPT adds switches (-M, -C), PERL5LIB and PERL5DB load code and
+# PERL_UNICODE changes how bytes are read, all before a script's first
+# line, and a root run must not hang that on sudo's env_reset any more
+# than the shell's own startup does (-p, at the top). None of them needs
+# anything from the environment. The UTF-8
 # scan is spelled out instead of calling Encode::decode with a
 # malformed-byte callback: Encode consumes the whole bad sequence and
 # reports only its first byte, which would take bytes out of the display.
@@ -360,7 +366,7 @@ esc_into() {
     *[![:print:]]*|*\\*) ;;
     *) printf -v "$1" '%s' "$2"; return 0 ;;
   esac
-  _ei_out="$(printf '%s' "$2" | /usr/bin/perl -e "$UNTRUSTED_PL" -- field \
+  _ei_out="$(printf '%s' "$2" | env -i /usr/bin/perl -e "$UNTRUSTED_PL" -- field \
     "${3:-}" "${3:+$'\033[0m'${4:-}}" && printf x)" || {
     echo "locked: cannot render a path for display; its raw bytes are never shown" >&2
     exit 1
@@ -1618,7 +1624,7 @@ convert_legacy_layout() {
 LOCKED_RUN_LOCK="$LOCKED_STATE_ROOT/run.lock"
 
 flock_fd9() { # <try|wait>: 0 locked, 1 held by another run (try only), 2 error
-  /usr/bin/perl -MFcntl=:flock -e '
+  env -i /usr/bin/perl -MFcntl=:flock -e '
     open(my $fh, ">&=", 9) or exit 2;
     my $op = LOCK_EX;
     $op |= LOCK_NB if $ARGV[0] eq "try";
@@ -1866,7 +1872,7 @@ vctx() { vfind "$1" context "$2"; }
 # bytes (either case), so a path from a record can be escaped for display
 # like any other.
 verify_unescape() {
-  /usr/bin/perl -e '$_ = $ARGV[0]; s/\\x([0-9A-Fa-f]{2})/chr(hex($1))/ge; print' -- "$1"
+  env -i /usr/bin/perl -e '$_ = $ARGV[0]; s/\\x([0-9A-Fa-f]{2})/chr(hex($1))/ge; print' -- "$1"
 }
 
 # verify_rows <indent> [<path>]: draw the findings on stdin. With a path,
@@ -2733,7 +2739,7 @@ git_diff() { # <old> <new> <old-label> <new-label>
 # the second at 1, a file whose line endings are CRLF gets a `CRLF line
 # endings` header line and draws its pairs as plain breaks; at 0, every
 # carriage return shows escaped.
-diff_filter() { /usr/bin/perl -e "$UNTRUSTED_PL" -- lines "$1" "${2:-0}"; }
+diff_filter() { env -i /usr/bin/perl -e "$UNTRUSTED_PL" -- lines "$1" "${2:-0}"; }
 
 # Diff-witness display, shared by the three diff sites (content relock,
 # anchor relock, edit), each handing it the two sides and their labels
@@ -5896,8 +5902,9 @@ VERIFY_PATHS_MAX=20
 
 verify_escape() { # <path>: printable ASCII, \xHH for every other byte
   # Bytes, not characters: without -C perl reads its argument as octets, so
-  # a multi-byte character becomes one \xHH per byte.
-  /usr/bin/perl -e '$_ = $ARGV[0]; s/([^\x20-\x5b\x5d-\x7e])/sprintf("\\x%02x", ord($1))/ge; print' -- "$1"
+  # a multi-byte character becomes one \xHH per byte (env -i: no
+  # PERL_UNICODE or PERL5OPT can add a -C).
+  env -i /usr/bin/perl -e '$_ = $ARGV[0]; s/([^\x20-\x5b\x5d-\x7e])/sprintf("\\x%02x", ord($1))/ge; print' -- "$1"
 }
 
 write_verify_status() { # <userdir> <lock group> <at> <records> [drifted path...]
