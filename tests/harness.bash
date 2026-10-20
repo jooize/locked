@@ -1260,6 +1260,44 @@ check "a drift fact resumes plain after the escape" "1" \
 check "a line of context resumes dim"      "1" \
       "$(dw_rows 1 drift context "$DW_ACL" | grep -cF -- "${DW_ESC}[7;31m${BSL}u{1B}${DW_ESC}[0m${DW_ESC}[2m[31m" || true)"
 
+# shq quotes a path for a command the reader pastes, so each shell the
+# reader may run has to read the word back as the same bytes. Fish reads
+# \\ and \' as escapes even inside single quotes, so a backslash is the
+# case a plain single-quote wrapper gets wrong there, and zsh expands a
+# leading =name. Lifted out of locked like the renderer. A shell that is
+# not on PATH (sudo's secure_path may leave fish out) skips its half.
+eval "$(sed -n '/^shq() {/,/^}/p' "$LOCKED")"
+check "a word of safe characters stays bare" "/plain/p-1.2_x+y@h:p,q=r" \
+      "$(shq "/plain/p-1.2_x+y@h:p,q=r")"
+check "an inner quote is written '\\''"   "'it'\\''s'" "$(shq "it's")"
+check "a backslash is written '\\\\', outside the quotes" "'a'\\\\'b'" \
+      "$(shq "a${BSL}b")"
+check "a leading = is quoted (zsh expands =name)" "'=x'" "$(shq "=x")"
+# $HOME`id` is literal on purpose: the shells must not expand it.
+# shellcheck disable=SC2016
+SHQ_WORDS=("/a b/c" "it's" "a${BSL}${BSL}b" "end${BSL}" "x'${BSL}'y" '$HOME`id`'
+  '*?[x]{a,b}~' "" "=x" $'caf\xc3\xa9/zw\xe2\x80\x8b.txt' $'end\n')
+SHQ_WHAT=("a space" "a quote" "two backslashes" "a trailing backslash"
+  "a backslash between quotes" "expansions" "globs, braces and a tilde"
+  "nothing (an empty word)" "a leading =" "UTF-8 and a zero-width space"
+  "a trailing newline")
+for sh in bash zsh fish; do
+  if ! command -v "$sh" >/dev/null 2>&1; then
+    tap_skip "$sh reads back every quoted word" "no $sh on PATH"
+    continue
+  fi
+  case "$sh" in
+    bash) sh_argv=(bash --norc --noprofile -c) ;;
+    zsh)  sh_argv=(zsh -f -c) ;;
+    fish) sh_argv=(fish --no-config -c) ;;
+  esac
+  for i in "${!SHQ_WORDS[@]}"; do
+    SHQ_Q="$(shq "${SHQ_WORDS[$i]}")"
+    check "$sh reads back a word holding ${SHQ_WHAT[$i]}" "${SHQ_WORDS[$i]}." \
+          "$("${sh_argv[@]}" "printf '%s' $SHQ_Q; printf ." 2>&1 || true)"
+  done
+done
+
 note "cli: dry-run mutates nothing"
 DR="$FAKE_HOME/dryrun.txt"
 as_user /bin/sh -c "echo dr > '$DR'"
