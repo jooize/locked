@@ -920,7 +920,7 @@ ACRC=0
 locked edit --yes --from "$PROPX" "$FA" >"$ACO" 2>&1 || ACRC=$?
 check "accepting unchanged bytes installs"     "0" "$ACRC"
 ok   "the block says nothing changed"          grep -qF "(no change; a mismatch is recorded" "$ACO"
-ok   "the question names the acceptance"       grep -qF 'install it again and clear the mismatch' "$LOCKED"
+ok   "the consequence names the acceptance"    grep -qF 'This installs it again and clears the mismatch.' "$LOCKED"
 ok   "verify clean after both are resolved"    locked verify
 locked edit --yes --from "$PROPX" "$FA" >"$ACO" 2>&1 || true
 ok   "a later unchanged edit stops early"      grep -qF "no changes: $FA" "$ACO"
