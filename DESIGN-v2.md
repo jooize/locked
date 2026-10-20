@@ -295,7 +295,7 @@ is one command, and it takes a glob because `rm`, `trash`, `lock` and
 `unlock` all accept many paths in one batch:
 
 ```sh
-sudo locked rm <dir>/<name>.tmp.*
+sudo locked rm DIR/NAME.tmp.*
 ```
 
 (`trash` is refused here: the trash service moves an entry as you, and a

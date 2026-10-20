@@ -2163,6 +2163,9 @@ ok   "and names it last"                       grep -qF "be removed or renamed w
 ok   "why offers the mediated rm"              grep -qF "sudo locked rm $WHYF" "$OUTF"
 ok   "why offers the mediated trash"           grep -qF "sudo locked trash $WHYF" "$OUTF"
 ok   "why offers the mediated mv"              grep -qF "sudo locked mv $WHYF" "$OUTF"
+# The new name is one capitalized word: a shell reads < and > as
+# redirects, so a pasted <new> would not run as shown.
+ok   "with a placeholder that pastes"          grep -qF "sudo locked mv $WHYF NEW" "$OUTF"
 # A suggested command is pasted, so a path a shell would split or expand
 # is one single-quoted word, a quote inside it written '\''.
 WHYQ="$MED/why it's *.txt"

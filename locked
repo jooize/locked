@@ -1375,7 +1375,7 @@ do_setup() {
   echo "To check the pool, then adopt a first target, run:"
   echo
   echo "  sudo locked status /nonexistent    # should print 'not in pool'"
-  echo "  sudo locked lock <path>"
+  echo "  sudo locked lock PATH"
 }
 
 if [ "$action" = "setup" ]; then
@@ -3590,11 +3590,13 @@ blocking_ancestor() { # <path>
 # Role-color one command string (terminal-output command-line sub-grammar):
 # `sudo` bold, the program token bold cyan (a dir part, were one ever
 # shown, plain cyan around a bold basename), option flags bold blue --
-# marked LEXICALLY, the token starts with `-` -- paths cyan, a <placeholder>
-# dim, everything else plain. The string is split into shell words the way
-# the shell will read it when pasted: on spaces outside single quotes,
-# a backslash keeping the next byte in its word, so a path shq quoted is
-# one word and is never expanded as a glob. Each word is escaped
+# marked LEXICALLY, the token starts with `-` -- paths cyan, everything else
+# plain, a placeholder included: one capitalized word (NEW), since a shell
+# reads < and > as redirects and a pasted <new> would not run as shown.
+# The string is split into shell words the way the shell will read it
+# when pasted: on spaces outside single quotes, a backslash keeping the
+# next byte in its word, so a path shq quoted is one word and is never
+# expanded as a glob. Each word is escaped
 # (esc_into). Into CMD_DISP, never through a command substitution, so a
 # word that cannot be rendered ends locked rather than a subshell. Uses
 # the P_* palette: callers run set_pal first.
@@ -3630,7 +3632,6 @@ cmd_disp() { # <command-string>
     case "$tok" in
       sudo)  st="$P_B" ;;
       -*)    st="$P_BLU" ;;
-      '<'*'>') st="$P_DIM" ;;
       */*)   st="$P_CYN" ;;
       *)
         st=""
@@ -5220,14 +5221,14 @@ do_why_one() {
       explain_blocker "$BLOCK_PATH" "$BLOCK_FLAG" \
         "sudo locked rm $(shq "$f")" "removes it through a bounded window" \
         "sudo locked trash $(shq "$f")" "moves it to your trash instead" \
-        "sudo locked mv $(shq "$f") <new>" "renames it through the same window"
+        "sudo locked mv $(shq "$f") NEW" "renames it through the same window"
     elif [ -e "$f" ] || [ -L "$f" ]; then
       # The trash service moves the entry as you, and this parent does not
       # let you remove what is in it (a placement seal's entry adds only),
       # so do_trash_one would refuse the command. rm and mv run as root.
       explain_blocker "$BLOCK_PATH" "$BLOCK_FLAG" \
         "sudo locked rm $(shq "$f")" "removes it through a bounded window" \
-        "sudo locked mv $(shq "$f") <new>" "renames it through the same window"
+        "sudo locked mv $(shq "$f") NEW" "renames it through the same window"
     else
       # There is nothing there to remove or rename, so offering the verbs
       # that do those would only produce commands that refuse.

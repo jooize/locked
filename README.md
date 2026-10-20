@@ -188,7 +188,7 @@ for p in /usr/local/sbin /usr/local /usr; do
 done
 # Expect each line: owner "root" (any group) with mode 755 (or stricter: 750, 700, ...).
 ```
-If any ancestor is user-owned -- common on Intel Macs where Homebrew once `chown`ed `/usr/local` -- repair before continuing: `sudo chown root:wheel <path> && sudo chmod 755 <path>`.
+If any ancestor is user-owned -- common on Intel Macs where Homebrew once `chown`ed `/usr/local` -- repair before continuing: `sudo chown root:wheel PATH && sudo chmod 755 PATH`.
 
 Then install:
 ```sh
@@ -398,7 +398,7 @@ The `owner`/`group`/`mode` restore targets are captured on the first `lock` of a
 **content.** `unlock`, `lock` and `revert` chown and chmod the node back to the recorded values. So:
 - Accidental `chmod 666 ~/.ssh/authorized_keys` while unlocked -- next lock restores the captured mode.
 - An attacker that gets a single chmod through (somehow) is undone the next cycle.
-- To intentionally change the captured mode/owner, edit `.meta` directly: `sudo -u _jooize-lock vi /var/db/locked/jooize/pool/<encoded>.meta`. (Or `unprotect` it and `lock` it again: a fresh seal recaptures them.)
+- To intentionally change the captured mode/owner, edit `.meta` directly: `sudo -u _jooize-lock vi /var/db/locked/jooize/pool/ENCODED.meta`. (Or `unprotect` it and `lock` it again: a fresh seal recaptures them.)
 
 **placement.** `unlock` clears `uappnd` and nothing else. The directory stays lock-account owned, with its ACL entry, for the whole window, on purpose: the owner has to be the lock account because `uappnd` is a user flag its owner could clear, and the entry is the one way you still reach into it. The entry only adds, so even with the flag off you cannot rename or remove what is in the directory -- `locked rm` and `locked mv` do that, as root. The recorded `owner`/`group`/`mode` are the pre-adoption identity, not a restore target for an unlock. The next `lock` of a file whose chain runs through it re-applies the flag, and refuses if the entry is gone. The one place that identity *is* restored is a release: once no protected file needs the directory it leaves the pool, so it goes all the way back -- flag off, the seal's entry off, owner, group and mode as they were.
 
@@ -412,7 +412,7 @@ A placement seal gives the directory to the lock account, because `uappnd` is a 
 user:jooize allow list,add_file,search,add_subdirectory,readattr,readextattr,readsecurity
 ```
 
-The rights are what the directory's owner bits gave you before the seal, minus anything that removes or renames an entry (`delete`, `delete_child`) or changes the directory itself (`writeattr`, `writeextattr`, `writesecurity`, `chown`). Only the owner or root can change an ACL, so you cannot strip or widen the entry, and it carries no inherit flags. The directory's group and mode stay what they were, and so do any ACL entries it already had: `~/Library` ships with Apple's `group:everyone deny delete`. The record keeps the entry, `verify` checks that it is there exactly, and a release takes off that entry and no other. `ls -le <dir>` shows it.
+The rights are what the directory's owner bits gave you before the seal, minus anything that removes or renames an entry (`delete`, `delete_child`) or changes the directory itself (`writeattr`, `writeextattr`, `writesecurity`, `chown`). Only the owner or root can change an ACL, so you cannot strip or widen the entry, and it carries no inherit flags. The directory's group and mode stay what they were, and so do any ACL entries it already had: `~/Library` ships with Apple's `group:everyone deny delete`. The record keeps the entry, `verify` checks that it is there exactly, and a release takes off that entry and no other. `ls -le DIR` shows it.
 
 **What you create there is ordinary.** On macOS, as on every BSD, a new file or directory takes its group from the directory it is created in, and the directory's group is still yours (usually `staff`). Nothing inherits the entry.
 
@@ -434,7 +434,7 @@ and does not guarantee is written out in
   script -- cannot answer the confirm gate: `locked` refuses unless
   `--yes` is given, and `--yes` skips the gate, so the diff is approved
   unseen. Run `locked` from a real terminal when you want the gate.
-- First lock assumes file is currently owned by you. To bring a file owned by someone else into the pool: `sudo chown -h <you>:staff <file>` first, then `sudo locked lock <file>` captures meta and locks. Or hand-write the meta file before unlocking once.
+- First lock assumes file is currently owned by you. To bring a file owned by someone else into the pool: `sudo chown -h YOU:staff FILE` first, then `sudo locked lock FILE` captures meta and locks. Or hand-write the meta file before unlocking once.
 - Other admins on the same machine can read snapshots via `sudo` (root reads all). Only encryption fixes that; not in scope here.
 - Records written before 0.6.0 identify their node by `dev.ino`. They still match (the inode is what proves the node), and the next root `status`, `lock` or `unlock` rewrites the field to the volume-uuid form with an `info` line. An unprivileged `status` says so and names the command that does it.
 - `readlink -f` requires macOS 12+. On older macOS, replace with `realpath` or a Python one-liner.
@@ -471,15 +471,15 @@ Useful for spotting unexpected lock/unlock cycles. The log records `user=`, `act
 To delete the file itself, use the mediated verb -- it does the removal
 through the window and retires the record in one step:
 ```sh
-sudo locked rm <file>        # or: sudo locked trash <file>
+sudo locked rm FILE        # or: sudo locked trash FILE
 ```
 To keep the file but stop protecting it:
 ```sh
-sudo locked unprotect <file>
+sudo locked unprotect FILE
 ```
 It goes back to the owner, group and mode it had before the first lock,
 its record is retired, and directories nothing else needs are released
 with it.
 If something else already deleted the file and `verify` is flagging it:
-`sudo locked tombstone <file>` records it as gone, with you as the
+`sudo locked tombstone FILE` records it as gone, with you as the
 asserter.
