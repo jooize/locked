@@ -1236,6 +1236,7 @@ dw_rows() { # <color 0|1> <word> <weight> <detail>: one finding, drawn
     eval "$(sed -n -e '/^esc_into() {/,/^}/p' -e '/^set_pal() {/,/^}/p' \
       -e '/^vfind() {/,/^}/p' -e '/^verify_rows() {/,/^}/p' "$LOCKED")"
     if [ "$1" = 1 ]; then
+      # shellcheck disable=SC2329,SC2034  # the verify_rows eval'd above calls it and reads them
       set_pal() { P_OFF="${DW_ESC}[0m" P_DIM="${DW_ESC}[2m" P_RV="${DW_ESC}[7;31m"; }
     fi
     vfind "$2" "$3" "$4" | verify_rows "  "
