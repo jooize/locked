@@ -5045,9 +5045,9 @@ do_tombstone_one() {
 # a column padded to the widest of this walk, and the path last:
 #
 #   why: /Users/me/.zshrc
-#       ~  root:wheel    sunlnk  no record      /
-#       !  me:staff      sappnd  anchor locked  /Users/me
-#       !  _me-lock:...  uchg    content locked /Users/me/.zshrc
+#       ~  root:wheel         sunlnk  no record       /
+#       !  me:staff           sappnd  anchor locked   /Users/me
+#       !  _me-lock:_me-lock  uchg    content locked  /Users/me/.zshrc
 #
 # The marker answers one question: does this node constrain what is under
 # it? ! blocks removal and rename (yellow: attention), ~ carries some other
