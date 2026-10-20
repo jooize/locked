@@ -5130,8 +5130,9 @@ do_tombstone_one() {
 #
 # The marker answers one question: does this node constrain what is under
 # it? ! blocks removal and rename (yellow: attention), ~ carries some other
-# flag, - carries none (dim: absence). An empty column on every row is
-# left out.
+# flag, - carries none (dim: absence). The flags column is the fact the
+# display answers, so it prints plain; owner and record are context, dim.
+# An empty column on every row is left out.
 do_why_one() {
   local f
   f="$(abs_leaf "$1")" || return 1
@@ -5180,11 +5181,11 @@ do_why_one() {
   for n in "${nodes[@]}"; do
     esc_into ef "$n" "$P_RV"
     {
-      printf '    %s  %s' "${marks[$i]}" "$P_DIM"
-      [ "$ow" -eq 0 ] || printf '%-*s  ' "$ow" "${owners[$i]}"
+      printf '    %s  ' "${marks[$i]}"
+      [ "$ow" -eq 0 ] || printf '%s%-*s%s  ' "$P_DIM" "$ow" "${owners[$i]}" "$P_OFF"
       [ "$fw" -eq 0 ] || printf '%-*s  ' "$fw" "${flagss[$i]}"
-      [ "$rw" -eq 0 ] || printf '%-*s  ' "$rw" "${records[$i]}"
-      printf '%s%s\n' "$P_OFF" "$ef"
+      [ "$rw" -eq 0 ] || printf '%s%-*s%s  ' "$P_DIM" "$rw" "${records[$i]}" "$P_OFF"
+      printf '%s\n' "$ef"
     }
     i=$((i + 1))
   done
