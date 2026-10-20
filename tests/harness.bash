@@ -2185,7 +2185,7 @@ check "the record is in volume form"           "vol" "$(id_form_of "$(meta_get "
 put_id "$IDL" "999.$IDINO"
 locked status "$IDL" >"$OUTF" 2>&1 || true
 ok   "status reports the upgrade"              grep -qF "identity record upgraded" "$OUTF"
-deny "and does not call it drift"              grep -qF "DRIFT" "$OUTF"
+deny "and does not call it drift"              grep -qF "drift" "$OUTF"
 check "the record is in volume form again"     "vol" "$(id_form_of "$(meta_get "$IDL" id)")"
 check "and still names the same inode"         "$IDINO" "$(meta_get "$IDL" id | sed 's/.*\.//')"
 ok   "verify is clean after the upgrade"       locked verify --quiet

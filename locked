@@ -392,7 +392,7 @@ ok_move() {
 # characters that are there (esc_into) and ends the line, where nothing
 # can follow it (terminal-output Rows: errors, refusals and log lines put
 # the value last). <text> is locked's own words, styled by the caller.
-# say_err is the same on stderr; err_val puts the red ERROR: label first.
+# say_err is the same on stderr; err_val puts the red `✗ error:` label first.
 say_out() {
   local v
   esc_into v "$2" "$C_RV"
@@ -403,7 +403,7 @@ say_err() {
   esc_into v "$2" "$E_RV"
   printf '%s: %s\n' "$1" "$v" >&2
 }
-err_val() { say_err "${E_RED}${E_B}ERROR:${E_OFF} $1" "$2"; }
+err_val() { say_err "${E_RED}${E_B}✗ error:${E_OFF} $1" "$2"; }
 
 # path_lines <indent> <path>...: one path per line on stdout, each escaped
 # and alone on its line. Prints with set_pal, so a caller sends it to
@@ -1218,10 +1218,10 @@ do_setup() {
   # and group, digest-pinned sudoers, verify daemon. Refuse rather than
   # fight the declarative config; a rebuild is the whole setup there.
   if nix_managed; then
-    echo "${E_RED}${E_B}ERROR:${E_OFF} this locked is nix-managed; setup here is declarative." >&2
-    echo "       Change the nix module config (security.locked) and rebuild" >&2
-    echo "       instead. Standalone setup remains available by running" >&2
-    echo "       ./locked setup from a repo checkout." >&2
+    echo "${E_RED}${E_B}✗ error:${E_OFF} this locked is nix-managed; setup here is declarative." >&2
+    echo "         Change the nix module config (security.locked) and rebuild" >&2
+    echo "         instead. Standalone setup remains available by running" >&2
+    echo "         ./locked setup from a repo checkout." >&2
     exit 1
   fi
 
@@ -1237,7 +1237,7 @@ do_setup() {
   local p="$target_dir"
   while [ "$p" != "/" ]; do
     verify_root_owned_path "$p" || {
-      echo "       refusing to install: a non-root owner of an ancestor dir can replace the binary" >&2
+      echo "         refusing to install: a non-root owner of an ancestor dir can replace the binary" >&2
       exit 1
     }
     p="$(dirname "$p")"
@@ -1446,9 +1446,9 @@ verify_helper() {
 verify_helper_now() {
   if [ ! -f "$LOCKED_HELPER" ]; then
     err_val "window helper not found" "$LOCKED_HELPER"
-    echo "       every verb needs it -- it opens the mediated window and it" >&2
-    echo "       reads node identity (nix: rebuild; standalone: build" >&2
-    echo "       helper/locked-helper.m and install it root-owned 755)" >&2
+    echo "         every verb needs it -- it opens the mediated window and it" >&2
+    echo "         reads node identity (nix: rebuild; standalone: build" >&2
+    echo "         helper/locked-helper.m and install it root-owned 755)" >&2
     return 1
   fi
   [ -x "$LOCKED_HELPER" ] || { err_val "window helper is not executable" "$LOCKED_HELPER"; return 1; }
@@ -1503,12 +1503,12 @@ convert_legacy_layout() {
     acct="${LOCKED_LOCK_ACCOUNT:-$(lock_account_for "$name")}"
     dest="$LOCKED_STATE_ROOT/$name"
     if [ -e "$dest/pool" ]; then
-      echo "${E_RED}${E_B}ERROR:${E_OFF} a pool exists at both paths; move one by hand" >&2
+      echo "${E_RED}${E_B}✗ error:${E_OFF} a pool exists at both paths; move one by hand" >&2
       value_rows "  " legacy id "$old" pool id "$dest/pool" >&2
       return 1
     fi
     if [ "$(stat -f '%d' "$old")" != "$(stat -f '%d' "$LOCKED_STATE_ROOT")" ]; then
-      echo "${E_RED}${E_B}ERROR:${E_OFF} the pool and the state root are on different filesystems; refusing a copying move" >&2
+      echo "${E_RED}${E_B}✗ error:${E_OFF} the pool and the state root are on different filesystems; refusing a copying move" >&2
       value_rows "  " pool id "$old" "state root" id "$LOCKED_STATE_ROOT" >&2
       return 1
     fi
@@ -1664,7 +1664,7 @@ atomic_replace() {
   dst_dev="$(stat -f '%d' "$dst_parent")"
   if [ "$stage_dev" != "$dst_dev" ]; then
     rm -f -- "$tmp"
-    echo "${E_RED}${E_B}ERROR:${E_OFF} the destination is on a different filesystem from staging; refusing a non-atomic mv" >&2
+    echo "${E_RED}${E_B}✗ error:${E_OFF} the destination is on a different filesystem from staging; refusing a non-atomic mv" >&2
     value_rows "  " destination id "$dst" staging id "$stage_dir" >&2
     return 1
   fi
@@ -1746,13 +1746,13 @@ snap_paths() { # sets ENC SNAP SNAPDIR ATTIC META for path $1
 # of known width, the path last, each detail on a dim line under it in the
 # path's column (terminal-output Rows):
 #
-#   DRIFT  /Users/me/.zshrc
+#   drift  /Users/me/.zshrc
 #          owner jooize, expected _jooize-lock
 #          mode 644, expected 444
 #   open   /Users/me/.config/zsh
 #          intentionally unlocked; relock with: sudo locked lock
 #
-# The words: DRIFT, open (deliberately unlocked), info (a record locked
+# The words: drift, open (deliberately unlocked), info (a record locked
 # repaired on its way to clean), note (a repair that needs root). A path
 # inside a detail is escaped as the detail is composed, so the detail is
 # one line whatever the name holds, and the hidden escapes resume the dim.
@@ -1777,7 +1777,7 @@ verify_unescape() {
 # each run of one word is a row, `<indent><word>  <path>`, its details
 # under it. Without one -- the path already ends the row above, a status
 # row or an error -- the details alone, at <indent>, a word other than
-# DRIFT leading its own detail (`info: ...`).
+# drift leading its own detail (`info: ...`).
 verify_rows() {
   local ind="$1" p="" word det last="" ep col
   if [ -n "${2:-}" ]; then
@@ -1793,7 +1793,7 @@ verify_rows() {
         last="$word"
       fi
       printf '%*s%s%s%s\n' "$col" '' "$C_DIM" "$det" "$C_OFF"
-    elif [ "$word" = "DRIFT" ]; then
+    elif [ "$word" = "drift" ]; then
       printf '%s%s%s%s\n' "$ind" "$C_DIM" "$det" "$C_OFF"
     else
       printf '%s%s%s: %s%s\n' "$ind" "$C_DIM" "$word" "$det" "$C_OFF"
@@ -1817,7 +1817,7 @@ upgrade_identity_record() { # <path> <metafile> <live id>
     return 0
   fi
   vpath em "$meta"
-  vline DRIFT "identity record could not be upgraded: $em"
+  vline drift "identity record could not be upgraded: $em"
   return 1
 }
 
@@ -1844,7 +1844,7 @@ verify_node() {
     case "$(meta_field "$meta" role)" in
       leaf|chain) ;;
       *)
-        vline DRIFT "record has no role (written before locked 0.13.0)"
+        vline drift "record has no role (written before locked 0.13.0)"
         return 1
         ;;
     esac
@@ -1852,7 +1852,7 @@ verify_node() {
     # still has the pre-0.14.0 shape (lock group, group write), and a
     # release would have no entry to take off.
     if [ "$tier" = "placement" ] && [ -z "$(meta_field "$meta" acl)" ]; then
-      vline DRIFT "placement record has no ACL entry (written before locked 0.14.0)"
+      vline drift "placement record has no ACL entry (written before locked 0.14.0)"
       return 1
     fi
   fi
@@ -1867,13 +1867,13 @@ verify_node() {
   if [ "$state" = "suspended" ]; then
     bin="$(meta_field "$meta" bin)"
     if [ -e "$f" ] || [ -L "$f" ]; then
-      vline DRIFT "back from the trash and unsealed"
+      vline drift "back from the trash and unsealed"
       if [ -n "$bin" ]; then
         vpath ep "$bin"
-        vline DRIFT "it was in the bin at: $ep"
+        vline drift "it was in the bin at: $ep"
       fi
       vpath ep "$f"
-      vline DRIFT "relock it with: sudo locked lock $ep"
+      vline drift "relock it with: sudo locked lock $ep"
       return 1
     fi
     if [ -n "$bin" ] && [ ! -e "$bin" ] && [ ! -L "$bin" ]; then
@@ -1892,7 +1892,7 @@ verify_node() {
         return 0
       fi
       vpath ep "$meta"
-      vline DRIFT "suspended, and its record could not be finalized: $ep"
+      vline drift "suspended, and its record could not be finalized: $ep"
       return 1
     fi
     return 0
@@ -1903,7 +1903,7 @@ verify_node() {
   # exactly as before. Only -e would call it missing and report drift on a
   # node nothing touched.
   if [ ! -e "$f" ] && [ ! -L "$f" ]; then
-    vline DRIFT "missing"
+    vline drift "missing"
     return 1
   fi
   # An edit whose install check failed left a line on the record, and it
@@ -1921,7 +1921,7 @@ verify_node() {
     mrest="${mrest#* }"
     mwhat="${mrest%% *}"
     vpath ep "$(verify_unescape "${mrest#* }")"
-    vline DRIFT "an edit at $mat did not install as approved ($mwhat): $ep"
+    vline drift "an edit at $mat did not install as approved ($mwhat): $ep"
     mbad=1
   done
   if [ "$state" = "unlocked" ]; then
@@ -1933,22 +1933,22 @@ verify_node() {
   case "$tier" in
     content|placement) want_owner="$lu" ;;
     anchor)            want_owner="$owner" ;;
-    *) vline DRIFT "meta has unknown tier '$tier'"; return 1 ;;
+    *) vline drift "meta has unknown tier '$tier'"; return 1 ;;
   esac
   cur="$(stat -f '%Su' "$f")"
-  [ "$cur" = "$want_owner" ] || { vline DRIFT "owner $cur, expected $want_owner"; bad=1; }
+  [ "$cur" = "$want_owner" ] || { vline drift "owner $cur, expected $want_owner"; bad=1; }
   cur="$(stat -f '%OLp' "$f")"
-  [ "$cur" = "$lockmode" ] || { vline DRIFT "mode $cur, expected $lockmode"; bad=1; }
+  [ "$cur" = "$lockmode" ] || { vline drift "mode $cur, expected $lockmode"; bad=1; }
   cur="$(flags_of "$f")"
-  [ "$cur" = "$flagsym" ] || { vline DRIFT "flags '$cur', expected '$flagsym'"; bad=1; }
+  [ "$cur" = "$flagsym" ] || { vline drift "flags '$cur', expected '$flagsym'"; bad=1; }
   # Placement keeps the directory's own group, and lets the invoker in
   # through exactly the recorded entry (placement_entry). Either one
   # changing takes root, so either one changing is drift.
   if [ "$tier" = "placement" ]; then
     cur="$(stat -f '%Sg' "$f")"
-    [ "$cur" = "$group" ] || { vline DRIFT "group $cur, expected $group"; bad=1; }
+    [ "$cur" = "$group" ] || { vline drift "group $cur, expected $group"; bad=1; }
     cur="$(meta_field "$meta" acl)"
-    acl_has "$f" "$cur" || { vline DRIFT "ACL entry missing or changed, expected '$cur'"; bad=1; }
+    acl_has "$f" "$cur" || { vline drift "ACL entry missing or changed, expected '$cur'"; bad=1; }
   fi
   local sn=0
   if cur="$(node_id "$f")"; then
@@ -1959,8 +1959,8 @@ verify_node() {
   case "$sn" in
     0) ;;
     2) upgrade_identity_record "$f" "$meta" "$cur" || bad=1 ;;
-    3) vline DRIFT "identity could not be read (the window helper is unavailable)"; bad=1 ;;
-    *) vline DRIFT "identity $cur, expected $id (node replaced)"; bad=1 ;;
+    3) vline drift "identity could not be read (the window helper is unavailable)"; bad=1 ;;
+    *) vline drift "identity $cur, expected $id (node replaced)"; bad=1 ;;
   esac
 
   # The first three stray nodes, read NUL-separated, so a name holding a
@@ -1973,10 +1973,10 @@ verify_node() {
       [ "${#stray[@]}" -lt 3 ] || break
     done < <(find "$f" \( ! -user "$lu" -o ! -flags +uchg \) -print0 2>/dev/null)
     if [ "${#stray[@]}" -gt 0 ]; then
-      vline DRIFT "tree nodes without lock ownership or uchg:"
+      vline drift "tree nodes without lock ownership or uchg:"
       for sp in "${stray[@]}"; do
         vpath ep "$sp"
-        vline DRIFT "  $ep"
+        vline drift "  $ep"
       done
       bad=1
     fi
@@ -3047,7 +3047,7 @@ abs_leaf() { # <path>
   b="$(basename "$p")"
   case "$b" in
     .|..|/)
-      say_err "${E_RED}${E_B}refusing:${E_OFF} names a directory, not an entry inside one" "$p"
+      say_err "${E_RED}${E_B}✗ refusing:${E_OFF} names a directory, not an entry inside one" "$p"
       return 1
       ;;
   esac
@@ -3056,7 +3056,7 @@ abs_leaf() { # <path>
   # Say that here instead of surfacing a bare usage error from inside it.
   case "$b" in
     *$'\t'*|*$'\n'*)
-      say_err "${E_RED}${E_B}refusing:${E_OFF} the entry name contains a tab or newline" "$p"
+      say_err "${E_RED}${E_B}✗ refusing:${E_OFF} the entry name contains a tab or newline" "$p"
       echo "  the window helper refuses those; rename it first" >&2
       return 1
       ;;
@@ -3253,19 +3253,19 @@ helper_outcome() { # <verb> <path>
     2)
       local ef
       esc_into ef "$f" "$E_RV" "$E_CYN"
-      say_err "${E_RED}${E_B}refused:${E_OFF} the node the helper opened is not the one recorded" "$f"
+      say_err "${E_RED}${E_B}✗ refused:${E_OFF} the node the helper opened is not the one recorded" "$f"
       echo "  nothing was changed. Check it, then re-run: ${E_CYN}sudo locked status $ef${E_OFF}" >&2
       log_action "$verb" "$f" refuse-identity
       return 1
       ;;
     3)
-      say_err "${E_RED}${E_B}failed:${E_OFF} the operation did not happen" "$f"
+      say_err "${E_RED}${E_B}✗ failed:${E_OFF} the operation did not happen" "$f"
       log_action "$verb" "$f" fail
       return 1
       ;;
     4)
-      echo "${E_RED}${E_B}ERROR:${E_OFF} the window helper refused the request as malformed, or is" >&2
-      say_err "       not running as root" "$LOCKED_HELPER"
+      echo "${E_RED}${E_B}✗ error:${E_OFF} the window helper refused the request as malformed, or is" >&2
+      say_err "         not running as root" "$LOCKED_HELPER"
       log_action "$verb" "$f" fail-helper
       return 1
       ;;
@@ -3302,8 +3302,8 @@ helper_outcome() { # <verb> <path>
       return 0
       ;;
     *)
-      echo "${E_RED}${E_B}ERROR:${E_OFF} the window helper exited $HELPER_RC, which locked does not" >&2
-      say_err "       know how to read; treating the target as unchanged" "$f"
+      echo "${E_RED}${E_B}✗ error:${E_OFF} the window helper exited $HELPER_RC, which locked does not" >&2
+      say_err "         know how to read; treating the target as unchanged" "$f"
       log_action "$verb" "$f" fail-unknown
       return 1
       ;;
@@ -3414,7 +3414,7 @@ subtree_gate() { # <verb> <target>
     other="$(pool_records_under "${udir}pool" "$target")"
     [ -n "$other" ] || continue
     if [ "$foreign" -eq 0 ]; then
-      say_err "${E_RED}${E_B}refusing $verb:${E_OFF} it holds locked records that are not yours" "$target"
+      say_err "${E_RED}${E_B}✗ refusing $verb:${E_OFF} it holds locked records that are not yours" "$target"
       foreign=1
     fi
     echo "  pool of $uname:" >&2
@@ -3453,7 +3453,7 @@ EOF
     set_pal
     local et
     esc_into et "$target" "$P_RV"
-    echo "${P_RED}${P_B}refusing $verb:${P_OFF} locked records live under it: $et"
+    echo "${P_RED}${P_B}✗ refusing $verb:${P_OFF} locked records live under it: $et"
     echo
     echo "${P_B}records under it:${P_OFF}"
     while IFS= read -r p; do
@@ -3700,8 +3700,8 @@ do_lock_one() {
     rec_role="$(meta_field "$META" role)"
     if [ "$(meta_field "$META" tier)" = "placement" ]; then
       err_val "sealed as a chain directory for the files under it" "$f"
-      echo "       Protecting it as content would freeze everything inside it. Protect" >&2
-      echo "       the files you mean instead; this seal goes when nothing needs it." >&2
+      echo "         Protecting it as content would freeze everything inside it. Protect" >&2
+      echo "         the files you mean instead; this seal goes when nothing needs it." >&2
       log_action lock "$f" refuse-chain-dir
       return 1
     fi
@@ -3713,8 +3713,8 @@ do_lock_one() {
   # seals a node as itself, which is the whole point of naming a link here.
   if [ "$is_link" -eq 1 ] && [ "$leaf_tier" != "content" ]; then
     err_val "a symlink under ~/.ssh; the anchor tier does not apply to a link" "$f"
-    echo "       A link has no ownership the OS checks -- content is the only" >&2
-    echo "       tier that seals the link node itself. Name its target instead." >&2
+    echo "         A link has no ownership the OS checks -- content is the only" >&2
+    echo "         tier that seals the link node itself. Name its target instead." >&2
     log_action lock "$f" refuse-link-tier
     return 1
   fi
@@ -4787,7 +4787,7 @@ do_trash_one() {
   # The trash is a per-user destination. With no invoking user there is no
   # bin to put anything in, and root's own would be the wrong answer.
   if [ -z "$inv" ]; then
-    echo "${E_RED}${E_B}refusing trash:${E_OFF} no invoking user, so there is no bin to trash into" >&2
+    echo "${E_RED}${E_B}✗ refusing trash:${E_OFF} no invoking user, so there is no bin to trash into" >&2
     echo "  use rm if the node really should be removed outright" >&2
     return 1
   fi
@@ -4795,7 +4795,7 @@ do_trash_one() {
   uid="$(id -u "$inv")"
   gid="$(id -g "$inv")"
   if [ "$uid" = "0" ]; then
-    echo "${E_RED}${E_B}refusing trash:${E_OFF} the invoker is root, whose bin is not where you" >&2
+    echo "${E_RED}${E_B}✗ refusing trash:${E_OFF} the invoker is root, whose bin is not where you" >&2
     echo "  meant this to go. Run it as yourself, or use rm." >&2
     return 1
   fi
@@ -4813,7 +4813,7 @@ do_trash_one() {
   # The mode bits are the whole answer this reads, which holds for
   # placement because the entry adds nothing that removes an entry.
   if ! user_can_write_dir "$inv" "$parent"; then
-    say_err "${E_RED}${E_B}refusing trash:${E_OFF} $inv cannot write the directory it is in" "$parent"
+    say_err "${E_RED}${E_B}✗ refusing trash:${E_OFF} $inv cannot write the directory it is in" "$parent"
     echo "  The trash service runs as you, not as root, so the move out of" >&2
     echo "  that directory needs your own rights on it -- releasing the flag" >&2
     echo "  does not grant them." >&2
@@ -4867,7 +4867,7 @@ do_mv() { # <old> <new>
     return 1
   fi
   if [ -e "$new" ] || [ -L "$new" ]; then
-    say_err "${E_RED}${E_B}refusing:${E_OFF} the new path already exists; locked mv never clobbers" "$new"
+    say_err "${E_RED}${E_B}✗ refusing:${E_OFF} the new path already exists; locked mv never clobbers" "$new"
     log_action mv "$old" refuse-exists
     return 1
   fi
@@ -4875,14 +4875,14 @@ do_mv() { # <old> <new>
   oldparent="$(dirname "$old")"
   newparent="$(dirname "$new")"
   if [ ! -d "$newparent" ]; then
-    say_err "${E_RED}${E_B}refusing:${E_OFF} not a directory" "$newparent"
+    say_err "${E_RED}${E_B}✗ refusing:${E_OFF} not a directory" "$newparent"
     return 1
   fi
   # Rename cannot cross filesystems, and a copy+delete would drop the BSD
   # flags and xattrs this tool exists to keep. Say so here rather than
   # letting an EXDEV from inside the window explain it later.
   if [ "$(stat -f '%d' "$oldparent")" != "$(stat -f '%d' "$newparent")" ]; then
-    echo "${E_RED}${E_B}refusing:${E_OFF} the two paths are on different filesystems" >&2
+    echo "${E_RED}${E_B}✗ refusing:${E_OFF} the two paths are on different filesystems" >&2
     value_rows "  " old id "$old" new id "$new" >&2
     echo "  a copy would drop flags and xattrs, so locked will not do it" >&2
     log_action mv "$old" refuse-xdev
@@ -4964,7 +4964,7 @@ do_rekey() { # <old> <new>
   fi
   want="$(meta_field "$META" id)"
   if [ ! -e "$new" ] && [ ! -L "$new" ]; then
-    say_err "${E_RED}${E_B}refusing:${E_OFF} does not exist" "$new"
+    say_err "${E_RED}${E_B}✗ refusing:${E_OFF} does not exist" "$new"
     cmd_rows "  " "sudo locked tombstone $old" "records it as gone instead" >&2
     return 1
   fi
@@ -4975,7 +4975,7 @@ do_rekey() { # <old> <new>
   # rewrites its id field, and refusing the repair over a spelling would be
   # the reboot bug all over again.
   if [ "$sn" -eq 1 ]; then
-    say_err "${E_RED}${E_B}refusing:${E_OFF} the node here is not the one that record describes" "$new"
+    say_err "${E_RED}${E_B}✗ refusing:${E_OFF} the node here is not the one that record describes" "$new"
     value_rows "  " record id "$old" "recorded id" plain "$want" "id here" plain "$cur" >&2
     echo "  Re-keying would attach its snapshot and flag history to a different file." >&2
     cmd_rows "  " "sudo locked tombstone $old" "if the recorded node is really gone" >&2
@@ -5569,7 +5569,7 @@ do_verify() {
     total_drift=$((total_drift + ${#drifted[@]}))
   done
   if [ "$total_drift" -gt 0 ]; then
-    echo "${E_RED}${E_B}verify: $total_drift node(s) drifted${E_OFF}" >&2
+    echo "${E_RED}${E_B}✗ verify: $total_drift node(s) drifted${E_OFF}" >&2
     log_action verify "" "drift-$total_drift"
     return 5
   fi
