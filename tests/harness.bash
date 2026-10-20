@@ -45,6 +45,10 @@ set -euo pipefail
 IFS=$'\n\t'
 shopt -s nullglob
 
+# One backslash. Every escape a needle expects is built from it in code
+# ("${BSL}u{200B}"), so no escape is ever spelled out in this file.
+BSL='\'
+
 # ---- TAP output ------------------------------------------------------------
 #
 # Every line on stdout is a test point, a comment, the plan or a bail out.
@@ -1056,44 +1060,72 @@ dw_case() { # <name> <printf escapes> <label> <needle>...: one class, three site
 
 # The keep-raw needles are built from escapes so this file stays ascii and
 # the bytes are exactly the ones asserted: o with diaeresis, a rightwards
-# arrow, a Persian word with a zero width non-joiner between its two parts,
-# and a tab between two letters.
+# arrow and a tab between two letters. The Persian word keeps its letters
+# raw, but the zero width non-joiner between its two parts is on the
+# hidden list (U+2000-200F) and shows as its escape.
 DW_OE="$(printf '%b' '\xc3\xb6')"
 DW_ARROW="$(printf '%b' '\xe2\x86\x92')"
-DW_FA="$(printf '%b' '\xd9\x86\xd9\x85\xdb\x8c\xe2\x80\x8c\xd8\xae\xd9\x88\xd8\xa7\xd9\x87\xd9\x85')"
+DW_FA="$(printf '%b' '\xd9\x86\xd9\x85\xdb\x8c')${BSL}u{200C}$(printf '%b' '\xd8\xae\xd9\x88\xd8\xa7\xd9\x87\xd9\x85')"
 DW_TAB="$(printf '%b' 'tab\there')"
 
 dw_case esc  'esc \x1b[31mred\x1b[0m\n' \
-        'the escape as a token'             '\x{1B}'
+        'the escape escaped'                "${BSL}u{1B}"
 dw_case c0   'soh \x01 cr\x0d end\n' \
-        'start of heading as a token'       '\x{01}' \
-        'carriage return as a token'        '\x{0D}'
+        'start of heading escaped'          "${BSL}u{1}" \
+        'a lone carriage return escaped'    "${BSL}u{D}"
 dw_case del  'del \x7f end\n' \
-        'delete as a token'                 '\x{7F}'
+        'delete escaped'                    "${BSL}u{7F}"
 dw_case c1   'c1 \xc2\x85 end\n' \
-        'the c1 control as a token'         '\x{85}'
+        'the c1 control escaped'            "${BSL}u{85}"
 dw_case bidi 'bidi \xe2\x80\xae evil \xe2\x81\xa6 end\n' \
-        'the bidi override as a token'      '\x{202E}' \
-        'the bidi isolate as a token'       '\x{2066}'
+        'the bidi override escaped'         "${BSL}u{202E}" \
+        'the bidi isolate escaped'          "${BSL}u{2066}"
 dw_case zw   'zwsp \xe2\x80\x8b lrm \xe2\x80\x8e end\n' \
-        'zero width space as a token'       '\x{200B}' \
-        'the left-to-right mark as a token' '\x{200E}'
+        'zero width space escaped'          "${BSL}u{200B}" \
+        'the left-to-right mark escaped'    "${BSL}u{200E}"
+dw_case vs   'heart \xe2\x9d\xa4\xef\xb8\x8f nbsp \xc2\xa0 end\n' \
+        'a variation selector escaped'      "${BSL}u{FE0F}" \
+        'a no-break space escaped'          "${BSL}u{A0}"
 dw_case bom  '\xef\xbb\xbfbom on the first line\n' \
-        'a leading byte order mark'         '\x{FEFF}'
-dw_case bad  'bad \xc3 end\n' \
-        'the invalid byte as a token'       '\x{C3}'
+        'a leading byte order mark'         "${BSL}u{FEFF}"
+dw_case bad  'bad \xc3 caf\xc3\xa9\xff end\n' \
+        'the invalid byte as one escape'    "bad ${BSL}xC3 caf" \
+        'a valid sequence decoded first'    "caf$(printf '%b' '\xc3\xa9')${BSL}xFF end"
+dw_case bs   'lit \\u{41} and \\x41 end\n' \
+        'a backslash that would begin an escape, escaped' "lit ${BSL}u{5C}u{41} and ${BSL}u{5C}x41 end"
 dw_case keep '\xc3\xb6 \xe2\x86\x92 \xd9\x86\xd9\x85\xdb\x8c\xe2\x80\x8c\xd8\xae\xd9\x88\xd8\xa7\xd9\x87\xd9\x85 tab\there\n' \
         'o with diaeresis byte-exact'       "$DW_OE" \
         'the arrow byte-exact'              "$DW_ARROW" \
-        'the Persian word with its joiner'  "$DW_FA" \
+        'the Persian word, its joiner escaped' "$DW_FA" \
         'the tab byte-exact'                "$DW_TAB"
 
 ok   "verify clean after the witness round" locked verify
 
-note "diff witness: the filter is the only thing that emits an escape"
+note "diff witness: CRLF line endings are stated once, not escaped"
+# A carriage return before every line feed of the content is the file's
+# line-ending convention: the display says so once, above the diff, and
+# draws each pair as one break. The fixture is CRLF on both sides, so the
+# content relock's diff is CRLF throughout.
+CRF="$DWD/crlf.txt"
+printf 'one\r\ntwo\r\n' >"$CRF"
+chown "$INV:staff" "$CRF"
+CRRC=0
+locked lock --yes "$CRF" >/dev/null 2>&1 || CRRC=1
+locked unlock "$CRF" >/dev/null 2>&1 || CRRC=1
+printf 'one\r\nthree\r\n' >"$CRF"
+check "the CRLF fixture was set up"       "0" "$CRRC"
+locked lock --yes "$CRF" >"$DW" 2>&1 || CRRC=1
+check "the CRLF relock succeeded"         "0" "$CRRC"
+ok   "the relock states the line endings" grep -qxF "(CRLF line endings)" "$DW"
+ok   "and draws the pair as one break"    grep -qxF "+three" "$DW"
+deny "and escapes no carriage return"     grep -qF "${BSL}u{D}" "$DW"
+deny "nor prints one raw"                 grep -q $'\r' "$DW"
+
+note "diff witness: the renderer is the only thing that emits an escape"
 # The painter runs only on a tty, which this harness is not, so it is
 # exercised on the very source the script runs -- lifted out of locked by
-# the quotes that delimit it, never a second copy of the program.
+# the quotes that delimit it, never a second copy of the program. The same
+# program renders a path (field mode) and a diff (lines mode).
 #
 # The input is shaped like real unified output, because the file headers are
 # recognized by where they sit: the pair at the top, then a hunk, then a
@@ -1101,21 +1133,23 @@ note "diff witness: the filter is the only thing that emits an escape"
 # as --- not a header) and an added line beginning ++. Those two are content
 # and have to keep the colors of a removal and an addition -- painting a
 # removal as a header would be the falsification this filter exists to stop.
-DWFILT="$SCRATCH/diff-filter.pl"
-sed -n "/^readonly DIFF_FILTER='\$/,/^'\$/p" "$LOCKED" | sed '1d;$d' >"$DWFILT"
-ok   "the filter source was lifted out"    test -s "$DWFILT"
-ok   "the filter source compiles"          /usr/bin/perl -c "$DWFILT"
+DWFILT="$SCRATCH/untrusted.pl"
+sed -n "/^readonly UNTRUSTED_PL='\$/,/^'\$/p" "$LOCKED" | sed '1d;$d' >"$DWFILT"
+ok   "the renderer source was lifted out"  test -s "$DWFILT"
+ok   "the renderer source compiles"        /usr/bin/perl -c "$DWFILT"
 DWPIN="$SCRATCH/painter.in"
 DWPOUT="$SCRATCH/painter.out"
-printf '%b' '--- a\n+++ b\n@@ -1 +1 @@\n+add \x1b[31m\n-del\n--- not a header\n+++ not a header\n' \
+printf '%b' '--- a\n+++ b\n@@ -1 +1 @@\n+add \x1b[31m\n-del \xff\n--- not a header\n+++ not a header\n' \
       >"$DWPIN"
-/usr/bin/perl "$DWFILT" 1 <"$DWPIN" >"$DWPOUT" 2>&1 || true
+/usr/bin/perl "$DWFILT" lines 1 <"$DWPIN" >"$DWPOUT" 2>&1 || true
 check "an addition line opens green"       "1" \
       "$(grep -cF -- "${DW_ESC}[32m+add" "$DWPOUT" || true)"
-check "the token wears reverse video"      "1" \
-      "$(grep -cF -- "${DW_ESC}[7m\\x{1B}${DW_ESC}[27m" "$DWPOUT" || true)"
-check "reverse video ends, the line color does not" "1" \
-      "$(grep -cF -- "[31m${DW_ESC}[0m" "$DWPOUT" || true)"
+check "a hidden escape wears reverse red"  "1" \
+      "$(grep -cF -- "${DW_ESC}[7;31m${BSL}u{1B}${DW_ESC}[0m" "$DWPOUT" || true)"
+check "and the line color resumes after it" "1" \
+      "$(grep -cF -- "${BSL}u{1B}${DW_ESC}[0m${DW_ESC}[32m[31m${DW_ESC}[0m" "$DWPOUT" || true)"
+check "a kept escape takes the line's color, no style of its own" "1" \
+      "$(grep -cF -- "${DW_ESC}[31m-del ${BSL}xFF${DW_ESC}[0m" "$DWPOUT" || true)"
 check "a removal line opens red"           "1" \
       "$(grep -cF -- "${DW_ESC}[31m-del" "$DWPOUT" || true)"
 check "a hunk header opens cyan"           "1" \
@@ -1130,11 +1164,51 @@ check "an addition that reads like a header opens green" "1" \
       "$(grep -cF -- "${DW_ESC}[32m+++ not a header" "$DWPOUT" || true)"
 check "and neither of them goes magenta"   "0" \
       "$(grep -cF -- "${DW_ESC}[1;35m--- not a header" "$DWPOUT" || true)"
-/usr/bin/perl "$DWFILT" 0 <"$DWPIN" >"$DWPOUT" 2>&1 || true
+/usr/bin/perl "$DWFILT" lines 0 <"$DWPIN" >"$DWPOUT" 2>&1 || true
 check "color off emits no escape at all"   "0" \
       "$(LC_ALL=C grep -c -- "$DW_ESC" "$DWPOUT" || true)"
-check "color off still encodes the token"  "1" \
-      "$(grep -cF -- '\x{1B}' "$DWPOUT" || true)"
+check "color off still escapes the character" "1" \
+      "$(grep -cF -- "${BSL}u{1B}" "$DWPOUT" || true)"
+
+# Line endings: CRLF throughout is stated through the facts file and drawn
+# as plain breaks; a mix keeps every carriage return escaped, and so does
+# a call with no facts file. A content line whose newline diff added (the
+# no-newline marker follows it) is not counted.
+DWFACTS="$SCRATCH/painter.facts"
+: >"$DWFACTS"
+printf '%b' '--- a\n+++ b\n@@ -1,2 +1,2 @@\n one\r\n-two\r\n+three\r\n' \
+  | /usr/bin/perl "$DWFILT" lines 0 "$DWFACTS" >"$DWPOUT" 2>&1 || true
+check "CRLF throughout is reported"        "crlf" "$(cat "$DWFACTS")"
+check "and drawn without the carriage returns" "0" \
+      "$(LC_ALL=C grep -c $'\r' "$DWPOUT" || true)"
+check "and without their escapes"          "0" \
+      "$(grep -cF -- "${BSL}u{D}" "$DWPOUT" || true)"
+: >"$DWFACTS"
+printf '%b' '--- a\n+++ b\n@@ -1 +1 @@\n-two\n+three\r\n' \
+  | /usr/bin/perl "$DWFILT" lines 0 "$DWFACTS" >"$DWPOUT" 2>&1 || true
+check "mixed endings are not reported"     "" "$(cat "$DWFACTS")"
+check "and their carriage return is escaped" "1" \
+      "$(grep -cxF -- "+three${BSL}u{D}" "$DWPOUT" || true)"
+: >"$DWFACTS"
+printf '%b' '--- a\n+++ b\n@@ -1 +1 @@\n-two\r\n+three\r\n\\ No newline at end of file\n' \
+  | /usr/bin/perl "$DWFILT" lines 0 "$DWFACTS" >"$DWPOUT" 2>&1 || true
+check "a last line without a newline still reads as CRLF" "crlf" "$(cat "$DWFACTS")"
+check "and its own carriage return stays escaped" "1" \
+      "$(grep -cxF -- "+three${BSL}u{D}" "$DWPOUT" || true)"
+printf '%b' '--- a\n+++ b\n@@ -1 +1 @@\n-two\r\n+three\r\n' \
+  | /usr/bin/perl "$DWFILT" lines 0 >"$DWPOUT" 2>&1 || true
+check "without a facts file every carriage return is escaped" "2" \
+      "$(grep -cF -- "${BSL}u{D}" "$DWPOUT" || true)"
+
+# Field mode, the form every path takes: a tab and a line feed are
+# escaped (a value sits on one row), and only the bytes that fail UTF-8
+# are escaped as bytes.
+check "a field escapes its tab and line feed" "a${BSL}u{9}b${BSL}u{A}c" \
+      "$(printf 'a\tb\nc' | /usr/bin/perl "$DWFILT" field)"
+check "a field decodes before it escapes bytes" "$(printf '%b' 'caf\xc3\xa9')${BSL}xFF" \
+      "$(printf '%b' 'caf\xc3\xa9\xff' | /usr/bin/perl "$DWFILT" field)"
+check "a field wraps only the hidden escape in its style" "<rv>${BSL}u{200B}<on>x${BSL}xFF" \
+      "$(printf '%b' '\xe2\x80\x8bx\xff' | /usr/bin/perl "$DWFILT" field '<rv>' '<on>')"
 
 note "cli: dry-run mutates nothing"
 DR="$FAKE_HOME/dryrun.txt"

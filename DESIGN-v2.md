@@ -318,17 +318,24 @@ anywhere in the display path. diff's own color is disabled and `locked`
 paints the `+`, `-` and `@@` lines itself, so the only escape sequences
 reaching the terminal are locked's own.
 
-The diff then goes through locked's own encoder before it is drawn.
-Rendered as `\x{HH}` / `\x{HHHH}` tokens, in reverse video on a tty: the
-C0 controls except tab and newline, DEL, the C1 controls, the bidi
-overrides and isolates (U+202A-U+202E, U+2066-U+2069), U+200B, U+200E,
-U+200F and U+FEFF, and any byte that is not valid UTF-8. Tab, newline,
-ZWNJ, ZWJ and every other valid UTF-8 sequence pass raw.
+The diff then goes through the same renderer every path on screen goes
+through (the untrusted-text rules), before it is drawn. Every code point
+on the hidden list shows as `\u{HEX}` (uppercase, no leading zeros), in
+reverse red on a tty: the C0 and C1 controls, DEL, the no-break and
+other invisible spaces, the zero-width marks, joiners included, the bidi
+marks, embeddings, overrides and isolates, U+FEFF, the variation
+selectors and the tag characters (the full list is in the comment above
+`UNTRUSTED_PL`). A byte that is not valid UTF-8 shows as `\xHH`, one per
+byte, after every valid sequence is decoded. A literal backslash that
+would begin an escape is escaped itself, so an escape on screen is always
+one. Those two kept escapes take the line's own color, not the reserved
+style. Newline and tab are layout and pass raw. When a carriage return
+precedes every newline of the content, `locked` says `(CRLF line endings)`
+once above the diff and draws each pair as one break; any other carriage
+return is escaped.
 
-Two residuals. Homoglyphs are not distinguishable: a Cyrillic "а" is
-drawn the way a Latin "a" is. And off a tty there is no reverse video, so
-an encoded token is indistinguishable from a file that literally
-contains the text `\x{1B}`.
+One residual: homoglyphs are not distinguishable. A Cyrillic "а" is
+drawn the way a Latin "a" is.
 
 ### Callers without a tty
 
