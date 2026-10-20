@@ -1739,30 +1739,94 @@ snap_paths() { # sets ENC SNAP SNAPDIR ATTIC META for path $1
   META="$USER_POOL/${ENC}.meta"
 }
 
+# ---- verify findings ----------------------------------------------------------
+#
+# verify_node reports what it finds as lines of `<word><TAB><detail>`, one
+# finding per line, and verify_rows draws them: the word first, in a field
+# of known width, the path last, each detail on a dim line under it in the
+# path's column (terminal-output Rows):
+#
+#   DRIFT  /Users/me/.zshrc
+#          owner jooize, expected _jooize-lock
+#          mode 644, expected 444
+#   open   /Users/me/.config/zsh
+#          intentionally unlocked; relock with: sudo locked lock
+#
+# The words: DRIFT, open (deliberately unlocked), info (a record locked
+# repaired on its way to clean), note (a repair that needs root). A path
+# inside a detail is escaped as the detail is composed, so the detail is
+# one line whatever the name holds, and the hidden escapes resume the dim.
+# The palette is stdout's (C_*), fixed when locked starts, so a finding
+# captured in a command substitution keeps its color for the terminal it
+# is printed to.
+
+# vline <word> <detail>: one finding.
+vline() { printf '%s\t%s\n' "$1" "$2"; }
+
+# vpath <var> <path>: <path> escaped into <var>, for a detail line.
+vpath() { esc_into "$1" "$2" "$C_RV" "$C_DIM"; }
+
+# verify_unescape <text>: the bytes verify_escape wrote as \xHH, back as
+# bytes (either case), so a path from a record can be escaped for display
+# like any other.
+verify_unescape() {
+  /usr/bin/perl -e '$_ = $ARGV[0]; s/\\x([0-9A-Fa-f]{2})/chr(hex($1))/ge; print' -- "$1"
+}
+
+# verify_rows <indent> [<path>]: draw the findings on stdin. With a path,
+# each run of one word is a row, `<indent><word>  <path>`, its details
+# under it. Without one -- the path already ends the row above, a status
+# row or an error -- the details alone, at <indent>, a word other than
+# DRIFT leading its own detail (`info: ...`).
+verify_rows() {
+  local ind="$1" p="" word det last="" ep col
+  if [ -n "${2:-}" ]; then
+    esc_into ep "$2" "$C_RV"
+    p=1
+  fi
+  col=$(( ${#ind} + 5 + 2 ))
+  while IFS=$'\t' read -r word det; do
+    [ -n "$word" ] || continue
+    if [ -n "$p" ]; then
+      if [ "$word" != "$last" ]; then
+        printf '%s%-5s  %s\n' "$ind" "$word" "$ep"
+        last="$word"
+      fi
+      printf '%*s%s%s%s\n' "$col" '' "$C_DIM" "$det" "$C_OFF"
+    elif [ "$word" = "DRIFT" ]; then
+      printf '%s%s%s%s\n' "$ind" "$C_DIM" "$det" "$C_OFF"
+    else
+      printf '%s%s%s: %s%s\n' "$ind" "$C_DIM" "$word" "$det" "$C_OFF"
+    fi
+  done
+}
+
 # A pre-0.6.0 record names its node by st_dev, a number the kernel may have
 # handed to another volume at the last mount. The inode proves it is the
 # same node, so the record is corrected rather than reported -- the drift a
 # reboot invents is not drift. Root only: unprivileged status must never
 # write a pool it can merely read (same rule as the trash finalization).
 upgrade_identity_record() { # <path> <metafile> <live id>
-  local f="$1" meta="$2" cur="$3"
+  local f="$1" meta="$2" cur="$3" em
   if [ "$EUID" -ne 0 ]; then
-    echo "  note  $f: identity in legacy dev.ino form; sudo locked status rewrites it"
+    vline note "identity in legacy dev.ino form; sudo locked status rewrites it"
     return 0
   fi
   if rewrite_meta_id "$meta" "$cur"; then
-    echo "  info  $f: identity record upgraded (dev.ino → volume uuid)"
+    vline info "identity record upgraded (dev.ino → volume uuid)"
     return 0
   fi
-  echo "  DRIFT $f: identity record could not be upgraded ($meta)"
+  vpath em "$meta"
+  vline DRIFT "identity record could not be upgraded: $em"
   return 1
 }
 
 # verify_node <path> <metafile> <lock_user>
-# Prints drift descriptions; returns 0 clean/open, 1 drift.
+# Prints its findings (see verify_rows); returns 0 clean/open, 1 drift.
 verify_node() {
   local f="$1" meta="$2" lu="$3"
   local tier state flag flagsym mode lockmode owner group id recursive bin
+  local ep
   tier="$(meta_field "$meta" tier)"
   state="$(meta_field "$meta" state)"
   flag="$(meta_field "$meta" flag)"
@@ -1780,7 +1844,7 @@ verify_node() {
     case "$(meta_field "$meta" role)" in
       leaf|chain) ;;
       *)
-        echo "  DRIFT $f: record has no role (written before locked 0.13.0)"
+        vline DRIFT "record has no role (written before locked 0.13.0)"
         return 1
         ;;
     esac
@@ -1788,7 +1852,7 @@ verify_node() {
     # still has the pre-0.14.0 shape (lock group, group write), and a
     # release would have no entry to take off.
     if [ "$tier" = "placement" ] && [ -z "$(meta_field "$meta" acl)" ]; then
-      echo "  DRIFT $f: placement record has no ACL entry (written before locked 0.14.0)"
+      vline DRIFT "placement record has no ACL entry (written before locked 0.14.0)"
       return 1
     fi
   fi
@@ -1803,8 +1867,13 @@ verify_node() {
   if [ "$state" = "suspended" ]; then
     bin="$(meta_field "$meta" bin)"
     if [ -e "$f" ] || [ -L "$f" ]; then
-      echo "  DRIFT $f: back from the trash and unsealed (bin was ${bin:-unknown});"
-      echo "        re-lock it with: sudo locked lock $f"
+      vline DRIFT "back from the trash and unsealed"
+      if [ -n "$bin" ]; then
+        vpath ep "$bin"
+        vline DRIFT "it was in the bin at: $ep"
+      fi
+      vpath ep "$f"
+      vline DRIFT "relock it with: sudo locked lock $ep"
       return 1
     fi
     if [ -n "$bin" ] && [ ! -e "$bin" ] && [ ! -L "$bin" ]; then
@@ -1819,10 +1888,11 @@ verify_node() {
            "by=$(meta_field "$meta" by)" \
            "at=$(now_utc)" \
            "bin=$bin"; then
-        echo "  info  $f: trashed item no longer in the bin; record retired"
+        vline info "trashed item no longer in the bin; record retired"
         return 0
       fi
-      echo "  DRIFT $f: suspended, and its record could not be finalized ($meta)"
+      vpath ep "$meta"
+      vline DRIFT "suspended, and its record could not be finalized: $ep"
       return 1
     fi
     return 0
@@ -1833,12 +1903,14 @@ verify_node() {
   # exactly as before. Only -e would call it missing and report drift on a
   # node nothing touched.
   if [ ! -e "$f" ] && [ ! -L "$f" ]; then
-    echo "  DRIFT $f: missing"
+    vline DRIFT "missing"
     return 1
   fi
   # An edit whose install check failed left a line on the record, and it
   # stays drift -- unlocked or not -- until an edit of that file installs
-  # cleanly, or the record is sealed afresh (a relock or a revert).
+  # cleanly, or the record is sealed afresh (a relock or a revert). The
+  # record holds the file's path as verify_escape wrote it; it is shown
+  # as the characters it names.
   local mbad=0 mall mline mrest mat mwhat
   mall="$(mismatch_kv "$meta")"
   while [ -n "$mall" ]; do
@@ -1848,11 +1920,12 @@ verify_node() {
     mat="${mrest%% *}"
     mrest="${mrest#* }"
     mwhat="${mrest%% *}"
-    echo "  DRIFT $f: the edit of ${mrest#* } at $mat did not install as approved ($mwhat)"
+    vpath ep "$(verify_unescape "${mrest#* }")"
+    vline DRIFT "an edit at $mat did not install as approved ($mwhat): $ep"
     mbad=1
   done
   if [ "$state" = "unlocked" ]; then
-    echo "  open  $f (intentionally unlocked; relock with: sudo locked lock)"
+    vline open "intentionally unlocked; relock with: sudo locked lock"
     return "$mbad"
   fi
 
@@ -1860,22 +1933,22 @@ verify_node() {
   case "$tier" in
     content|placement) want_owner="$lu" ;;
     anchor)            want_owner="$owner" ;;
-    *) echo "  DRIFT $f: meta has unknown tier '$tier'"; return 1 ;;
+    *) vline DRIFT "meta has unknown tier '$tier'"; return 1 ;;
   esac
   cur="$(stat -f '%Su' "$f")"
-  [ "$cur" = "$want_owner" ] || { echo "  DRIFT $f: owner $cur, expected $want_owner"; bad=1; }
+  [ "$cur" = "$want_owner" ] || { vline DRIFT "owner $cur, expected $want_owner"; bad=1; }
   cur="$(stat -f '%OLp' "$f")"
-  [ "$cur" = "$lockmode" ] || { echo "  DRIFT $f: mode $cur, expected $lockmode"; bad=1; }
+  [ "$cur" = "$lockmode" ] || { vline DRIFT "mode $cur, expected $lockmode"; bad=1; }
   cur="$(flags_of "$f")"
-  [ "$cur" = "$flagsym" ] || { echo "  DRIFT $f: flags '$cur', expected '$flagsym'"; bad=1; }
+  [ "$cur" = "$flagsym" ] || { vline DRIFT "flags '$cur', expected '$flagsym'"; bad=1; }
   # Placement keeps the directory's own group, and lets the invoker in
   # through exactly the recorded entry (placement_entry). Either one
   # changing takes root, so either one changing is drift.
   if [ "$tier" = "placement" ]; then
     cur="$(stat -f '%Sg' "$f")"
-    [ "$cur" = "$group" ] || { echo "  DRIFT $f: group $cur, expected $group"; bad=1; }
+    [ "$cur" = "$group" ] || { vline DRIFT "group $cur, expected $group"; bad=1; }
     cur="$(meta_field "$meta" acl)"
-    acl_has "$f" "$cur" || { echo "  DRIFT $f: ACL entry missing or changed, expected '$cur'"; bad=1; }
+    acl_has "$f" "$cur" || { vline DRIFT "ACL entry missing or changed, expected '$cur'"; bad=1; }
   fi
   local sn=0
   if cur="$(node_id "$f")"; then
@@ -1886,16 +1959,25 @@ verify_node() {
   case "$sn" in
     0) ;;
     2) upgrade_identity_record "$f" "$meta" "$cur" || bad=1 ;;
-    3) echo "  DRIFT $f: identity could not be read (the window helper is unavailable)"; bad=1 ;;
-    *) echo "  DRIFT $f: identity $cur, expected $id (node replaced)"; bad=1 ;;
+    3) vline DRIFT "identity could not be read (the window helper is unavailable)"; bad=1 ;;
+    *) vline DRIFT "identity $cur, expected $id (node replaced)"; bad=1 ;;
   esac
 
+  # The first three stray nodes, read NUL-separated, so a name holding a
+  # newline stays one path.
   if [ "$recursive" = "1" ] && [ -d "$f" ]; then
-    local stray
-    stray="$(find "$f" \( ! -user "$lu" -o ! -flags +uchg \) -print 2>/dev/null | head -3)"
-    if [ -n "$stray" ]; then
-      echo "  DRIFT $f: tree nodes without lock ownership/uchg:"
-      printf '%s\n' "$stray" | sed 's/^/          /'
+    local -a stray=()
+    local sp
+    while IFS= read -r -d '' sp; do
+      stray+=("$sp")
+      [ "${#stray[@]}" -lt 3 ] || break
+    done < <(find "$f" \( ! -user "$lu" -o ! -flags +uchg \) -print0 2>/dev/null)
+    if [ "${#stray[@]}" -gt 0 ]; then
+      vline DRIFT "tree nodes without lock ownership or uchg:"
+      for sp in "${stray[@]}"; do
+        vpath ep "$sp"
+        vline DRIFT "  $ep"
+      done
       bad=1
     fi
   fi
@@ -2395,7 +2477,7 @@ plan_node() {
       return 0
     fi
     err_val "marked locked but drifted; investigate before relocking" "$p"
-    verify_node "$p" "$META" "$lock_user" >&2 || true
+    verify_node "$p" "$META" "$lock_user" | verify_rows "    " >&2 || true
     return 1
   fi
 
@@ -4957,6 +5039,20 @@ do_tombstone_one() {
 # "What, if anything, stops this path from being modified?" -- a question
 # independent of the pool, so it answers for foreign flags too, and runs
 # without sudo on whatever the invoker can stat.
+#
+# One row per node, root-first (terminal-output Rows): the marker, then
+# the node's owner and group, its flags and what the pool says of it, each
+# a column padded to the widest of this walk, and the path last:
+#
+#   why: /Users/me/.zshrc
+#       ~  root:wheel    sunlnk  no record      /
+#       !  me:staff      sappnd  anchor locked  /Users/me
+#       !  _me-lock:...  uchg    content locked /Users/me/.zshrc
+#
+# The marker answers one question: does this node constrain what is under
+# it? ! blocks removal and rename (yellow: attention), ~ carries some other
+# flag, - carries none (dim: absence). An empty column on every row is
+# left out.
 do_why_one() {
   local f
   f="$(abs_leaf "$1")" || return 1
@@ -4970,40 +5066,53 @@ do_why_one() {
   done
 
   set_pal
-  echo "${P_B}why $f:${P_OFF}"
-  local fl marker owner record parts
+  local -a marks=() owners=() flagss=() records=()
+  local fl owner record i ow=0 fw=0 rw=0
   for n in "${nodes[@]}"; do
     if [ ! -e "$n" ] && [ ! -L "$n" ]; then
-      echo "    ${P_DIM}-${P_OFF}  $n ${P_DIM}(does not exist)${P_OFF}"
+      marks+=("$P_DIM-$P_OFF") owners+=("") flagss+=("") records+=("does not exist")
+      [ "$rw" -ge 14 ] || rw=14
       continue
     fi
     fl="$(flags_of "$n" 2>/dev/null)" || fl=""
-    # The marker answers one question: does this node constrain what is
-    # under it? ! blocks removal and rename (yellow: attention), ~ carries
-    # some other flag, - carries none (dim: absence). What the record says
-    # goes in the parenthetical.
     case ",$fl," in
-      *,sappnd,*|*,schg,*|*,uappnd,*|*,uchg,*) marker="${P_YEL}!${P_OFF}" ;;
-      ,,) marker="${P_DIM}-${P_OFF}" ;;
-      *) marker="${P_YEL}~${P_OFF}" ;;
+      *,sappnd,*|*,schg,*|*,uappnd,*|*,uchg,*) marks+=("$P_YEL!$P_OFF") ;;
+      ,,) marks+=("$P_DIM-$P_OFF") ;;
+      *) marks+=("$P_YEL~$P_OFF") ;;
     esac
     owner="$(stat -f '%Su:%Sg' "$n" 2>/dev/null)" || owner="unreadable"
     record=""
     snap_paths "$n"
     if [ -f "$META" ]; then
-      record="pool $(meta_field "$META" tier) $(meta_field "$META" state)"
+      record="$(meta_field "$META" tier) $(meta_field "$META" state)"
     elif [ -n "$fl" ]; then
       record="no record"
     fi
-    parts="$owner"
-    [ -n "$fl" ] && parts="$parts, $fl"
-    [ -n "$record" ] && parts="$parts; $record"
-    echo "    $marker  $n ${P_DIM}($parts)${P_OFF}"
+    owners+=("$owner") flagss+=("$fl") records+=("$record")
+    [ "${#owner}" -le "$ow" ] || ow="${#owner}"
+    [ "${#fl}" -le "$fw" ] || fw="${#fl}"
+    [ "${#record}" -le "$rw" ] || rw="${#record}"
+  done
+
+  local ef
+  esc_into ef "$f" "$P_RV"
+  echo "${P_B}why:${P_OFF} $ef"
+  i=0
+  for n in "${nodes[@]}"; do
+    esc_into ef "$n" "$P_RV"
+    {
+      printf '    %s  %s' "${marks[$i]}" "$P_DIM"
+      [ "$ow" -eq 0 ] || printf '%-*s  ' "$ow" "${owners[$i]}"
+      [ "$fw" -eq 0 ] || printf '%-*s  ' "$fw" "${flagss[$i]}"
+      [ "$rw" -eq 0 ] || printf '%-*s  ' "$rw" "${records[$i]}"
+      printf '%s%s\n' "$P_OFF" "$ef"
+    }
+    i=$((i + 1))
   done
 
   # Two constraints, reported separately because their remedies differ: an
   # immutable node cannot be changed at all, and a sealed parent will not
-  # let the entry be removed or renamed.
+  # let the entry be removed or renamed. The path ends the note's last line.
   local blocked=0 self_fl self_block=""
   self_fl="$(flags_of "$f" 2>/dev/null)" || self_fl=""
   case ",$self_fl," in
@@ -5013,16 +5122,17 @@ do_why_one() {
   if [ -n "$self_block" ]; then
     blocked=1
     echo
+    esc_into ef "$f" "$P_RV"
     snap_paths "$f"
     if [ -f "$META" ] && [ "$(meta_field "$META" state)" = "locked" ]; then
-      echo "${P_YEL}note:${P_OFF} $f is immutable ($self_block); its contents cannot change"
-      echo "      while it is sealed."
+      echo "${P_YEL}note:${P_OFF} this path is immutable ($self_block), so its contents cannot"
+      echo "      change while it is sealed: $ef"
       cmd_rows "      " \
         "sudo locked edit $f" "edits it without ever leaving it unlocked" \
         "sudo locked unlock $f" "releases it until the next lock"
     else
-      echo "${P_YEL}note:${P_OFF} $f is immutable ($self_block), and locked has no record of"
-      echo "      that flag -- it was set outside the pool."
+      echo "${P_YEL}note:${P_OFF} this path is immutable ($self_block), and locked has no record of"
+      echo "      that flag; it was set outside the pool: $ef"
       cmd_rows "      " \
         "sudo chflags no$self_block $f" "releases it (re-apply it yourself after)"
     fi
@@ -5052,45 +5162,84 @@ do_why_one() {
     echo
     # Precisely what was measured, and no more: this walk reads file flags,
     # so ordinary permissions are still free to say no.
-    echo "${P_YEL}note:${P_OFF} no file flag on this chain stops $f from being"
+    echo "${P_YEL}note:${P_OFF} no file flag on this chain stops this path from being"
     echo "      changed, renamed or removed. Ordinary permissions still"
     echo "      apply -- the owners are listed above."
   fi
 }
 
-# One node, one row, in the layout every listing in this script shares:
-# four spaces, a verdict glyph, the path, then the record in parentheses.
+# One node, one row, in the layout every listing in this script shares
+# (terminal-output Rows): four spaces, a verdict glyph and its word, the
+# tier and the recorded flag -- each a column of fixed words, padded to
+# the widest word of its set, blank where the row has none -- and the path
+# last. What a row says beyond its words goes on a dim line under it,
+# starting in the path's column:
+#
+#   ✓  sealed       content    uchg    /Users/me/.zshrc
+#   !  unlocked     content            /Users/me/.config/zsh
+#   ~  retired      content            /Users/me/old
+#                                      via rm at 2026-10-01T12:00:00Z
+#   -  not in pool                     /Users/me
+#
 # Markers (terminal-output verdict set): ✓ green sealed and clean, ✗ red
 # drifted, ! yellow deliberately unlocked (protection is OFF -- the row to
 # notice), ~ yellow recorded but no longer enforced (retired, suspended),
-# - dim not in pool. `brief` collapses drift detail to a pointer, for the
-# pool listing. Sets STATUS_ROW_POOL so a caller can tell "clean" from
-# "no record". Returns 1 on drift. Clobbers the snap_paths globals.
+# - dim not in pool, or a leaf parent the chain does not need. `brief`
+# collapses drift detail to a pointer, for the pool listing. Sets
+# STATUS_ROW_POOL so a caller can tell "clean" from "no record". Returns 1
+# on drift. Clobbers the snap_paths globals.
+readonly STATUS_WORD_W=11 STATUS_TIER_W=9 STATUS_FLAG_W=6
+readonly STATUS_COL=$(( 4 + 1 + 2 + STATUS_WORD_W + 2 + STATUS_TIER_W + 2 + STATUS_FLAG_W + 2 ))
+
+# status_line <style> <glyph> <word> <tier> <flag> <path>: one row on
+# stdout, P_* palette (callers run set_pal). The glyph and its word wear
+# <style>; tier and flag are dim context; the path is plain and last.
+status_line() {
+  local ep
+  esc_into ep "$6" "$P_RV"
+  printf '    %s%s  %-*s%s  %s%-*s  %-*s%s  %s\n' "$1" "$2" "$STATUS_WORD_W" "$3" "$P_OFF" \
+    "$P_DIM" "$STATUS_TIER_W" "$4" "$STATUS_FLAG_W" "$5" "$P_OFF" "$ep"
+}
+
+# status_note <text> [<value>]: a dim line under a row, in the path's
+# column; a value (a path) follows the text after a colon, escaped, last.
+status_note() {
+  local ev=""
+  if [ "$#" -ge 2 ]; then
+    esc_into ev "$2" "$P_RV" "$P_DIM"
+    ev=": $ev"
+  fi
+  printf '%*s%s%s%s%s\n' "$STATUS_COL" '' "$P_DIM" "$1" "$ev" "$P_OFF"
+}
+
 STATUS_ROW_POOL=0
 status_row() { # <path> [brief]
-  local n="$1" brief="${2:-}" tier state
+  local n="$1" brief="${2:-}" tier state flag
   STATUS_ROW_POOL=0
   set_pal
   snap_paths "$n"
   if [ ! -f "$META" ]; then
-    echo "    ${P_DIM}-${P_OFF}  $n ${P_DIM}(not in pool)${P_OFF}"
+    status_line "$P_DIM" - "not in pool" "" "" "$n"
     return 0
   fi
   STATUS_ROW_POOL=1
   tier="$(meta_field "$META" tier)"
   state="$(meta_field "$META" state)"
+  flag="$(meta_field "$META" flag)"
   case "$state" in
     unlocked)
-      echo "    ${P_YEL}!${P_OFF}  $n ${P_DIM}($tier, unlocked)${P_OFF}"
+      status_line "$P_YEL" '!' unlocked "$tier" "" "$n"
       return 0
       ;;
     retired)
-      echo "    ${P_YEL}~${P_OFF}  $n ${P_DIM}($tier, retired via $(meta_field "$META" via) $(meta_field "$META" at))${P_OFF}"
+      status_line "$P_YEL" '~' retired "$tier" "" "$n"
+      status_note "via $(meta_field "$META" via) at $(meta_field "$META" at)"
       return 0
       ;;
     suspended)
-      echo "    ${P_YEL}~${P_OFF}  $n ${P_DIM}($tier, suspended $(meta_field "$META" at))${P_OFF}"
-      echo "         bin: $(meta_field "$META" bin)"
+      status_line "$P_YEL" '~' suspended "$tier" "" "$n"
+      status_note "since $(meta_field "$META" at)"
+      status_note bin "$(meta_field "$META" bin)"
       return 0
       ;;
   esac
@@ -5099,19 +5248,22 @@ status_row() { # <path> [brief]
   # nothing is wrong. Discarding that output would hide the one thing the
   # row cannot show -- and, unprivileged, the note asking for the sudo run
   # that does the repair.
-  local vout
+  local vout pad
+  printf -v pad '%*s' "$STATUS_COL" ''
   if vout="$(verify_node "$n" "$META" "$lock_user" 2>/dev/null)"; then
-    echo "    ${P_GRN}✓${P_OFF}  $n ${P_DIM}($tier $(meta_field "$META" flag))${P_OFF}"
+    status_line "$P_GRN" '✓' sealed "$tier" "$flag" "$n"
     if [ -n "$vout" ]; then
-      printf '%s\n' "$vout" | sed 's/^/      /'
+      printf '%s\n' "$vout" | verify_rows "$pad"
     fi
     return 0
   fi
+  status_line "$P_RED" '✗' drifted "$tier" "$flag" "$n"
   if [ "$brief" = "brief" ]; then
-    echo "    ${P_RED}✗${P_OFF}  $n ${P_DIM}($tier $(meta_field "$META" flag))${P_OFF} ${P_YEL}DRIFT${P_OFF} -- details: ${P_CYN}sudo locked status $n${P_OFF}"
+    local en
+    esc_into en "$n" "$P_RV" "$P_DIM"
+    status_note "details: sudo locked status $en"
   else
-    echo "    ${P_RED}✗${P_OFF}  $n ${P_DIM}($tier)${P_OFF} ${P_YEL}DRIFT:${P_OFF}"
-    verify_node "$n" "$META" "$lock_user" | sed 's/^/      /' || true
+    verify_node "$n" "$META" "$lock_user" | verify_rows "$pad" || true
   fi
   return 1
 }
@@ -5121,14 +5273,16 @@ status_row() { # <path> [brief]
 # a record. Returns 1 if any node drifted.
 CHAIN_ANY=0
 print_chain() { # <path> [brief]
-  local f="$1" brief="${2:-}" chain nodes=() a rc=0 parent
+  local f="$1" brief="${2:-}" chain nodes=() a rc=0 parent ef
   CHAIN_ANY=0
   set_pal
-  echo "${P_B}chain for $f:${P_OFF}"
+  esc_into ef "$f" "$P_RV"
+  echo "${P_B}chain for:${P_OFF} $ef"
   if chain="$(chain_for "$f" 2>/dev/null)"; then
     :
   else
-    echo "  ${P_RED}✗${P_OFF} chain stop node is not root-owned (see: ${P_CYN}sudo locked lock $f${P_OFF})"
+    esc_into ef "$f" "$P_RV" "$P_CYN"
+    echo "  ${P_RED}✗${P_OFF} the chain stop node is not root-owned; see: ${P_CYN}sudo locked lock $ef${P_OFF}"
     if chain_skips_parent "$f"; then
       chain="$(dirname "$(dirname "$f")")"
     else
@@ -5151,12 +5305,13 @@ EOF
   fi
   # A leaf parent left out of the chain (the rule is argued at
   # chain_skips_parent) is still the node a reader looks for first, so it
-  # prints as context: dim, with the reason, and never a "!" -- there is
-  # nothing on it to be out of order. A parent that holds a LIVE record is a
-  # pool node like any other -- another leaf's chain runs through it, or
-  # nothing needs it and the next plan releases it -- so it gets the
-  # ordinary row, drift and all. A retired record is history and reads as
-  # none. An anchor parent is in the chain above and has already printed.
+  # prints as context: dim, with the reason on the line under it, and never
+  # a "!" -- there is nothing on it to be out of order. A parent that holds
+  # a LIVE record is a pool node like any other -- another leaf's chain
+  # runs through it, or nothing needs it and the next plan releases it --
+  # so it gets the ordinary row, drift and all. A retired record is history
+  # and reads as none. An anchor parent is in the chain above and has
+  # already printed.
   parent="$(dirname "$f")"
   if [ "$parent" != "$f" ] && chain_skips_parent "$f"; then
     snap_paths "$parent"
@@ -5166,7 +5321,8 @@ EOF
         CHAIN_ANY=1
       fi
     else
-      echo "    ${P_DIM}-${P_OFF}  $parent ${P_DIM}(not needed: $(dirname "$parent") keeps it in place)${P_OFF}"
+      status_line "$P_DIM" - "not needed" "" "" "$parent"
+      status_note "its parent keeps it in place" "$(dirname "$parent")"
     fi
   fi
   status_row "$f" "$brief" || rc=1
@@ -5200,7 +5356,7 @@ do_status_one() {
   snap_paths "$f"
   local leaf_meta="$META" rc=0
   print_chain "$f" || rc=1
-  [ "$CHAIN_ANY" -eq 1 ] || echo "  not in pool: $leaf_meta absent"
+  [ "$CHAIN_ANY" -eq 1 ] || say_out "  not in pool; no record at" "$leaf_meta"
   return "$rc"
 }
 
@@ -5324,17 +5480,21 @@ fmt_age() { # <seconds>: how long ago, in the largest whole unit
 # One block for status: what the last verify run found, from the file above.
 # A run older than three intervals is stale -- the timer has stopped or the
 # machine has not been awake to run it -- and says so, because a clean
-# answer from yesterday is not a clean answer now.
+# answer from yesterday is not a clean answer now. The status file is a
+# path, so it ends whichever line names it; the drifted paths come back as
+# the bytes verify_escape wrote and are shown as any other path is.
 verify_summary() { # <userdir>
-  local f="$1/verify" line at="" interval="" drifted="" epoch now age when
+  local f="$1/verify" line at="" interval="" drifted="" epoch now age when ef
   local paths=()
   set_pal
+  esc_into ef "$f" "$P_RV"
   if [ ! -e "$f" ]; then
-    echo "${P_B}last verify:${P_OFF} ${P_DIM}-${P_OFF}  none recorded ${P_DIM}(the timer writes $f)${P_OFF}"
+    echo "${P_B}last verify:${P_OFF} ${P_DIM}-${P_OFF}  none recorded"
+    echo "      ${P_DIM}the timer writes it at: $ef${P_OFF}"
     return 0
   fi
   if [ -L "$f" ] || [ ! -f "$f" ] || [ ! -r "$f" ]; then
-    echo "${P_B}last verify:${P_OFF} ${P_RED}✗${P_OFF}  cannot read $f"
+    echo "${P_B}last verify:${P_OFF} ${P_RED}✗${P_OFF}  cannot read: $ef"
     return 0
   fi
   while IFS= read -r line; do
@@ -5348,11 +5508,11 @@ verify_summary() { # <userdir>
   case "$interval" in ''|*[!0-9]*) interval="" ;; esac
   case "$drifted" in ''|*[!0-9]*) drifted="" ;; esac
   if [ -z "$interval" ] || [ -z "$drifted" ]; then
-    echo "${P_B}last verify:${P_OFF} ${P_RED}✗${P_OFF}  $f is malformed"
+    echo "${P_B}last verify:${P_OFF} ${P_RED}✗${P_OFF}  malformed: $ef"
     return 0
   fi
   epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$at" +%s 2>/dev/null)" || {
-    echo "${P_B}last verify:${P_OFF} ${P_RED}✗${P_OFF}  $f is malformed"
+    echo "${P_B}last verify:${P_OFF} ${P_RED}✗${P_OFF}  malformed: $ef"
     return 0
   }
   now="$(date +%s)"
@@ -5368,7 +5528,7 @@ verify_summary() { # <userdir>
   else
     echo "${P_B}last verify:${P_OFF} ${P_RED}✗${P_OFF}  $drifted drifted ${P_DIM}($when, $(fmt_age "$age"))${P_OFF}"
     for line in ${paths[@]+"${paths[@]}"}; do
-      echo "      $line"
+      path_lines "      " "$(verify_unescape "$line")"
     done
     [ "$drifted" -le "${#paths[@]}" ] || echo "      ${P_DIM}and $((drifted - ${#paths[@]})) more${P_OFF}"
     echo "      details: ${P_CYN}sudo locked verify${P_OFF}"
@@ -5396,9 +5556,9 @@ do_verify() {
       records=$((records + 1))
       fpath="$(decode "$(basename "$meta" .meta)")"
       if out="$(verify_node "$fpath" "$meta" "$ulock")"; then
-        [ "$OPT_QUIET" -eq 1 ] || [ -z "$out" ] || printf '%s\n' "$out"
+        [ "$OPT_QUIET" -eq 1 ] || [ -z "$out" ] || printf '%s\n' "$out" | verify_rows "  " "$fpath"
       else
-        printf '%s\n' "$out"
+        printf '%s\n' "$out" | verify_rows "  " "$fpath"
         drifted+=("$fpath")
       fi
     done

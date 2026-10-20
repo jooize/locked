@@ -49,6 +49,11 @@ shopt -s nullglob
 # ("${BSL}u{200B}"), so no escape is ever spelled out in this file.
 BSL='\'
 
+# srow <glyph> <word> <tier> <flag> <path>: a status row as locked prints
+# it off a tty -- the glyph, three word columns padded to the widest word
+# of their sets, the path last -- less its four-space indent.
+srow() { printf '%s  %-11s  %-9s  %-6s  %s' "$1" "$2" "$3" "$4" "$5"; }
+
 # ---- TAP output ------------------------------------------------------------
 #
 # Every line on stdout is a test point, a comment, the plan or a bail out.
@@ -898,7 +903,7 @@ check "its directory is frozen again"          "uchg" "$(flags_of "$CD/nested")"
 ok   "the folder record carries the mismatch"  has_mismatch "$(pool_meta "$CD")" "content $FM"
 check "the edit refreshed the verify status"   "drifted=1" \
       "$(grep '^drifted=' "$STATEROOT/$INV/verify")"
-refuse "verify reports the mismatch"           "the edit of $FM at" locked verify
+refuse "verify reports the mismatch"           "did not install as approved (content): $FM" locked verify
 
 refuse "a second file in the folder mismatches" "not what you approved (content)" \
        locked_tamper edit --yes --from "$PROPM" "$FA"
@@ -906,7 +911,7 @@ ok   "a clean edit of the first file"          locked edit --yes --from "$PROPM"
 check "the first file has the approved bytes"  "approved" "$(cat "$FM")"
 deny "its mismatch is cleared"                 has_mismatch "$(pool_meta "$CD")" "$FM"
 ok   "the second file's mismatch stays"        has_mismatch "$(pool_meta "$CD")" "content $FA"
-refuse "verify still reports the second file"  "the edit of $FA at" locked verify
+refuse "verify still reports the second file"  "did not install as approved (content): $FA" locked verify
 
 PROPX="$PROPD/mismatch-accept.proposed.txt"
 as_user /bin/sh -c "printf 'approved\nx' > '$PROPX'"
@@ -924,7 +929,7 @@ refuse "a mismatch before an unlock"           "not what you approved (content)"
        locked_tamper edit --yes --from "$PROPM" "$FA"
 ok   "unlock the folder"                       locked unlock "$CD"
 ok   "the unlocked record keeps the mismatch"  has_mismatch "$(pool_meta "$CD")" "content $FA"
-refuse "verify reports it while unlocked"      "the edit of $FA at" locked verify
+refuse "verify reports it while unlocked"      "did not install as approved (content): $FA" locked verify
 ok   "relock the folder"                       locked lock --yes "$CD"
 deny "the relock clears it"                    grep -q '^mismatch=' "$(pool_meta "$CD")"
 ok   "verify clean after the relock"           locked verify
@@ -944,7 +949,7 @@ MVO="$SCRATCH/verify-mismatch.out"
 MVRC=0
 locked verify >"$MVO" 2>&1 || MVRC=$?
 check "verify fails on the mismatch"           "5" "$MVRC"
-ok   "verify names the mismatch"               grep -qF "the edit of $MCFG at" "$MVO"
+ok   "verify names the mismatch"               grep -qF "did not install as approved (content): $MCFG" "$MVO"
 deny "verify sees no replaced node"            grep -qF "node replaced" "$MVO"
 ok   "revert the mismatch fixture"             locked revert "$MCFG"
 check "the reverted content"                   "version 1" "$(cat "$MCFG")"
@@ -1393,11 +1398,11 @@ note "cli: no-arg status lists the populated pool"
 # anchor, and the content dir (unlocked here only to render that state).
 ok   "status lists the pool"             locked status
 locked status >"$POOL" 2>&1
-ok   "listing names the locked leaf"     grep -qF "✓  $CFG (content uchg)" "$POOL"
-ok   "listing names the home anchor"     grep -qF "✓  $FAKE_HOME (anchor sappnd)" "$POOL"
+ok   "listing names the locked leaf"     grep -qF "$(srow ✓ sealed content uchg "$CFG")" "$POOL"
+ok   "listing names the home anchor"     grep -qF "$(srow ✓ sealed anchor sappnd "$FAKE_HOME")" "$POOL"
 ok   "unlock dir to expose its state"    locked unlock "$CD"
 locked status >"$POOL" 2>&1
-ok   "listing marks the unlocked node"   grep -qF "!  $CD (content, unlocked)" "$POOL"
+ok   "listing marks the unlocked node"   grep -qF "$(srow '!' unlocked content '' "$CD")" "$POOL"
 ok   "relock dir after the listing"      locked lock --yes "$CD"
 
 check "the listing ends with the last verify" "last verify: ✓  clean" "$(tail -1 "$POOL" | sed 's/ (.*//')"
@@ -1482,7 +1487,8 @@ vfixture "at=$NOW_ISO" "interval=900" "records=3" "drifted=3" \
          "drift=/a/one" "drift=/a/caf\\xc3\\xa9"
 locked_as "$LOCK_ACCT" status >"$POOL" 2>&1
 ok   "drift reads as drift, with its count"     grep -qF "last verify: ✗  3 drifted" "$POOL"
-ok   "the recorded paths are listed as written" grep -qF "      /a/caf\\xc3\\xa9" "$POOL"
+ok   "the recorded paths are shown as the characters they name" \
+     grep -qxF "      /a/caf$(printf '%b' '\xc3\xa9')" "$POOL"
 ok   "the uncapped remainder is counted"        grep -qF "and 1 more" "$POOL"
 
 vfixture "at=2026-01-01T00:00:00Z" "interval=900" "records=3" "drifted=0"
@@ -1492,7 +1498,7 @@ ok   "and that it is stale"                     grep -qF "note: that run is stal
 
 vfixture "at=$NOW_ISO" "interval=soon" "drifted=0"
 locked_as "$LOCK_ACCT" status >"$POOL" 2>&1
-ok   "a malformed status says so"               grep -qF "last verify: ✗  $VFX/verify is malformed" "$POOL"
+ok   "a malformed status says so"               grep -qF "last verify: ✗  malformed: $VFX/verify" "$POOL"
 
 rm -f -- "$VFX/verify"
 rmdir -- "$VFX"
@@ -2117,18 +2123,19 @@ if locked verify >"$OUTF" 2>&1; then vrc=0; else vrc=$?; fi
 check "a reappearance drifts"                  "5" "$vrc"
 ok   "the drift says it came back from the trash" \
      grep -qF "back from the trash and unsealed" "$OUTF"
-ok   "the drift names the bin it was in"       grep -qF "(bin was $VD/bin/back.txt)" "$OUTF"
+ok   "the drift names the bin it was in"       grep -qF "it was in the bin at: $VD/bin/back.txt" "$OUTF"
 ok   "the drift points at re-locking"          grep -qF "sudo locked lock $BACK" "$OUTF"
 
 note "status: retired and suspended rows"
 locked status >"$OUTF" 2>&1 || true
-ok   "the pool listing marks a retired node"   grep -qF "~  $RETIRED (content, retired via rm" "$OUTF"
-ok   "the pool listing marks a suspended node" grep -qF "~  $BACK (content, suspended" "$OUTF"
+ok   "the pool listing marks a retired node"   grep -qF "$(srow '~' retired content '' "$RETIRED")" "$OUTF"
+ok   "and says how it was retired"             grep -qF "via rm at " "$OUTF"
+ok   "the pool listing marks a suspended node" grep -qF "$(srow '~' suspended content '' "$BACK")" "$OUTF"
 ok   "the suspended row carries its bin"       grep -qF "bin: $VD/bin/back.txt" "$OUTF"
 locked status "$RETIRED" >"$OUTF" 2>&1 || true
-ok   "per-path status renders the retired row" grep -qF "~  $RETIRED (content, retired via rm" "$OUTF"
+ok   "per-path status renders the retired row" grep -qF "$(srow '~' retired content '' "$RETIRED")" "$OUTF"
 locked status "$BACK" >"$OUTF" 2>&1 || true
-ok   "per-path status renders the suspended row" grep -qF "~  $BACK (content, suspended" "$OUTF"
+ok   "per-path status renders the suspended row" grep -qF "$(srow '~' suspended content '' "$BACK")" "$OUTF"
 ok   "per-path status shows the bin line"      grep -qF "bin: $VD/bin/back.txt" "$OUTF"
 
 note "mediated: the pool is left consistent"
@@ -2276,7 +2283,7 @@ ok   "verify clean with a sealed link"         locked verify --quiet
 # A link is one node everywhere: status reads the link's own record rather
 # than resolving to a target that has none.
 locked status "$LNK" >"$OUTF" 2>&1 || true
-ok   "status reports the link's own record"    grep -qF "✓  $LNK (content uchg)" "$OUTF"
+ok   "status reports the link's own record"    grep -qF "$(srow ✓ sealed content uchg "$LNK")" "$OUTF"
 deny "and never resolves to the target"        grep -qF "$LNKT" "$OUTF"
 
 # The point of the change: the link entry can no longer be re-pointed.
@@ -2560,8 +2567,8 @@ check "the shallow leaf is sealed"             "$LOCK_ACCT uchg" "$(stat -f '%Su
 deny "its plan never offers to release the shared node" grep -q "release  *[a-z]*  *$SHD\$" "$LPOUT"
 check "the shared node kept its flag"          "uappnd" "$(flags_of "$SHD")"
 locked_home "$LPHOME" status "$SH1" >"$LPOUT" 2>&1 || true
-ok   "a recorded leaf parent prints as placement" grep -qF "✓  $SHD (placement uappnd)" "$LPOUT"
-deny "and not as the context row"              grep -qF "$SHD (not needed" "$LPOUT"
+ok   "a recorded leaf parent prints as placement" grep -qF "$(srow ✓ sealed placement uappnd "$SHD")" "$LPOUT"
+deny "and not as the context row"              grep -qF "$(srow - "not needed" '' '' "$SHD")" "$LPOUT"
 
 locked_home "$LPHOME" unprotect --dry-run "$SH2" >"$LPOUT" 2>&1 || true
 ok   "a leaf's own parent is released as kept" grep -q "release  *kept  *$SHD\$" "$LPOUT"
@@ -2574,7 +2581,8 @@ check "with no flag"                           "" "$(flags_of "$SHD")"
 check "the shallow leaf is still sealed"       "uchg" "$(flags_of "$SH1")"
 check "and its grandparent too"                "uappnd" "$(flags_of "$LPA")"
 locked_home "$LPHOME" status "$SH1" >"$LPOUT" 2>&1 || true
-ok   "status: the released parent is context"  grep -qF -- "-  $SHD (not needed: $LPA keeps it in place)" "$LPOUT"
+ok   "status: the released parent is context"  grep -qF -- "$(srow - "not needed" '' '' "$SHD")" "$LPOUT"
+ok   "with what keeps it on the line under"    grep -qF "its parent keeps it in place: $LPA" "$LPOUT"
 deny "and no retired row takes its place"      grep -qF "retired via" "$LPOUT"
 ok   "verify clean with the shared node gone"  locked_home "$LPHOME" verify --quiet
 
@@ -2659,11 +2667,11 @@ ok   "verify clean after the moves"            locked_home "$LPHOME" verify --qu
 note "status: the leaf parent prints as context"
 locked_home "$LPHOME" status "$LPF" >"$LPOUT" 2>&1 || true
 ok   "the chain names the leaf parent"         \
-     grep -qF -- "-  $LPB (not needed: $LPA keeps it in place)" "$LPOUT"
-deny "and never marks it unlocked"             grep -qF "!  $LPB" "$LPOUT"
-deny "and never calls it a drift"              grep -qF "✗  $LPB" "$LPOUT"
-ok   "the grandparent prints as placement"     grep -qF "✓  $LPA (placement uappnd)" "$LPOUT"
-ok   "the leaf prints as its own row"          grep -qF "✓  $LPF (content uchg)" "$LPOUT"
+     grep -qF -- "$(srow - "not needed" '' '' "$LPB")" "$LPOUT"
+deny "and never marks it unlocked"             grep -q "^    !  .* $LPB\$" "$LPOUT"
+deny "and never calls it a drift"              grep -q "^    ✗  .* $LPB\$" "$LPOUT"
+ok   "the grandparent prints as placement"     grep -qF "$(srow ✓ sealed placement uappnd "$LPA")" "$LPOUT"
+ok   "the leaf prints as its own row"          grep -qF "$(srow ✓ sealed content uchg "$LPF")" "$LPOUT"
 
 note "chain: the anchor stays in the chain as a leaf's own parent"
 # ~/.zshrc's parent IS the home. Its sappnd is what holds ~/.claude and
@@ -2677,8 +2685,8 @@ check "and still owned by the user"            "$INV" "$(owner_of "$LPHOME")"
 check "its record is still locked"             "locked" "$(meta_get "$LPHOME" state)"
 deny "the plan never offered to release it"    grep -q "release  *$LPHOME " "$LPOUT"
 locked_home "$LPHOME" status "$ZRC" >"$LPOUT" 2>&1 || true
-ok   "the anchor prints as a chain row"        grep -qF "✓  $LPHOME (anchor sappnd)" "$LPOUT"
-deny "and never as a context row"              grep -qF "$LPHOME (not needed" "$LPOUT"
+ok   "the anchor prints as a chain row"        grep -qF "$(srow ✓ sealed anchor sappnd "$LPHOME")" "$LPOUT"
+deny "and never as a context row"              grep -qF "$(srow - "not needed" '' '' "$LPHOME")" "$LPOUT"
 refuse "a chain dir cannot be named"           "sealed as a chain directory" \
        locked_home "$LPHOME" lock --yes "$LPA"
 refuse "nor unprotected by name"               "not protected by name" \
@@ -2778,7 +2786,8 @@ deny "which has no record either"              test -f "$(meta_path "$WPHOME/.co
 check "nor Application Support"                "$WPAPP_B" \
       "$(stat -f '%Su %Sg %OLp' "$WPHOME/Library/Application Support")"
 deny "which has no record either"              test -f "$(meta_path "$WPHOME/Library/Application Support")"
-ok   "status names .claude as context"         grep -qF -- "-  $WPHOME/.claude (not needed: $WPHOME keeps it in place)" "$WPOUT"
+ok   "status names .claude as context"         grep -qF -- "$(srow - "not needed" '' '' "$WPHOME/.claude")" "$WPOUT"
+ok   "and what keeps it in place"              grep -qF "its parent keeps it in place: $WPHOME" "$WPOUT"
 
 # The motivating failure, gone: the software that owns ~/.claude can take
 # and release its lock directory, and a temp+rename save strands nothing.
