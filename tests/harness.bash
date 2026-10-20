@@ -1224,6 +1224,41 @@ check "a field decodes before it escapes bytes" "$(printf '%b' 'caf\xc3\xa9')${B
 check "a field wraps only the hidden escape in its style" "<rv>${BSL}u{200B}<on>x${BSL}xFF" \
       "$(printf '%b' '\xe2\x80\x8bx\xff' | /usr/bin/perl "$DWFILT" field '<rv>' '<on>')"
 
+# Verify findings carry raw text -- a path, a record field as the record
+# holds it -- and verify_rows escapes each detail whole as it draws it,
+# so an ESC or an SO in an ACL entry shows as its escape and never acts.
+# Lifted out of locked like the renderer, with the helpers it calls, in
+# a subshell so nothing it defines stays behind. Off a tty it draws with
+# no color; color 1 stands in the tty palette.
+dw_rows() { # <color 0|1> <word> <weight> <detail>: one finding, drawn
+  (
+    eval "$(sed -n "/^readonly UNTRUSTED_PL='\$/,/^'\$/p" "$LOCKED")"
+    eval "$(sed -n -e '/^esc_into() {/,/^}/p' -e '/^set_pal() {/,/^}/p' \
+      -e '/^vfind() {/,/^}/p' -e '/^verify_rows() {/,/^}/p' "$LOCKED")"
+    if [ "$1" = 1 ]; then
+      set_pal() { P_OFF="${DW_ESC}[0m" P_DIM="${DW_ESC}[2m" P_RV="${DW_ESC}[7;31m"; }
+    fi
+    vfind "$2" "$3" "$4" | verify_rows "  "
+  )
+}
+DW_ACL="ACL entry missing or changed, expected 'user:x ${DW_ESC}[31m"$'\x0e'" allow list'"
+check "a finding escapes an ESC and an SO in a record field" \
+      "  ACL entry missing or changed, expected 'user:x ${BSL}u{1B}[31m${BSL}u{E} allow list'" \
+      "$(dw_rows 0 drift fact "$DW_ACL")"
+check "and prints neither raw"             "0" \
+      "$(dw_rows 0 drift fact "$DW_ACL" | LC_ALL=C grep -c $'[\x1b\x0e]' || true)"
+check "a tab in a detail survives the record and shows escaped" "  a${BSL}u{9}b" \
+      "$(dw_rows 0 drift fact $'a\tb')"
+check "a line feed in a path keeps the finding on one line" "  /x${BSL}u{A}y" \
+      "$(dw_rows 0 drift fact $'/x\ny')"
+check "a backslash comes back as itself, escaped only before x and hex" \
+      "  a${BSL}b ${BSL}u{5C}x41" \
+      "$(dw_rows 0 drift fact "a${BSL}b ${BSL}x41")"
+check "a drift fact resumes plain after the escape" "1" \
+      "$(dw_rows 1 drift fact "$DW_ACL" | grep -cF -- "${DW_ESC}[7;31m${BSL}u{1B}${DW_ESC}[0m[31m" || true)"
+check "a line of context resumes dim"      "1" \
+      "$(dw_rows 1 drift context "$DW_ACL" | grep -cF -- "${DW_ESC}[7;31m${BSL}u{1B}${DW_ESC}[0m${DW_ESC}[2m[31m" || true)"
+
 note "cli: dry-run mutates nothing"
 DR="$FAKE_HOME/dryrun.txt"
 as_user /bin/sh -c "echo dr > '$DR'"

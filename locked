@@ -1791,29 +1791,35 @@ snap_paths() { # sets ENC SNAP SNAPDIR ATTIC META for path $1
 # wrong, what is missing) is what the reader decides from, so it prints
 # plain, never dim (terminal-output, color roles). Context -- where a
 # node was, a command to run next -- and every detail of the other words
-# print dim, safe to skim. A path
-# inside a detail is escaped as the detail is composed, so the detail is
-# one line whatever the name holds. The findings carry no color: a
-# finding is composed before anyone knows which stream will show it (a
-# status row on stdout, a refusal on stderr), so verify_rows styles it
-# with the palette of the fd it writes to (set_pal). Each hidden escape
-# in a path is marked by two bytes no escaped text can hold raw, SO
-# before it and SI after it, and verify_rows turns them into reverse red
-# and back into the line's style.
+# print dim, safe to skim.
+#
+# A finding carries RAW text: a path as its bytes (shq-quoted where it is
+# part of a command), a record field as the record holds it. Nothing in
+# it is escaped or styled when it is composed, because nothing there
+# knows which stream will show it (a status row on stdout, a refusal on
+# stderr). verify_rows escapes the whole detail as it draws it
+# (untrusted-text), so a hidden character in a path or in a record field
+# -- an owner, a flag word, an ACL entry, an id -- shows as its escape,
+# in the palette of the fd it writes to (set_pal).
+
+# vfind <word> <weight> <detail>: one finding on stdout. A backslash, a
+# tab and a line feed in the detail are written \x5C, \x09 and \x0A, so the
+# record stays one line of three tab-separated fields whatever the detail
+# holds; verify_rows reads them back to the raw bytes before it escapes
+# them. The replacements sit in variables: bash 3.2 keeps quotes in a
+# quoted replacement literally.
+vfind() {
+  local bs='\' xbs='\x5C' xt='\x09' xn='\x0A' d="$3"
+  d="${d//"$bs"/$xbs}"
+  d="${d//$'\t'/$xt}"
+  d="${d//$'\n'/$xn}"
+  printf '%s\t%s\t%s\n' "$1" "$2" "$d"
+}
 
 # vline <word> <detail>: one finding, a fact. vctx <word> <detail>: a line
 # of context under it.
-vline() { printf '%s\tfact\t%s\n' "$1" "$2"; }
-vctx() { printf '%s\tcontext\t%s\n' "$1" "$2"; }
-
-# vpath <var> <path>: <path> escaped into <var>, for a detail line, each
-# hidden escape between SO and SI. esc_into closes an escape with a reset,
-# the only ESC the escaped text can hold, which becomes the SI.
-vpath() {
-  local _vp
-  esc_into _vp "$2" $'\016'
-  printf -v "$1" '%s' "${_vp//$'\033[0m'/$'\017'}"
-}
+vline() { vfind "$1" fact "$2"; }
+vctx() { vfind "$1" context "$2"; }
 
 # verify_unescape <text>: the bytes verify_escape wrote as \xHH, back as
 # bytes (either case), so a path from a record can be escaped for display
@@ -1827,8 +1833,11 @@ verify_unescape() {
 # under it. Without one -- the path already ends the row above, a status
 # row or an error -- the details alone, at <indent>, a word other than
 # drift leading its own detail (`info: ...`). A drift fact is plain, the
-# rest dim. Prints with set_pal, so a caller sends it to stderr with >&2
-# and it takes the colors of stderr.
+# rest dim. Each detail is read back to its raw bytes (%b undoes vfind,
+# whose \x escapes are the only backslashes in the record) and escaped
+# whole, its hidden escapes in reverse red resuming the line's style.
+# Prints with set_pal, so a caller sends it to stderr with >&2 and it
+# takes the colors of stderr.
 verify_rows() {
   local ind="$1" p="" word wt det last="" ep col st
   set_pal
@@ -1843,8 +1852,8 @@ verify_rows() {
     if [ "$word" = "drift" ] && [ "$wt" = "fact" ]; then
       st=""
     fi
-    det="${det//$'\016'/$P_RV}"
-    det="${det//$'\017'/$P_OFF$st}"
+    printf -v det '%b' "$det"
+    esc_into det "$det" "$P_RV" "$st"
     if [ -n "$p" ]; then
       if [ "$word" != "$last" ]; then
         printf '%s%-5s  %s\n' "$ind" "$word" "$ep"
@@ -1865,7 +1874,7 @@ verify_rows() {
 # reboot invents is not drift. Root only: unprivileged status must never
 # write a pool it can merely read (same rule as the trash finalization).
 upgrade_identity_record() { # <path> <metafile> <live id>
-  local f="$1" meta="$2" cur="$3" em
+  local f="$1" meta="$2" cur="$3"
   if [ "$EUID" -ne 0 ]; then
     vline note "identity in legacy dev.ino form; sudo locked status rewrites it"
     return 0
@@ -1874,8 +1883,7 @@ upgrade_identity_record() { # <path> <metafile> <live id>
     vline info "identity record upgraded (dev.ino → volume uuid)"
     return 0
   fi
-  vpath em "$meta"
-  vline drift "identity record could not be upgraded: $em"
+  vline drift "identity record could not be upgraded: $meta"
   return 1
 }
 
@@ -1884,7 +1892,6 @@ upgrade_identity_record() { # <path> <metafile> <live id>
 verify_node() {
   local f="$1" meta="$2" lu="$3"
   local tier state flag flagsym mode lockmode owner group id recursive bin
-  local ep
   tier="$(meta_field "$meta" tier)"
   state="$(meta_field "$meta" state)"
   flag="$(meta_field "$meta" flag)"
@@ -1927,11 +1934,9 @@ verify_node() {
     if [ -e "$f" ] || [ -L "$f" ]; then
       vline drift "back from the trash and unsealed"
       if [ -n "$bin" ]; then
-        vpath ep "$bin"
-        vctx drift "it was in the bin at: $ep"
+        vctx drift "it was in the bin at: $bin"
       fi
-      vpath ep "$(shq "$f")"
-      vctx drift "relock it with: sudo locked lock $ep"
+      vctx drift "relock it with: sudo locked lock $(shq "$f")"
       return 1
     fi
     if [ -n "$bin" ] && [ ! -e "$bin" ] && [ ! -L "$bin" ]; then
@@ -1949,8 +1954,7 @@ verify_node() {
         vline info "trashed item no longer in the bin; record retired"
         return 0
       fi
-      vpath ep "$meta"
-      vline drift "suspended, and its record could not be finalized: $ep"
+      vline drift "suspended, and its record could not be finalized: $meta"
       return 1
     fi
     return 0
@@ -1978,8 +1982,7 @@ verify_node() {
     mat="${mrest%% *}"
     mrest="${mrest#* }"
     mwhat="${mrest%% *}"
-    vpath ep "$(verify_unescape "${mrest#* }")"
-    vline drift "an edit at $mat did not install as approved ($mwhat): $ep"
+    vline drift "an edit at $mat did not install as approved ($mwhat): $(verify_unescape "${mrest#* }")"
     mbad=1
   done
   if [ "$state" = "unlocked" ]; then
@@ -2033,8 +2036,7 @@ verify_node() {
     if [ "${#stray[@]}" -gt 0 ]; then
       vline drift "tree nodes without lock ownership or uchg:"
       for sp in "${stray[@]}"; do
-        vpath ep "$sp"
-        vline drift "  $ep"
+        vline drift "  $sp"
       done
       bad=1
     fi
