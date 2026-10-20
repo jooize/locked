@@ -14,7 +14,13 @@
 # variables today, but status and why run without sudo, and the flag must
 # not hang on sudo's policy. It holds only when the kernel reads this
 # line: `bash locked` runs without it, so the script is always executed
-# by its path.
+# by its path. -p leaves two more alone, so the next two lines run first:
+# POSIXLY_CORRECT in the environment still starts bash in posix mode
+# (verified on 3.2) and BASH_COMPAT sets a compatibility level (bash 4.3
+# and later), so posix mode goes off and both names go, before any other
+# line and before any child inherits them.
+set +o posix
+unset POSIXLY_CORRECT BASH_COMPAT
 #
 # Tiers (see DESIGN-v2.md):
 #   content    uchg,  owned by _<user>-lock; leaf files, or leaf dirs (recursive)
