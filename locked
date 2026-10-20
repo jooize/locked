@@ -1787,16 +1787,25 @@ snap_paths() { # sets ENC SNAP SNAPDIR ATTIC META for path $1
 # The words: drift, open (deliberately unlocked), info (a record locked
 # repaired on its way to clean), note (a repair that needs root). A path
 # inside a detail is escaped as the detail is composed, so the detail is
-# one line whatever the name holds, and the hidden escapes resume the dim.
-# The palette is stdout's (C_*), fixed when locked starts, so a finding
-# captured in a command substitution keeps its color for the terminal it
-# is printed to.
+# one line whatever the name holds. The findings carry no color: a
+# finding is composed before anyone knows which stream will show it (a
+# status row on stdout, a refusal on stderr), so verify_rows styles it
+# with the palette of the fd it writes to (set_pal). Each hidden escape
+# in a path is marked by two bytes no escaped text can hold raw, SO
+# before it and SI after it, and verify_rows turns them into reverse red
+# and back into the line's style.
 
 # vline <word> <detail>: one finding.
 vline() { printf '%s\t%s\n' "$1" "$2"; }
 
-# vpath <var> <path>: <path> escaped into <var>, for a detail line.
-vpath() { esc_into "$1" "$2" "$C_RV" "$C_DIM"; }
+# vpath <var> <path>: <path> escaped into <var>, for a detail line, each
+# hidden escape between SO and SI. esc_into closes an escape with a reset,
+# the only ESC the escaped text can hold, which becomes the SI.
+vpath() {
+  local _vp
+  esc_into _vp "$2" $'\016'
+  printf -v "$1" '%s' "${_vp//$'\033[0m'/$'\017'}"
+}
 
 # verify_unescape <text>: the bytes verify_escape wrote as \xHH, back as
 # bytes (either case), so a path from a record can be escaped for display
@@ -1809,26 +1818,30 @@ verify_unescape() {
 # each run of one word is a row, `<indent><word>  <path>`, its details
 # under it. Without one -- the path already ends the row above, a status
 # row or an error -- the details alone, at <indent>, a word other than
-# drift leading its own detail (`info: ...`).
+# drift leading its own detail (`info: ...`). Prints with set_pal, so a
+# caller sends it to stderr with >&2 and it takes the colors of stderr.
 verify_rows() {
   local ind="$1" p="" word det last="" ep col
+  set_pal
   if [ -n "${2:-}" ]; then
-    esc_into ep "$2" "$C_RV"
+    esc_into ep "$2" "$P_RV"
     p=1
   fi
   col=$(( ${#ind} + 5 + 2 ))
   while IFS=$'\t' read -r word det; do
     [ -n "$word" ] || continue
+    det="${det//$'\016'/$P_RV}"
+    det="${det//$'\017'/$P_OFF$P_DIM}"
     if [ -n "$p" ]; then
       if [ "$word" != "$last" ]; then
         printf '%s%-5s  %s\n' "$ind" "$word" "$ep"
         last="$word"
       fi
-      printf '%*s%s%s%s\n' "$col" '' "$C_DIM" "$det" "$C_OFF"
+      printf '%*s%s%s%s\n' "$col" '' "$P_DIM" "$det" "$P_OFF"
     elif [ "$word" = "drift" ]; then
-      printf '%s%s%s%s\n' "$ind" "$C_DIM" "$det" "$C_OFF"
+      printf '%s%s%s%s\n' "$ind" "$P_DIM" "$det" "$P_OFF"
     else
-      printf '%s%s%s: %s%s\n' "$ind" "$C_DIM" "$word" "$det" "$C_OFF"
+      printf '%s%s%s: %s%s\n' "$ind" "$P_DIM" "$word" "$det" "$P_OFF"
     fi
   done
 }
