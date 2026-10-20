@@ -236,7 +236,7 @@ locked() {
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$FAKE_HOME" \
       SUDO_USER="$INV" \
-      /bin/bash "$LOCKED_RUN" "$@"
+      "$LOCKED_RUN" "$@"
 }
 
 as_user() {
@@ -316,7 +316,7 @@ locked_home() { # <home> <args...>: locked with a different LOCKED_USER_HOME
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$h" \
       SUDO_USER="$INV" \
-      /bin/bash "$LOCKED_RUN" "$@"
+      "$LOCKED_RUN" "$@"
 }
 
 # Shared by sections 4, 5 and 6.
@@ -423,6 +423,20 @@ check "the run copy names the harness git once" "1" \
       "$(grep -cxF -- "$GIT_LINE_RUN" "$LOCKED_RUN")"
 check "and differs from the script in that line alone" "1" \
       "$(diff "$LOCKED" "$LOCKED_RUN" | grep -c '^>')"
+
+# Every case runs that copy by its path, never as `bash FILE`, so the
+# kernel reads its first line and each run starts the way an installed
+# locked does: under `/bin/bash -p`, which sources no BASH_ENV. The
+# control runs the same copy through a plain bash, which does.
+note "startup: the script runs under its own shebang"
+check "the copy's first line is /bin/bash -p"  "#!/bin/bash -p" "$(head -1 "$LOCKED_RUN")"
+BENV="$SCRATCH/bash-env"
+BENV_RAN="$SCRATCH/bash-env.ran"
+printf ': >"%s"\n' "$BENV_RAN" >"$BENV"
+env BASH_ENV="$BENV" "$LOCKED_RUN" --version >/dev/null 2>&1 || true
+deny "an injected BASH_ENV does not run"       test -e "$BENV_RAN"
+env BASH_ENV="$BENV" /bin/bash "$LOCKED_RUN" --version >/dev/null 2>&1 || true
+ok   "control: a plain bash runs it"           test -e "$BENV_RAN"
 
 # The `id` verb is the whole of the script's node_id(): it runs without
 # root (unprivileged `status` needs it), reads nothing but attributes, and
@@ -1533,7 +1547,7 @@ set timeout 15
 # run is optional, so this same pattern still matches the uncolored prompt
 # (NO_COLOR, or a redirected stderr).
 set ynp {\[(\x1b\[[0-9;]*m)*y(\x1b\[[0-9;]*m)*/(\x1b\[[0-9;]*m)*N(\x1b\[[0-9;]*m)*\]}
-spawn env LOCKED_STATE_ROOT=$(state_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME SUDO_USER=$INV /bin/bash $LOCKED lock $TTYCFG
+spawn env LOCKED_STATE_ROOT=$(state_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME SUDO_USER=$INV $LOCKED_RUN lock $TTYCFG
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
@@ -1576,7 +1590,7 @@ EOF
   TTYEXP2="$SCRATCH/tty-decline.exp"
   cat >"$TTYEXP2" <<EOF
 set timeout 15
-spawn env LOCKED_STATE_ROOT=$(state_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME SUDO_USER=$INV /bin/bash $LOCKED lock $TTYDEC
+spawn env LOCKED_STATE_ROOT=$(state_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME SUDO_USER=$INV $LOCKED_RUN lock $TTYDEC
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
@@ -1606,7 +1620,7 @@ EOF
   cat >"$TTYEXP2B" <<EOF
 set timeout 15
 set ynp {\[(\x1b\[[0-9;]*m)*y(\x1b\[[0-9;]*m)*/(\x1b\[[0-9;]*m)*N(\x1b\[[0-9;]*m)*\]}
-spawn env LOCKED_STATE_ROOT=$(state_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME SUDO_USER=$INV /bin/bash $LOCKED lock $TTYWRONG
+spawn env LOCKED_STATE_ROOT=$(state_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME SUDO_USER=$INV $LOCKED_RUN lock $TTYWRONG
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
@@ -1642,7 +1656,7 @@ EOF
   TTYEXP3="$SCRATCH/tty-unprotect.exp"
   cat >"$TTYEXP3" <<EOF
 set timeout 15
-spawn env LOCKED_STATE_ROOT=$(state_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME SUDO_USER=$INV /bin/bash $LOCKED unprotect $TTYCFG
+spawn env LOCKED_STATE_ROOT=$(state_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH/not-installed LOCKED_HELPER=$HELPER LOCKED_LOCK_ACCOUNT=$LOCK_ACCT LOCKED_USER_HOME=$TTYHOME SUDO_USER=$INV $LOCKED_RUN unprotect $TTYCFG
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
@@ -1713,7 +1727,7 @@ locked_as() { # <user> <args...>: run locked unprivileged AS <user>.
       LOCKED_HELPER="$HELPER" \
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$FAKE_HOME" \
-      /bin/bash "$SCRIPT_COPY" "$@"
+      "$SCRIPT_COPY" "$@"
 }
 
 MARKER="$SCRATCH/unpriv-marker"
@@ -1797,7 +1811,7 @@ locked_it() { # <install_target> <args...>: locked with a specific INSTALL_TARGE
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$FAKE_HOME" \
       SUDO_USER="$INV" \
-      /bin/bash "$LOCKED_RUN" "$@"
+      "$LOCKED_RUN" "$@"
 }
 
 # Accepted: strict root:wheel 755 chain (the /usr/local shape).
@@ -2161,7 +2175,7 @@ locked_fake() { # <helper> <args...>: locked with a stand-in LOCKED_HELPER
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$FAKE_HOME" \
       SUDO_USER="$INV" \
-      /bin/bash "$LOCKED_RUN" "$@"
+      "$LOCKED_RUN" "$@"
 }
 
 FKD="$MED/fakearea"
@@ -2232,12 +2246,12 @@ refuse "trash without an invoking user"        "must be invoked via sudo" \
        env LOCKED_STATE_ROOT="$STATEROOT" INSTALL_TARGET="$SCRATCH/not-installed" \
            LOCKED_HELPER="$HELPER" LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
            LOCKED_USER_HOME="$FAKE_HOME" SUDO_USER= \
-           /bin/bash "$LOCKED_RUN" trash --yes "$TRD/t.txt"
+           "$LOCKED_RUN" trash --yes "$TRD/t.txt"
 refuse "trash refuses a root invoker"          "the invoker is root" \
        env LOCKED_STATE_ROOT="$STATEROOT" INSTALL_TARGET="$SCRATCH/not-installed" \
            LOCKED_HELPER="$HELPER" LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
            LOCKED_USER_HOME="$FAKE_HOME" SUDO_USER=root \
-           /bin/bash "$LOCKED_RUN" trash --yes "$TRD/t.txt"
+           "$LOCKED_RUN" trash --yes "$TRD/t.txt"
 ok   "the file survived both refusals"         test -f "$TRD/t.txt"
 rmdir -- "$STATEROOT/root/pool" "$STATEROOT/root" 2>/dev/null || true
 
@@ -3257,7 +3271,7 @@ locked_conv() { # <args...>: a root run as launchd makes it, no invoker
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$FAKE_HOME" \
       SUDO_USER= \
-      /bin/bash "$LOCKED_RUN" "$@"
+      "$LOCKED_RUN" "$@"
 }
 legacy_pool() { # <user>: a 0.14.0-shaped pool with one record file in it
   install -d -m 711 -o root -g wheel "$CONV_LEGACY"

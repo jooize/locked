@@ -105,7 +105,8 @@ Tests: `sudo /bin/bash tests/harness.bash` (scratch-dir only; stands in
 at the same time, each in a scratch dir of its own; `--serial` runs them one
 at a time, and section numbers run only those. The verbs run a copy of the
 script whose git line names `--git PATH`, else the script's own git, else
-the one git in `/nix/store`. Its stdout is a TAP 14
+the one git in `/nix/store`, and run it by its path, so every case starts
+under its own `#!/bin/bash -p` as an install does. Its stdout is a TAP 14
 stream, so `prove -v --exec 'sudo /bin/bash' tests/harness.bash` (TAP::Harness
 3.50 or later) can check it.
 
