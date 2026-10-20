@@ -1764,9 +1764,9 @@ as_user /bin/sh -c "echo z > '$MVB/taken.txt'"
 refuse "mv never clobbers an existing dest"    "never clobbers" \
        locked mv "$MVB/b.txt" "$MVB/taken.txt"
 ok   "both entries survived the refusal"       test -f "$MVB/b.txt"
-refuse "mv refuses a missing destination parent" "cannot resolve $MED/no-such-dir" \
+refuse "mv refuses a missing destination parent" "cannot resolve: $MED/no-such-dir" \
        locked mv "$MVB/b.txt" "$MED/no-such-dir/b.txt"
-refuse "mv refuses a non-directory dest parent" "$MVB/taken.txt is not a directory" \
+refuse "mv refuses a non-directory dest parent" "not a directory: $MVB/taken.txt" \
        locked mv "$MVB/b.txt" "$MVB/taken.txt/b.txt"
 # Cross-device is live-testable without mounting anything: devfs is a second
 # filesystem on every macOS, and the refusal lands before any window opens.
@@ -1924,7 +1924,7 @@ F5B="$(mkfake exit5-clears \
 locked_fake "$F5B" rm --yes "$FKD/t.txt" >"$OUTF" 2>&1 || true
 ok   "the backstop notices a cleared parent"   grep -qF "came back with flags 'none', expected 'uappnd'" "$OUTF"
 ok   "the backstop re-seals from its captured word" \
-     grep -qF "re-sealed by the backstop: $FKD (uappnd)" "$OUTF"
+     grep -qF "re-sealed by the backstop (uappnd): $FKD" "$OUTF"
 check "the parent really is sealed again"      "uappnd" "$(flags_of "$FKD")"
 check "the record still says locked"           "locked" "$(meta_get "$FKD/t.txt" state)"
 
@@ -1968,7 +1968,7 @@ install -d -o "$LOCK_ACCT" -g "$LOCK_ACCT" -m 700 "$NWD"
 install -m 644 -o "$LOCK_ACCT" -g "$LOCK_ACCT" /dev/null "$NWD/x.txt"
 locked trash --yes "$NWD/x.txt" >"$OUTF" 2>&1 || true
 ok   "trash refuses a parent the invoker cannot write" \
-     grep -qF "cannot write $NWD" "$OUTF"
+     grep -qF "cannot write the directory it is in: $NWD" "$OUTF"
 ok   "the refusal points at rm instead"        grep -qF "sudo locked rm $NWD/x.txt" "$OUTF"
 ok   "the file is still there"                 test -f "$NWD/x.txt"
 
@@ -2142,7 +2142,8 @@ note "why: what is actually stopping this"
 WHYF="$MED/why-plain.txt"
 as_user /bin/sh -c "echo w > '$WHYF'"
 locked why "$WHYF" >"$OUTF" 2>&1 || true
-ok   "why names the sealed ancestor"           grep -qF "note: $MED is flagged uappnd" "$OUTF"
+ok   "why says the ancestor is flagged"        grep -qF "note: this directory is flagged uappnd" "$OUTF"
+ok   "and names it last"                       grep -qF "be removed or renamed while it is sealed: $MED" "$OUTF"
 ok   "why offers the mediated rm"              grep -qF "sudo locked rm $WHYF" "$OUTF"
 ok   "why offers the mediated trash"           grep -qF "sudo locked trash $WHYF" "$OUTF"
 ok   "why offers the mediated mv"              grep -qF "sudo locked mv $WHYF" "$OUTF"
@@ -2708,7 +2709,7 @@ if locked_home "$LPHOME" verify >"$LPOUT" 2>&1; then vrc=0; else vrc=$?; fi
 check "verify calls a roleless record drift"   "5" "$vrc"
 ok   "and says what is missing"                grep -qF "record has no role" "$LPOUT"
 locked_home "$LPHOME" lock --yes "$ZRC" >"$LPOUT" 2>&1 || true
-ok   "a plan says why it releases nothing"     grep -qF "no directory is released this run: the record for $SH1 has no role" "$LPOUT"
+ok   "a plan says why it releases nothing"     grep -qF "no directory is released this run; this record has no role: $SH1" "$LPOUT"
 check "the unneeded dir stays sealed"          "uappnd" "$(flags_of "$ORD2")"
 printf 'role=leaf\n' >>"$SH1M"
 locked_home "$LPHOME" lock --yes "$ZRC" >"$LPOUT" 2>&1 || true
@@ -2916,7 +2917,7 @@ printf 'acl=%s\n' "$ACE" >>"$ACDM"
 ok   "verify clean with the record whole"      locked_home "$ACHOME" verify --quiet
 
 note "placement: trash needs rights the entry does not give"
-refuse "trash out of a placement dir is refused" "cannot write $ACD" \
+refuse "trash out of a placement dir is refused" "cannot write the directory it is in: $ACD" \
        locked_home "$ACHOME" trash --yes "$ACD/new.txt"
 ok   "the file is still there"                 test -f "$ACD/new.txt"
 locked_home "$ACHOME" why "$ACD/new.txt" >"$ACOUT" 2>&1 || true
@@ -2986,12 +2987,12 @@ ok   "a second run finds nothing to convert"   locked_conv verify --quiet
 
 note "conversion: nothing merges, nothing is left behind silently"
 legacy_pool "$INV"
-refuse "a pool at both paths refuses"          "a pool exists at both $CONV_LEGACY/$INV and $CONV_STATE/$INV/pool" \
+refuse "a pool at both paths refuses"          "a pool exists at both paths; move one by hand" \
        locked_conv verify --quiet
 ok   "and moves nothing"                       test -f "$CONV_LEGACY/$INV/x.snap"
 rm -rf -- "${CONV_LEGACY:?}/$INV"
 install -d -m 700 -o root -g wheel "$CONV_LEGACY/.stray"
-refuse "a stray entry keeps the legacy root"   "$CONV_LEGACY still holds entries after the move" \
+refuse "a stray entry keeps the legacy root"   "still holds entries after the move; look before removing it: $CONV_LEGACY" \
        locked_conv verify --quiet
 ok   "and is left where it was"                test -d "$CONV_LEGACY/.stray"
 rm -rf -- "$CONV_LEGACY"
@@ -3050,7 +3051,7 @@ ok   "a killed holder leaves no lock behind"   locked_conv_logged verify --quiet
 deny "so the next run does not wait"           grep -qF 'waiting for another locked run' "$RUNLOG"
 
 chmod 644 "$RUNLOCK"
-refuse "a run lock others can read refuses"    "$RUNLOCK is not a root-owned 600 file" \
+refuse "a run lock others can read refuses"    "not a root-owned 600 file; look at it, remove it, and run again: $RUNLOCK" \
        locked_conv verify --quiet
 chmod 600 "$RUNLOCK"
 ok   "at 600 again, runs pass"                 locked_conv verify --quiet

@@ -387,6 +387,49 @@ ok_move() {
   printf '%*s→ %s\n' $(( ${#1} + 2 )) '' "$b"
 }
 
+# say_out <text> <value>: one line on stdout, `<text>: <value>`. The value
+# -- a path, whose length locked does not choose -- is shown as the
+# characters that are there (esc_into) and ends the line, where nothing
+# can follow it (terminal-output Rows: errors, refusals and log lines put
+# the value last). <text> is locked's own words, styled by the caller.
+# say_err is the same on stderr; err_val puts the red ERROR: label first.
+say_out() {
+  local v
+  esc_into v "$2" "$C_RV"
+  printf '%s: %s\n' "$1" "$v"
+}
+say_err() {
+  local v
+  esc_into v "$2" "$E_RV"
+  printf '%s: %s\n' "$1" "$v" >&2
+}
+err_val() { say_err "${E_RED}${E_B}ERROR:${E_OFF} $1" "$2"; }
+
+# path_lines <indent> <path>...: one path per line on stdout, each escaped
+# and alone on its line. Prints with set_pal, so a caller sends it to
+# stderr with >&2 and keeps its color.
+path_lines() {
+  local ind="$1" p v
+  set_pal
+  shift
+  for p in "$@"; do
+    esc_into v "$p" "$P_RV"
+    printf '%s%s\n' "$ind" "$v"
+  done
+}
+
+# move_lines <words> <old> <new>: `<words>: <old>` on stdout, the new
+# path on the line under it, `→` hanging in the gutter so the two start in
+# the same column (`→` counted as one, as Ghostty draws it). With set_pal,
+# like path_lines.
+move_lines() {
+  local a b
+  set_pal
+  esc_into a "$2" "$P_RV"
+  esc_into b "$3" "$P_RV"
+  printf '%s: %s\n%*s→ %s\n' "$1" "$a" $(( ${#1} )) '' "$b"
+}
+
 usage() {
   cat <<EOF
 usage: sudo locked <action> [options] [args]
@@ -555,7 +598,7 @@ if [ -n "$OPT_FROM" ]; then
     exit 1
   fi
   if [ ! -f "$OPT_FROM" ]; then
-    echo "--from: not a regular file: $OPT_FROM" >&2
+    say_err "--from: not a regular file" "$OPT_FROM"
     exit 1
   fi
 fi
@@ -609,12 +652,25 @@ log_action() {
 
 run() {
   if [ "$OPT_DRY" -eq 1 ]; then
-    printf 'DRY-RUN: '
-    printf '%q ' "$@"
-    printf '\n'
+    dry_line "$@"
   else
     "$@"
   fi
+}
+
+# dry_line <argv>...: what a dry run would have run, on one line. Each
+# word is shell-quoted as %q does, then escaped (esc_into): %q passes
+# through raw any character the locale calls printable -- a zero-width
+# space, under a UTF-8 locale -- so the quoting alone does not show what
+# is there.
+dry_line() {
+  local a q out="DRY-RUN:"
+  for a in "$@"; do
+    printf -v q '%q' "$a"
+    esc_into q "$q" "$C_RV"
+    out="$out $q"
+  done
+  printf '%s\n' "$out"
 }
 
 # ONE implementation of the gate contract, shared by every y/N prompt and
@@ -768,13 +824,13 @@ verify_root_owned_path() {
   owner="$(stat -f '%Su:%Sg' "$path")"
   mode="$(stat -f '%OLp' "$path")"
   if [ "${owner%%:*}" != "root" ]; then
-    echo "${E_RED}${E_B}ERROR:${E_OFF} $path is owned $owner, expected root owner" >&2
+    err_val "owned $owner, expected root owner" "$path"
     return 1
   fi
   case "$mode" in
     755|750|700|555|550|500) ;;
     *)
-      echo "${E_RED}${E_B}ERROR:${E_OFF} $path has mode $mode, expected 755 or stricter" >&2
+      err_val "mode $mode, expected 755 or stricter" "$path"
       return 1
       ;;
   esac
@@ -791,14 +847,14 @@ verify_root_owned_file() {
   local path="$1" owner mode
   owner="$(stat -f '%Su' "$path")"
   if [ "$owner" != "root" ]; then
-    echo "${E_RED}${E_B}ERROR:${E_OFF} $path is owned by $owner, expected root owner" >&2
+    err_val "owned by $owner, expected root owner" "$path"
     return 1
   fi
   mode="$(printf '%03d' "$(stat -f '%OLp' "$path")")"
   mode="${mode#"${mode%???}"}"
   case "${mode:1:1}${mode:2:1}" in
     *[2367]*)
-      echo "${E_RED}${E_B}ERROR:${E_OFF} $path has mode $mode; group/other write must be off" >&2
+      err_val "mode $mode; group/other write must be off" "$path"
       return 1
       ;;
   esac
@@ -1153,7 +1209,7 @@ EOF
   # Idempotent (re)load.
   launchctl bootout system "$LOCKED_VERIFY_PLIST" 2>/dev/null || true
   launchctl bootstrap system "$LOCKED_VERIFY_PLIST"
-  echo "verify timer installed: $LOCKED_VERIFY_PLIST (every ${LOCKED_VERIFY_INTERVAL}s)"
+  say_out "verify timer installed (every ${LOCKED_VERIFY_INTERVAL}s)" "$LOCKED_VERIFY_PLIST"
 }
 
 do_setup() {
@@ -1189,9 +1245,9 @@ do_setup() {
 
   if [ "$self" != "$target" ]; then
     install -m 755 -o root -g wheel "$self" "$target"
-    echo "installed: $target"
+    say_out installed "$target"
   else
-    echo "binary already at $target"
+    say_out "binary already installed" "$target"
   fi
 
   # 2. Lock group
@@ -1256,13 +1312,13 @@ do_setup() {
   digest="$(shasum -a 256 "$INSTALL_TARGET" | awk '{print $1}')"
   sudoers_line="$inv ALL=(root) sha256:$digest ${INSTALL_TARGET}"
   if [ -f "$sudoers_target" ] && grep -qF "$sudoers_line" "$sudoers_target"; then
-    echo "sudoers digest current: $sudoers_target"
+    say_out "sudoers digest current" "$sudoers_target"
   else
     tmp="$(mktemp)"
     printf '%s\n' "$sudoers_line" >"$tmp"
     if visudo -c -f "$tmp" >/dev/null 2>&1; then
       install -m 440 -o root -g wheel "$tmp" "$sudoers_target"
-      echo "wrote sudoers entry with digest: $sudoers_target"
+      say_out "wrote sudoers entry with digest" "$sudoers_target"
       echo "  digest: sha256:$digest"
     else
       echo "sudoers validation failed; not installing" >&2
@@ -1321,7 +1377,7 @@ verify_ancestor() {
     local owner
     owner="$(stat -f '%Su' "$p")"
     [ "$owner" = "root" ] && return 0
-    echo "${E_RED}${E_B}ERROR:${E_OFF} $p is a symlink owned by $owner, expected root" >&2
+    err_val "a symlink owned by $owner, expected root" "$p"
     return 1
   fi
   if [ "$p" = "/nix/store" ]; then
@@ -1329,7 +1385,7 @@ verify_ancestor() {
     owner="$(stat -f '%Su' "$p")"
     mode="$(stat -f '%OMp%OLp' "$p")"
     [ "$owner" = "root" ] && [ "$mode" = "1775" ] && return 0
-    echo "${E_RED}${E_B}ERROR:${E_OFF} /nix/store is owned $owner mode $mode, expected root-owned 1775" >&2
+    err_val "owned $owner mode $mode, expected root-owned 1775" /nix/store
     return 1
   fi
   verify_root_owned_path "$p"
@@ -1389,13 +1445,13 @@ verify_helper() {
 
 verify_helper_now() {
   if [ ! -f "$LOCKED_HELPER" ]; then
-    echo "${E_RED}${E_B}ERROR:${E_OFF} window helper not found: $LOCKED_HELPER" >&2
+    err_val "window helper not found" "$LOCKED_HELPER"
     echo "       every verb needs it -- it opens the mediated window and it" >&2
     echo "       reads node identity (nix: rebuild; standalone: build" >&2
     echo "       helper/locked-helper.m and install it root-owned 755)" >&2
     return 1
   fi
-  [ -x "$LOCKED_HELPER" ] || { echo "${E_RED}${E_B}ERROR:${E_OFF} $LOCKED_HELPER is not executable" >&2; return 1; }
+  [ -x "$LOCKED_HELPER" ] || { err_val "window helper is not executable" "$LOCKED_HELPER"; return 1; }
   verify_root_owned_file "$LOCKED_HELPER" || return 1
   verify_program_ancestry "$LOCKED_HELPER" || return 1
   local real
@@ -1447,20 +1503,22 @@ convert_legacy_layout() {
     acct="${LOCKED_LOCK_ACCOUNT:-$(lock_account_for "$name")}"
     dest="$LOCKED_STATE_ROOT/$name"
     if [ -e "$dest/pool" ]; then
-      echo "${E_RED}${E_B}ERROR:${E_OFF} a pool exists at both $old and $dest/pool; move one by hand" >&2
+      echo "${E_RED}${E_B}ERROR:${E_OFF} a pool exists at both paths; move one by hand" >&2
+      value_rows "  " legacy id "$old" pool id "$dest/pool" >&2
       return 1
     fi
     if [ "$(stat -f '%d' "$old")" != "$(stat -f '%d' "$LOCKED_STATE_ROOT")" ]; then
-      echo "${E_RED}${E_B}ERROR:${E_OFF} $old and $LOCKED_STATE_ROOT are on different filesystems; refusing a copying move" >&2
+      echo "${E_RED}${E_B}ERROR:${E_OFF} the pool and the state root are on different filesystems; refusing a copying move" >&2
+      value_rows "  " pool id "$old" "state root" id "$LOCKED_STATE_ROOT" >&2
       return 1
     fi
     install -d -m 750 -o root -g "$acct" "$dest" || return 1
     mv -- "$old" "$dest/pool" || return 1
-    echo "moved $old to $dest/pool" >&2
+    move_lines "moved a pool" "$old" "$dest/pool" >&2
     log_action convert "$old" "moved-to-$dest/pool"
   done
   rmdir -- "$LOCKED_LEGACY_ROOT" || {
-    echo "${E_RED}${E_B}ERROR:${E_OFF} $LOCKED_LEGACY_ROOT still holds entries after the move; look before removing it" >&2
+    err_val "still holds entries after the move; look before removing it" "$LOCKED_LEGACY_ROOT"
     return 1
   }
   log_action convert "$LOCKED_LEGACY_ROOT" removed
@@ -1507,7 +1565,7 @@ run_lock_take() {
   # wider would survive a chmod.
   if [ -L "$LOCKED_RUN_LOCK" ] || [ ! -f "$LOCKED_RUN_LOCK" ] ||
      [ "$(stat -f '%Su %OLp' "$LOCKED_RUN_LOCK")" != "root 600" ]; then
-    echo "${E_RED}${E_B}ERROR:${E_OFF} $LOCKED_RUN_LOCK is not a root-owned 600 file; look at it, remove it, and run again" >&2
+    err_val "not a root-owned 600 file; look at it, remove it, and run again" "$LOCKED_RUN_LOCK"
     return 1
   fi
   flock_fd9 try || rc=$?
@@ -1518,7 +1576,7 @@ run_lock_take() {
     flock_fd9 wait || rc=$?
   fi
   if [ "$rc" -ne 0 ]; then
-    echo "${E_RED}${E_B}ERROR:${E_OFF} could not take the run lock $LOCKED_RUN_LOCK" >&2
+    err_val "could not take the run lock" "$LOCKED_RUN_LOCK"
     return 1
   fi
   printf 'pid %s: locked %s' "$$" "$action" >"$LOCKED_RUN_LOCK"
@@ -1552,7 +1610,7 @@ if [ "$EUID" -eq 0 ]; then
 elif [ -e "$LOCKED_STATE_ROOT" ] && [ ! -x "$LOCKED_STATE_ROOT" ]; then
   # A state root the caller cannot traverse would make every pool look
   # empty. Say what is actually wrong; one sudo run converges the mode.
-  echo "cannot read $LOCKED_STATE_ROOT (run 'sudo locked status' once to converge its mode)" >&2
+  say_err "cannot read the state root (run 'sudo locked status' once to converge its mode)" "$LOCKED_STATE_ROOT"
   exit 1
 elif [ -d "$USER_DIR" ] && { [ ! -r "$USER_DIR" ] || [ ! -x "$USER_DIR" ]; }; then
   # Unprivileged status skips the provisioning above deliberately rather
@@ -1606,7 +1664,8 @@ atomic_replace() {
   dst_dev="$(stat -f '%d' "$dst_parent")"
   if [ "$stage_dev" != "$dst_dev" ]; then
     rm -f -- "$tmp"
-    echo "${E_RED}${E_B}ERROR:${E_OFF} $dst is on a different filesystem from $stage_dir; refusing non-atomic mv" >&2
+    echo "${E_RED}${E_B}ERROR:${E_OFF} the destination is on a different filesystem from staging; refusing a non-atomic mv" >&2
+    value_rows "  " destination id "$dst" staging id "$stage_dir" >&2
     return 1
   fi
   local pflags lifted=""
@@ -1627,7 +1686,7 @@ atomic_replace() {
          [ $(( 0$(stat -f '%OLp' "$dst_parent") & 022 )) -ne 0 ] ||
          [ -n "$pacl" ]; then
         rm -f -- "$tmp"
-        echo "${E_RED}${E_B}ERROR:${E_OFF} $dst_parent is frozen (uchg) and not closed to you while open; refusing to lift it" >&2
+        err_val "frozen (uchg) and not closed to you while open; refusing to lift it" "$dst_parent"
         return 1
       fi
       lifted=uchg
@@ -1640,7 +1699,7 @@ atomic_replace() {
   mv -f -- "$tmp" "$dst" || rc=1
   if [ -n "$lifted" ]; then
     chflags -- "$lifted" "$dst_parent" || {
-      echo "${E_RED}${E_B}ERROR:${E_OFF} failed to restore $lifted on $dst_parent -- restore by hand" >&2
+      err_val "failed to restore $lifted; restore it by hand" "$dst_parent"
       rc=1
     }
   fi
@@ -1914,7 +1973,7 @@ chain_for() {
       p="$(dirname "$p")"
     else
       verify_root_owned_path "$p" || {
-        echo "${E_RED}${E_B}ERROR:${E_OFF} chain stop node $p is not a trustworthy anchor; refusing" >&2
+        err_val "the chain stop node is not a trustworthy anchor; refusing" "$p"
         return 1
       }
       break
@@ -1984,7 +2043,7 @@ plan_releases() {
       leaf) ;;
       chain) continue ;;
       *)
-        echo "${E_YEL}note:${E_OFF} no directory is released this run: the record for $q has no role" >&2
+        say_err "${E_YEL}note:${E_OFF} no directory is released this run; this record has no role" "$q"
         echo "      (written before locked 0.13.0; convert the pool first)" >&2
         return 0
         ;;
@@ -2000,7 +2059,7 @@ plan_releases() {
   while IFS= read -r q <&3; do
     [ -n "$q" ] || continue
     if ! c="$(chain_for "$q" 2>/dev/null)"; then
-      echo "${E_YEL}note:${E_OFF} no directory is released this run: the chain of $q cannot be derived" >&2
+      say_err "${E_YEL}note:${E_OFF} no directory is released this run; this leaf's chain cannot be derived" "$q"
       return 0
     fi
     needed="$needed$c"$'\n'
@@ -2191,7 +2250,7 @@ show_diff() { # <rule> <row label> <path> <diff-cmd>...
     # encoded like any other -- with no facts file, so every carriage
     # return shows escaped. Stderr decides the color here.
     dcolor=0; [ -n "$E_OFF" ] && dcolor=1
-    echo "${E_RED}${E_B}ERROR:${E_OFF} diff failed for $path:" >&2
+    err_val "diff failed" "$path"
     diff_filter "$dcolor" <"$raw" >&2 || true
     rm -f -- "$raw" "$enc" "$facts"
     return 1
@@ -2207,7 +2266,7 @@ show_diff() { # <rule> <row label> <path> <diff-cmd>...
   # colors on, including when the caller redirected fd 1.
   dcolor=0; [ -n "$P_OFF" ] && dcolor=1
   if ! diff_filter "$dcolor" "$facts" <"$raw" >"$enc"; then
-    echo "${E_RED}${E_B}ERROR:${E_OFF} cannot render the diff for $path; not showing it unencoded" >&2
+    err_val "cannot render the diff; not showing it unescaped" "$path"
     rm -f -- "$raw" "$enc" "$facts"
     return 1
   fi
@@ -2335,7 +2394,7 @@ plan_node() {
       printf 'already locked'
       return 0
     fi
-    echo "${E_RED}${E_B}ERROR:${E_OFF} $p is marked locked but drifted -- investigate before relocking:" >&2
+    err_val "marked locked but drifted; investigate before relocking" "$p"
     verify_node "$p" "$META" "$lock_user" >&2 || true
     return 1
   fi
@@ -2350,36 +2409,41 @@ plan_node() {
       fi
       content_targets "$p" || return 1
       if [ "$live" -eq 0 ] && [ "$T_OWNER" != "$inv" ]; then
-        echo "skip $p: not owned by you (owner=$T_OWNER)" >&2
+        say_err "skipped, not owned by you (owner $T_OWNER)" "$p"
         log_action lock "$p" skip-not-owned
         return 1
       fi
       # Recursive adoption sanity: single owner + single group across the
       # tree, so unlock's chown -R restore is lossless.
       if [ "$is_dir" -eq 1 ]; then
-        local stray
-        stray="$(find "$p" \( ! -user "$T_OWNER" ! -user "$lock_user" \) -o \( ! -group "$T_GROUP" ! -group "$lock_user" \) 2>/dev/null | head -3)"
-        if [ -n "$stray" ]; then
-          echo "${E_RED}${E_B}ERROR:${E_OFF} $p tree has mixed ownership; content tier needs a uniform tree:" >&2
-          printf '%s\n' "$stray" | sed 's/^/    /' >&2
+        local -a stray=()
+        local sp
+        # NUL-separated, so a name holding a newline stays one path.
+        while IFS= read -r -d '' sp; do
+          stray+=("$sp")
+          [ "${#stray[@]}" -lt 3 ] || break
+        done < <(find "$p" \( ! -user "$T_OWNER" ! -user "$lock_user" \) -o \( ! -group "$T_GROUP" ! -group "$lock_user" \) -print0 2>/dev/null)
+        if [ "${#stray[@]}" -gt 0 ]; then
+          err_val "mixed ownership in the tree; the content tier needs a uniform tree" "$p"
+          path_lines "    " "${stray[@]}" >&2
           return 1
         fi
       fi
       ;;
     placement)
       [ -d "$p" ] || {
-        echo "${E_RED}${E_B}ERROR:${E_OFF} placement tier needs a directory: $p" >&2
+        err_val "placement tier needs a directory" "$p"
         return 1
       }
       if [ "$live" -eq 0 ]; then
         local owner_now
         owner_now="$(stat -f '%Su' "$p")"
         if [ "$owner_now" != "$inv" ]; then
-          echo "${E_RED}${E_B}ERROR:${E_OFF} $p owned by $owner_now; placement adoption needs your ownership" >&2
+          err_val "owned by $owner_now; placement adoption needs your ownership" "$p"
           return 1
         fi
         if [ -z "$(placement_entry "$inv" "$(stat -f '%OLp' "$p")")" ]; then
-          echo "${E_RED}${E_B}ERROR:${E_OFF} $p gives its owner no access (mode $(stat -f '%OLp' "$p")); there is nothing for a placement seal to carry over" >&2
+          err_val "gives its owner no access (mode $(stat -f '%OLp' "$p")); there is nothing for a placement seal to carry over" "$p"
           return 1
         fi
         # chmod +a folds a new allow entry into an existing one for the same
@@ -2388,7 +2452,7 @@ plan_node() {
         # told apart from it, and a release would take away rights that were
         # never locked's to take.
         if acl_names_user "$p" "$inv"; then
-          echo "${E_RED}${E_B}ERROR:${E_OFF} $p already carries an ACL entry for $inv; placement adds its own, and the two would merge:" >&2
+          err_val "already carries an ACL entry for $inv; placement adds its own, and the two would merge" "$p"
           acl_entries "$p" | sed 's/^/    /' >&2
           return 1
         fi
@@ -2398,11 +2462,11 @@ plan_node() {
         local want
         want="$(meta_field "$META" acl)"
         if [ -z "$want" ]; then
-          echo "${E_RED}${E_B}ERROR:${E_OFF} $p has a placement record without its ACL entry (written before locked 0.14.0); convert the pool first" >&2
+          err_val "a placement record without its ACL entry (written before locked 0.14.0); convert the pool first" "$p"
           return 1
         fi
         if ! acl_has "$p" "$want"; then
-          echo "${E_RED}${E_B}ERROR:${E_OFF} $p no longer carries its ACL entry -- investigate before relocking:" >&2
+          err_val "no longer carries its ACL entry; investigate before relocking" "$p"
           echo "    expected: $want" >&2
           return 1
         fi
@@ -2624,7 +2688,8 @@ seal_placement() {
   # kernel now holds, spelled as ls prints it. A mismatch here is a
   # spelling bug in placement_entry: fail on it now, not as drift later.
   if [ "$OPT_DRY" -eq 0 ] && ! acl_has "$d" "$entry"; then
-    echo "${E_RED}${E_B}ERROR:${E_OFF} $d does not read back the ACL entry just added: $entry" >&2
+    err_val "does not read back the ACL entry just added" "$d"
+    echo "    entry: $entry" >&2
     run chmod -a "$entry" "$d" || true
     return 1
   fi
@@ -2721,7 +2786,7 @@ release_node() {
   if ! record_live "$META"; then
     # "not in pool" is true and unhelpful on its own: what usually blocks
     # this path is an ancestor, not the leaf. Say which one.
-    echo "skip $f: not in pool" >&2
+    say_err "skipped, not in pool" "$f"
     chain_diagnosis "$f" \
       "sudo locked unlock --chain $f" "releases the chain above it" \
       "sudo locked rm $f" "removes it through a bounded window" >&2
@@ -2740,7 +2805,7 @@ release_node() {
   local state
   state="$(meta_field "$META" state)"
   if [ "$state" = "unlocked" ]; then
-    echo "already unlocked: $f"
+    say_out "already unlocked" "$f"
     log_action unlock "$f" skip-already-unlocked
     return 0
   fi
@@ -2787,7 +2852,7 @@ release_node() {
       fi
       ;;
     *)
-      echo "${E_RED}${E_B}ERROR:${E_OFF} $f meta has unknown tier '$tier'" >&2
+      err_val "the record has unknown tier '$tier'" "$f"
       return 1
       ;;
   esac
@@ -2810,18 +2875,21 @@ release_node() {
   fi
   ok_row "unlocked ($tier)" "$f"
   if [ "$tier" = "content" ] && [ "$recursive" != "1" ] && [ "$is_link" -eq 0 ]; then
-    echo "  snapshot: $SNAP"
+    say_out "  snapshot" "$SNAP"
   fi
 
   # Atomic-save hint: if the parent still carries an append/immutable flag,
-  # editors that save via rename will fail until --chain releases it.
-  local pflags
+  # editors that save via rename will fail until --chain releases it. The
+  # parent is the row's path less its last name, so the note names it by
+  # kind; the command line, whose path is a value, ends its line.
+  local pflags ef
   pflags="$(flags_of "$(dirname "$f")")"
   case ",$pflags," in
     *,uappnd,*|*,sappnd,*|*,uchg,*|*,schg,*)
-      echo "  ${C_YEL}note:${C_OFF} parent $(dirname "$f") is flagged ($pflags); atomic-save editors"
+      esc_into ef "$f" "$C_RV" "$C_CYN"
+      echo "  ${C_YEL}note:${C_OFF} its parent is flagged ($pflags), so atomic-save editors"
       echo "        (write-then-rename) will fail. In-place edits work, or use:"
-      echo "        ${C_CYN}sudo locked unlock --chain $f${C_OFF}"
+      echo "        ${C_CYN}sudo locked unlock --chain $ef${C_OFF}"
       ;;
   esac
   log_action unlock "$f" ok
@@ -2852,7 +2920,7 @@ release_chain_node() { # <dir>
   state="$(meta_field "$META" state)"
   acl="$(meta_field "$META" acl)"
   if [ "$OPT_DRY" -eq 1 ]; then
-    echo "DRY-RUN: release $d"
+    say_out "DRY-RUN: release" "$d"
     return 0
   fi
   # Flag first: it blocks chown and chmod.
@@ -2872,7 +2940,7 @@ release_chain_node() { # <dir>
     if [ -n "$acl" ] && acl_has "$d" "$acl"; then
       run chmod -a "$acl" "$d" || return 1
     elif acl_names_user "$d" "$owner"; then
-      echo "  ${C_YEL}note:${C_OFF} $d carries an ACL entry for $owner that is not the one recorded; left in place"
+      say_out "  ${C_YEL}note:${C_OFF} an ACL entry for $owner is not the one recorded; left in place" "$d"
     fi
   fi
   retire_record "$d" unneeded quiet || return 1
@@ -2897,7 +2965,7 @@ abs_leaf() { # <path>
   b="$(basename "$p")"
   case "$b" in
     .|..|/)
-      echo "${E_RED}${E_B}refusing $p:${E_OFF} names a directory, not an entry inside one" >&2
+      say_err "${E_RED}${E_B}refusing:${E_OFF} names a directory, not an entry inside one" "$p"
       return 1
       ;;
   esac
@@ -2906,7 +2974,7 @@ abs_leaf() { # <path>
   # Say that here instead of surfacing a bare usage error from inside it.
   case "$b" in
     *$'\t'*|*$'\n'*)
-      echo "${E_RED}${E_B}refusing $p:${E_OFF} the entry name contains a tab or newline" >&2
+      say_err "${E_RED}${E_B}refusing:${E_OFF} the entry name contains a tab or newline" "$p"
       echo "  the window helper refuses those; rename it first" >&2
       return 1
       ;;
@@ -2914,7 +2982,7 @@ abs_leaf() { # <path>
   # Parents are opened O_NOFOLLOW, so a symlinked parent dir is refused
   # outright -- readlink -f here is what makes the call land on a real
   # directory, and it is also what pins the entry to one parent inode.
-  d="$(readlink -f "$d")" || { echo "skip: cannot resolve $(dirname "$p")" >&2; return 1; }
+  d="$(readlink -f "$d")" || { say_err "skipped, cannot resolve" "$(dirname "$p")"; return 1; }
   if [ "$d" = "/" ]; then
     printf '%s\n' "/$b"
   else
@@ -2935,7 +3003,7 @@ leaf_path() { # <path>
   if [ -L "$1" ]; then
     abs_leaf "$1"
   else
-    readlink -f "$1" || { echo "skip: cannot resolve $1" >&2; return 1; }
+    readlink -f "$1" || { say_err "skipped, cannot resolve" "$1"; return 1; }
   fi
 }
 
@@ -3035,17 +3103,21 @@ reseal_after_window() {
     cur="$(flags_of "$n" 2>/dev/null)" || cur=""
     [ "$cur" = "$want" ] && continue
     WINDOW_ALARM=1
-    # An alarm can fire anywhere, so it owns one leading blank line.
+    # An alarm can fire anywhere, so it owns one leading blank line. The
+    # node is a path, so it never sits inside the alarm's marker: the line
+    # under it names it, last.
     echo >&2
-    echo "${E_RED}${E_B}!!! $n came back with flags '${cur:-none}', expected '$want' !!!${E_OFF}" >&2
+    echo "${E_RED}${E_B}!!! a node came back with flags '${cur:-none}', expected '$want' !!!${E_OFF}" >&2
     # -h always: on a symlink it flags the link rather than whatever it
     # points at, and on anything else it changes nothing.
     if chflags -h -- "$want" "$n" 2>/dev/null; then
-      echo "    re-sealed by the backstop: $n ($want)" >&2
+      say_err "    re-sealed by the backstop ($want)" "$n"
       log_action reseal "$n" reseal-backstop
     else
+      local en
+      esc_into en "$n" "$E_RV"
       echo "    could not re-seal it. Restore by hand:" >&2
-      echo "    sudo chflags -h $want $n" >&2
+      echo "    sudo chflags -h $want $en" >&2
       log_action reseal "$n" reseal-failed
     fi
   done
@@ -3068,9 +3140,7 @@ helper_call() {
   HELPER_OUT=""
   HELPER_RC=0
   if [ "$OPT_DRY" -eq 1 ]; then
-    printf 'DRY-RUN: '
-    printf '%q ' "$LOCKED_HELPER" "$@"
-    printf '\n'
+    dry_line "$LOCKED_HELPER" "$@"
     return 0
   fi
   # Re-verified per call, never cached: see verify_helper.
@@ -3099,29 +3169,33 @@ helper_outcome() { # <verb> <path>
       return 0
       ;;
     2)
-      echo "${E_RED}${E_B}refused $f:${E_OFF} the node the helper opened is not the one recorded" >&2
-      echo "  nothing was changed. Check it, then re-run:  ${E_CYN}sudo locked status $f${E_OFF}" >&2
+      local ef
+      esc_into ef "$f" "$E_RV" "$E_CYN"
+      say_err "${E_RED}${E_B}refused:${E_OFF} the node the helper opened is not the one recorded" "$f"
+      echo "  nothing was changed. Check it, then re-run: ${E_CYN}sudo locked status $ef${E_OFF}" >&2
       log_action "$verb" "$f" refuse-identity
       return 1
       ;;
     3)
-      echo "${E_RED}${E_B}failed $f:${E_OFF} the operation did not happen" >&2
+      say_err "${E_RED}${E_B}failed:${E_OFF} the operation did not happen" "$f"
       log_action "$verb" "$f" fail
       return 1
       ;;
     4)
       echo "${E_RED}${E_B}ERROR:${E_OFF} the window helper refused the request as malformed, or is" >&2
-      echo "       not running as root: $LOCKED_HELPER" >&2
+      say_err "       not running as root" "$LOCKED_HELPER"
       log_action "$verb" "$f" fail-helper
       return 1
       ;;
     5)
       # The helper could not put the flag word back. window_end has already
       # run by the time this prints, so the backstop's own lines are above
-      # and say whether re-sealing from the captured word worked.
+      # and say whether re-sealing from the captured word worked. The paths
+      # stand on lines of their own under the alarm, never inside it.
       echo >&2
-      echo "${E_RED}${E_B}!!! $f: the helper could not restore the flags it lifted !!!${E_OFF}" >&2
-      echo "    window left open on: $(helper_line_value window-open)" >&2
+      echo "${E_RED}${E_B}!!! the helper could not restore the flags it lifted !!!${E_OFF}" >&2
+      say_err "    target" "$f"
+      say_err "    window left open on" "$(helper_line_value window-open)"
       echo "    locked's backstop has already re-applied the flag word it" >&2
       echo "    captured before the call; anything it could not fix is above." >&2
       echo "    The record is deliberately NOT updated -- whether the operation" >&2
@@ -3133,7 +3207,8 @@ helper_outcome() { # <verb> <path>
     6)
       HELPER_ANOMALY=1
       echo >&2
-      echo "${E_RED}${E_B}!!! $f: entries other than the target changed inside the window !!!${E_OFF}" >&2
+      echo "${E_RED}${E_B}!!! entries other than the target changed inside the window !!!${E_OFF}" >&2
+      say_err "    target" "$f"
       # The name field arrives backslash-escaped by the helper, precisely so
       # a hostile filename cannot forge one of these lines. Printed as it
       # came: un-escaping here would hand that forgery back.
@@ -3146,7 +3221,7 @@ helper_outcome() { # <verb> <path>
       ;;
     *)
       echo "${E_RED}${E_B}ERROR:${E_OFF} the window helper exited $HELPER_RC, which locked does not" >&2
-      echo "       know how to read. Treating $f as unchanged." >&2
+      say_err "       know how to read; treating the target as unchanged" "$f"
       log_action "$verb" "$f" fail-unknown
       return 1
       ;;
@@ -3164,13 +3239,13 @@ retire_record() { # <path> <via> [quiet]
   snap_paths "$f"
   [ -f "$META" ] || return 0
   if [ "$OPT_DRY" -eq 1 ]; then
-    echo "DRY-RUN: retire record for $f (via=$via)"
+    say_out "DRY-RUN: retire record (via=$via)" "$f"
     return 0
   fi
   rewrite_meta_state "$META" retired "via=$via" "by=$inv" "at=$(now_utc)" || return 1
   # quiet: the caller's own result line already says what happened to the
   # node, and the record following it is bookkeeping, not news.
-  [ "$quiet" = "quiet" ] || echo "  record retired: $f"
+  [ "$quiet" = "quiet" ] || say_out "  record retired" "$f"
 }
 
 # Suspend: trashing is reversible, so retiring here would let a Put Back
@@ -3181,12 +3256,12 @@ suspend_record() { # <path> <bin>
   snap_paths "$f"
   [ -f "$META" ] || return 0
   if [ "$OPT_DRY" -eq 1 ]; then
-    echo "DRY-RUN: suspend record for $f"
+    say_out "DRY-RUN: suspend record" "$f"
     return 0
   fi
   rewrite_meta_state "$META" suspended "by=$inv" "at=$(now_utc)" "bin=$bin" || return 1
-  echo "  record suspended: $f"
-  [ -n "$bin" ] && echo "    bin: $bin"
+  say_out "  record suspended" "$f"
+  [ -z "$bin" ] || say_out "    bin" "$bin"
   return 0
 }
 
@@ -3201,12 +3276,12 @@ rekey_record() { # <oldpath> <newpath>
   [ "$oldenc" != "$newenc" ] || return 0
   for suffix in meta snap snapdir attic; do
     if [ -e "$USER_POOL/$newenc.$suffix" ]; then
-      echo "${E_RED}${E_B}ERROR:${E_OFF} a record already exists for $new; refusing to merge into it" >&2
+      err_val "a record already exists for the new path; refusing to merge into it" "$new"
       return 1
     fi
   done
   if [ "$OPT_DRY" -eq 1 ]; then
-    echo "DRY-RUN: re-key record $old -> $new"
+    move_lines "DRY-RUN: re-key record" "$old" "$new"
     return 0
   fi
   for suffix in meta snap snapdir attic; do
@@ -3217,10 +3292,7 @@ rekey_record() { # <oldpath> <newpath>
     fi
   done
   # The new key hangs under the old one, `→` in the gutter.
-  local eo en
-  esc_into eo "$old" "$C_RV"
-  esc_into en "$new" "$C_RV"
-  printf '  record re-keyed: %s\n%*s→ %s\n' "$eo" 17 '' "$en"
+  move_lines "  record re-keyed" "$old" "$new"
 }
 
 # ---- subtree scan ----------------------------------------------------------
@@ -3260,11 +3332,15 @@ subtree_gate() { # <verb> <target>
     other="$(pool_records_under "${udir}pool" "$target")"
     [ -n "$other" ] || continue
     if [ "$foreign" -eq 0 ]; then
-      echo "${E_RED}${E_B}refusing $verb $target:${E_OFF} it holds locked records that are not yours" >&2
+      say_err "${E_RED}${E_B}refusing $verb:${E_OFF} it holds locked records that are not yours" "$target"
       foreign=1
     fi
     echo "  pool of $uname:" >&2
-    printf '%s\n' "$other" | sed 's/^/    /' >&2
+    while IFS= read -r p; do
+      [ -z "$p" ] || path_lines "    " "$p" >&2
+    done <<EOF
+$other
+EOF
   done
   if [ "$foreign" -eq 1 ]; then
     echo >&2
@@ -3293,9 +3369,11 @@ EOF
   fi
   {
     set_pal
-    echo "${P_RED}${P_B}refusing $verb $target:${P_OFF} locked records live under it"
+    local et
+    esc_into et "$target" "$P_RV"
+    echo "${P_RED}${P_B}refusing $verb:${P_OFF} locked records live under it: $et"
     echo
-    echo "${P_B}records under $target:${P_OFF}"
+    echo "${P_B}records under it:${P_OFF}"
     while IFS= read -r p; do
       [ -n "$p" ] || continue
       status_row "$p" brief || true
@@ -3379,29 +3457,36 @@ blocking_ancestor() { # <path>
 # shown, plain cyan around a bold basename), option flags bold blue --
 # marked LEXICALLY, the token starts with `-` -- paths cyan, a <placeholder>
 # dim, everything else plain. Tokens come from splitting on the single
-# spaces the call sites composed the string with; a spaced path would
-# merely split its color, never its bytes -- the displayed text is exactly
-# the input. Uses the P_* palette: callers run set_pal first.
+# spaces the call sites composed the string with -- by read, so a path
+# holding * or ? is never expanded as a glob -- and each is escaped
+# (esc_into); a spaced path merely splits its color, never its bytes. Into
+# CMD_DISP, never through a command substitution, so a token that cannot
+# be rendered ends locked rather than a subshell. Uses the P_* palette:
+# callers run set_pal first.
+CMD_DISP=""
 cmd_disp() { # <command-string>
-  local IFS=' ' out="" sep="" tok prog_pending=1
-  for tok in $1; do
+  local out="" sep="" tok st prog_pending=1
+  local -a toks=()
+  IFS=' ' read -r -d '' -a toks < <(printf '%s' "$1") || true
+  for tok in ${toks[@]+"${toks[@]}"}; do
     case "$tok" in
-      sudo)  out="$out$sep$P_B$tok$P_OFF" ;;
-      -*)    out="$out$sep$P_BLU$tok$P_OFF" ;;
-      '<'*'>') out="$out$sep$P_DIM$tok$P_OFF" ;;
-      */*)   out="$out$sep$P_CYN$tok$P_OFF" ;;
+      sudo)  st="$P_B" ;;
+      -*)    st="$P_BLU" ;;
+      '<'*'>') st="$P_DIM" ;;
+      */*)   st="$P_CYN" ;;
       *)
+        st=""
         if [ "$prog_pending" -eq 1 ]; then
-          out="$out$sep$P_B$P_CYN$tok$P_OFF"
+          st="$P_B$P_CYN"
           prog_pending=0
-        else
-          out="$out$sep$tok"
         fi
         ;;
     esac
+    esc_into tok "$tok" "$P_RV" "$st"
+    out="$out$sep$st$tok${st:+$P_OFF}"
     sep=' '
   done
-  printf '%s' "$out"
+  CMD_DISP="$out"
 }
 
 # Aligned command/description rows: the gutter is the longest command plus
@@ -3415,15 +3500,16 @@ cmd_disp() { # <command-string>
 # are explanation, not command. Args alternate <command> <description>;
 # bash 3.2 has no stride loop, so the positional list is walked by index.
 cmd_rows() { # <indent> [<command> <description>]...
-  local indent="$1" w=0 dw=0 i j c d
+  local indent="$1" w=0 dw=0 i j c d ce
   set_pal
   shift
+  # Widths come off the escaped command, which is what the row shows.
   i=1
   while [ "$i" -le "$#" ]; do
     j=$((i + 1))
-    c="${!i}"
+    esc_into ce "${!i}"
     d="${!j}"
-    if [ "${#c}" -gt "$w" ]; then w="${#c}"; fi
+    if [ "${#ce}" -gt "$w" ]; then w="${#ce}"; fi
     if [ "${#d}" -gt "$dw" ]; then dw="${#d}"; fi
     i=$((i + 2))
   done
@@ -3434,12 +3520,14 @@ cmd_rows() { # <indent> [<command> <description>]...
     j=$((i + 1))
     c="${!i}"
     d="${!j}"
+    esc_into ce "$c"
+    cmd_disp "$c"
     if [ "$wrap" -eq 1 ]; then
-      printf '%s%s\n%s    %s%s%s\n' "$indent" "$(cmd_disp "$c")" \
+      printf '%s%s\n%s    %s%s%s\n' "$indent" "$CMD_DISP" \
         "$indent" "$P_DIM" "$d" "$P_OFF"
     else
-      printf '%s%s%*s%s%s%s\n' "$indent" "$(cmd_disp "$c")" \
-        $(( w - ${#c} + 2 )) '' "$P_DIM" "$d" "$P_OFF"
+      printf '%s%s%*s%s%s%s\n' "$indent" "$CMD_DISP" \
+        $(( w - ${#ce} + 2 )) '' "$P_DIM" "$d" "$P_OFF"
     fi
     i=$((i + 2))
   done
@@ -3454,8 +3542,10 @@ explain_blocker() { # <node> <flag> [<command> <description>]...
   local n="$1" fl="$2"
   shift 2
   set_pal
-  echo "${P_YEL}note:${P_OFF} $n is flagged $fl, so entries under it cannot be removed"
-  echo "      or renamed while it is sealed."
+  local en
+  esc_into en "$n" "$P_RV"
+  echo "${P_YEL}note:${P_OFF} this directory is flagged $fl, so entries under it cannot"
+  echo "      be removed or renamed while it is sealed: $en"
   snap_paths "$n"
   if [ -f "$META" ] && [ "$(meta_field "$META" state)" = "locked" ]; then
     if [ "$#" -gt 0 ]; then
@@ -3497,9 +3587,9 @@ do_lock_one() {
   # is worth sealing is the operator's call, so the witness says the target
   # is missing and the gate decides.
   if [ "$is_link" -eq 0 ]; then
-    [ -e "$f" ] || { echo "skip $f: does not exist" >&2; log_action lock "$f" skip-noent; return 1; }
+    [ -e "$f" ] || { say_err "skipped, does not exist" "$f"; log_action lock "$f" skip-noent; return 1; }
     if [ ! -f "$f" ] && [ ! -d "$f" ]; then
-      echo "skip $f: not a regular file or directory" >&2
+      say_err "skipped, not a regular file or directory" "$f"
       return 1
     fi
   fi
@@ -3527,7 +3617,7 @@ do_lock_one() {
   if record_live "$META"; then
     rec_role="$(meta_field "$META" role)"
     if [ "$(meta_field "$META" tier)" = "placement" ]; then
-      echo "${E_RED}${E_B}ERROR:${E_OFF} $f is sealed as a chain directory for the files under it" >&2
+      err_val "sealed as a chain directory for the files under it" "$f"
       echo "       Protecting it as content would freeze everything inside it. Protect" >&2
       echo "       the files you mean instead; this seal goes when nothing needs it." >&2
       log_action lock "$f" refuse-chain-dir
@@ -3540,7 +3630,7 @@ do_lock_one() {
   # so it judges the target and never the link. Content is the tier that
   # seals a node as itself, which is the whole point of naming a link here.
   if [ "$is_link" -eq 1 ] && [ "$leaf_tier" != "content" ]; then
-    echo "${E_RED}${E_B}ERROR:${E_OFF} $f is a symlink under ~/.ssh; the anchor tier does not apply to a link" >&2
+    err_val "a symlink under ~/.ssh; the anchor tier does not apply to a link" "$f"
     echo "       A link has no ownership the OS checks -- content is the only" >&2
     echo "       tier that seals the link node itself. Name its target instead." >&2
     log_action lock "$f" refuse-link-tier
@@ -3792,7 +3882,9 @@ $chain"
     done 3<<EOF
 $chain
 EOF
-    echo "chain released; relock with: ${C_CYN}sudo locked lock $f${C_OFF}"
+    local ef
+    esc_into ef "$f" "$C_RV" "$C_CYN"
+    echo "chain released; relock with: ${C_CYN}sudo locked lock $ef${C_OFF}"
   fi
 }
 
@@ -3819,7 +3911,7 @@ do_unprotect_one() {
   f="$(leaf_path "$1")" || return 1
   snap_paths "$f"
   if ! record_live "$META"; then
-    echo "skip $f: not protected" >&2
+    say_err "skipped, not protected" "$f"
     log_action unprotect "$f" skip-no-record
     return 1
   fi
@@ -3828,13 +3920,13 @@ do_unprotect_one() {
   state="$(meta_field "$META" state)"
   tier="$(meta_field "$META" tier)"
   if [ "$role" != "leaf" ]; then
-    echo "skip $f: sealed as part of a chain, not protected by name" >&2
+    say_err "skipped, sealed as part of a chain, not protected by name" "$f"
     echo "  it is released by the first plan in which no protected file needs it" >&2
     log_action unprotect "$f" skip-chain-node
     return 1
   fi
   if [ "$state" = "suspended" ]; then
-    echo "skip $f: in the trash (record suspended); nothing here to unprotect" >&2
+    say_err "skipped, in the trash (record suspended); nothing here to unprotect" "$f"
     log_action unprotect "$f" skip-suspended
     return 1
   fi
@@ -3917,7 +4009,7 @@ unprotect_leaf() {
         fclear "$flag" "$f" || return 1
         ;;
       *)
-        echo "${E_RED}${E_B}ERROR:${E_OFF} $f record has tier '$tier'; only a leaf can be unprotected" >&2
+        err_val "the record has tier '$tier'; only a leaf can be unprotected" "$f"
         return 1
         ;;
     esac
@@ -3958,14 +4050,24 @@ sealed_folder_for() { # <path> <is-new>
     [ "$d" = "/" ] && return 3
     d="$(dirname "$d")"
   done
+  # Each refusal names the file last on its own line, and the folder (and
+  # the node) on rows under it: two paths never share a line.
   if [ "$(meta_field "$META" state)" != "locked" ]; then
-    echo "skip $f: its folder $d is unlocked -- edit it directly, then: sudo locked lock $d" >&2
+    say_err "skipped, its folder is unlocked" "$f"
+    value_rows "  " folder id "$d" >&2
+    cmd_rows "  " "sudo locked lock $d" "seals it again once you have edited the file directly" >&2
     return 1
   fi
-  cur="$(node_id "$d")" || { echo "skip $f: cannot read the identity of $d" >&2; return 1; }
+  cur="$(node_id "$d")" || {
+    say_err "skipped, cannot read the identity of its folder" "$f"
+    value_rows "  " folder id "$d" >&2
+    return 1
+  }
   same_node "$(meta_field "$META" id)" "$cur" || sn=$?
   if [ "$sn" -ne 0 ]; then
-    echo "skip $f: $d is not the folder its record names -- check: sudo locked status $d" >&2
+    say_err "skipped, its folder is not the node its record names" "$f"
+    value_rows "  " folder id "$d" >&2
+    cmd_rows "  " "sudo locked status $d" "shows what the record says" >&2
     return 1
   fi
   # Every node from the file up to the folder: lock-owned and frozen, as
@@ -3984,13 +4086,17 @@ sealed_folder_for() { # <path> <is-new>
       [ -d "$n" ] || bad=1
     fi
     if [ "$bad" -eq 1 ]; then
-      echo "skip $f: $n is not sealed as $d's record says -- check: sudo locked status $d" >&2
+      say_err "skipped, a node is not sealed as its folder's record says" "$f"
+      value_rows "  " node id "$n" folder id "$d" >&2
+      cmd_rows "  " "sudo locked status $d" "shows what the record says" >&2
       return 1
     fi
     case ",$(flags_of "$n")," in
       *,uchg,*) ;;
       *)
-        echo "skip $f: $n is not frozen (uchg) as $d's record says -- check: sudo locked status $d" >&2
+        say_err "skipped, a node is not frozen (uchg) as its folder's record says" "$f"
+        value_rows "  " node id "$n" folder id "$d" >&2
+        cmd_rows "  " "sudo locked status $d" "shows what the record says" >&2
         return 1
         ;;
     esac
@@ -4069,8 +4175,8 @@ note_folder_install() {
 # above say what drifted, and `locked verify` prints the rest.
 report_mismatch() {
   local f="$1" what="$2" rec="$3"
-  echo "${E_RED}${E_B}ERROR:${E_OFF} $f was installed, but it is not what you approved ($what)" >&2
-  echo "  recorded as drift on $rec until you edit the file again, or unlock and relock $rec" >&2
+  err_val "installed, but it is not what you approved ($what)" "$f"
+  say_err "  recorded as drift until you edit the file again, or unlock and relock this record" "$rec"
   log_action edit "$f" "mismatch-${what//,/-}"
   local OPT_QUIET=1
   do_verify >/dev/null 2>&1 || true
@@ -4094,7 +4200,7 @@ do_edit_one() {
   # through it would edit a file the caller did not name. Say which node is
   # editable instead of quietly acting on another one.
   if [ -L "$f" ]; then
-    echo "skip $f: a symlink has no content to edit -- name the file it points at" >&2
+    say_err "skipped, a symlink has no content to edit; name the file it points at" "$f"
     echo "  (re-pointing the link is a lock/unlock of the link node itself)" >&2
     log_action edit "$f" refuse-symlink
     return 1
@@ -4103,14 +4209,14 @@ do_edit_one() {
   # resolved and the name kept. Only a sealed folder can take one (below).
   local is_new=0 base
   if [ -e "$f" ]; then
-    f="$(readlink -f "$f")" || { echo "skip: cannot resolve $1" >&2; return 1; }
-    [ -f "$f" ] || { echo "skip $f: edit supports regular files only" >&2; return 1; }
+    f="$(readlink -f "$f")" || { say_err "skipped, cannot resolve" "$1"; return 1; }
+    [ -f "$f" ] || { say_err "skipped, edit supports regular files only" "$f"; return 1; }
   else
     base="$(basename -- "$f")"
     case "$base" in
-      .|..|'') echo "skip $f: not a file name" >&2; return 1 ;;
+      .|..|'') say_err "skipped, not a file name" "$f"; return 1 ;;
     esac
-    f="$(readlink -f "$(dirname -- "$f")")" || { echo "skip: cannot resolve $1" >&2; return 1; }
+    f="$(readlink -f "$(dirname -- "$f")")" || { say_err "skipped, cannot resolve" "$1"; return 1; }
     f="${f%/}/$base"
     is_new=1
   fi
@@ -4126,7 +4232,7 @@ do_edit_one() {
   if [ ! -f "$META" ]; then
     sealed_folder_for "$f" "$is_new" || frc=$?
     if [ "$frc" -eq 3 ]; then
-      echo "skip $f: not in pool (edit works on locked files, or files in a locked folder; use lock to adopt)" >&2
+      say_err "skipped, not in pool (edit works on locked files, or files in a locked folder; use lock to adopt)" "$f"
       return 1
     fi
     [ "$frc" -eq 0 ] || { log_action edit "$f" refuse-folder; return 1; }
@@ -4143,7 +4249,7 @@ do_edit_one() {
       mode="$(stat -f '%OLp' "$f")"
     fi
   else
-    [ "$is_new" -eq 0 ] && [ -f "$f" ] || { echo "skip $f: edit supports regular files only" >&2; return 1; }
+    [ "$is_new" -eq 0 ] && [ -f "$f" ] || { say_err "skipped, edit supports regular files only" "$f"; return 1; }
     tier="$(meta_field "$META" tier)"
     state="$(meta_field "$META" state)"
     flag="$(meta_field "$META" flag)"
@@ -4152,10 +4258,11 @@ do_edit_one() {
     group="$(meta_field "$META" group)"
     case "$tier" in
       content|anchor) ;;
-      *) echo "skip $f: edit supports content/anchor files, not tier '$tier'" >&2; return 1 ;;
+      *) say_err "skipped, edit supports content/anchor files, not tier '$tier'" "$f"; return 1 ;;
     esac
     if [ "$state" != "locked" ]; then
-      echo "skip $f: currently unlocked -- edit it directly, then: sudo locked lock $f" >&2
+      say_err "skipped, currently unlocked" "$f"
+      cmd_rows "  " "sudo locked lock $f" "seals it again once you have edited it directly" >&2
       return 1
     fi
   fi
@@ -4187,7 +4294,7 @@ do_edit_one() {
     # shellcheck disable=SC2024
     sudo -u "$inv" -- /bin/cat -- "$OPT_FROM" >"$stage" || {
       rm -f -- "$stage"
-      echo "--from: cannot read as $inv: $OPT_FROM" >&2
+      say_err "--from: cannot read as $inv" "$OPT_FROM"
       log_action edit "$f" refuse-unreadable-proposal
       return 1
     }
@@ -4212,7 +4319,7 @@ do_edit_one() {
     editor="${OPT_EDITOR:-${SUDO_EDITOR:-${VISUAL:-${EDITOR:-vi}}}}"
     # 9>&-: the editor must not inherit the run lock (see run_lock_take).
     if ! sudo -u "$inv" -- "$editor" "$copy" 9>&-; then
-      echo "editor exited nonzero; nothing installed: $f" >&2
+      say_err "editor exited nonzero; nothing installed" "$f"
       rm -rf -- "$editdir"
       return 1
     fi
@@ -4224,7 +4331,7 @@ do_edit_one() {
     sudo -u "$inv" -- /bin/cat -- "$copy" >"$stage" || {
       rm -f -- "$stage"
       rm -rf -- "$editdir"
-      echo "edit: cannot read the edited copy as $inv: $copy" >&2
+      say_err "edit: cannot read the edited copy as $inv" "$copy"
       log_action edit "$f" refuse-unreadable-copy
       return 1
     }
@@ -4241,7 +4348,7 @@ do_edit_one() {
   if [ "$is_new" -eq 0 ] && cmp -s -- "$stage" "$f"; then
     if [ "$(mismatch_kv "$META")" = "$(mismatch_kv "$META" "$f")" ]; then
       rm -f -- "$stage"
-      echo "no changes: $f"
+      say_out "no changes" "$f"
       log_action edit "$f" skip-unchanged
       return 0
     fi
@@ -4259,7 +4366,7 @@ do_edit_one() {
     "$LOCKED_HELPER" xattrs-from --src "$f" --src-id "${fid/./:}" \
       --dest "$stage" || {
       rm -f -- "$stage"
-      echo "edit: cannot carry $f's extended attributes onto the candidate" >&2
+      say_err "edit: cannot carry the file's extended attributes onto the candidate" "$f"
       log_action edit "$f" refuse-xattrs
       return 1
     }
@@ -4386,18 +4493,18 @@ do_revert_one() {
   f="$(leaf_path "$1")" || return 1
   snap_paths "$f"
   if [ ! -L "$f" ] && [ -d "$f" ]; then
-    echo "skip $f: revert supports files only (unlock, restore by hand, lock)" >&2
+    say_err "skipped, revert supports files only (unlock, restore by hand, lock)" "$f"
     return 1
   fi
   if [ ! -f "$SNAP" ]; then
-    echo "skip $f: no snapshot to revert from" >&2
+    say_err "skipped, no snapshot to revert from" "$f"
     log_action revert "$f" skip-no-snap
     return 0
   fi
   # Guard against double-revert: if file already matches snapshot, the
   # current attic IS the legitimate discarded edit; preserve it.
   if cmp -s "$f" "$SNAP"; then
-    echo "skip $f: file already matches snapshot (preserving existing .attic)" >&2
+    say_err "skipped, file already matches snapshot (preserving existing .attic)" "$f"
     log_action revert "$f" skip-already-reverted
     return 0
   fi
@@ -4442,7 +4549,7 @@ do_revert_one() {
     run atomic_replace "$SNAP" "$f" "${owner:-$inv}:${group:-staff}" "$mode" || return 1
   fi
   ok_row "reverted from snapshot" "$f"
-  echo "  discarded content saved to: $ATTIC"
+  say_out "  discarded content saved to" "$ATTIC"
   log_action revert "$f" ok
 }
 
@@ -4457,7 +4564,7 @@ do_rm_one() {
   local f
   f="$(abs_leaf "$1")" || return 1
   if [ ! -e "$f" ] && [ ! -L "$f" ]; then
-    echo "skip $f: does not exist" >&2
+    say_err "skipped, does not exist" "$f"
     log_action rm "$f" skip-noent
     return 1
   fi
@@ -4472,7 +4579,7 @@ do_rm_one() {
   # but refusing here means the window never opens at all.
   if [ -d "$f" ] && [ ! -L "$f" ] && [ "$OPT_RECURSIVE" -eq 0 ]; then
     if [ -n "$(ls -A -- "$f" 2>/dev/null)" ]; then
-      echo "skip $f: directory is not empty" >&2
+      say_err "skipped, directory is not empty" "$f"
       cmd_rows "  " \
         "sudo locked rm --recursive $f" "removes it and everything under it" >&2
       log_action rm "$f" skip-nonempty
@@ -4591,7 +4698,7 @@ do_trash_one() {
   local f
   f="$(abs_leaf "$1")" || return 1
   if [ ! -e "$f" ] && [ ! -L "$f" ]; then
-    echo "skip $f: does not exist" >&2
+    say_err "skipped, does not exist" "$f"
     log_action trash "$f" skip-noent
     return 1
   fi
@@ -4624,7 +4731,7 @@ do_trash_one() {
   # The mode bits are the whole answer this reads, which holds for
   # placement because the entry adds nothing that removes an entry.
   if ! user_can_write_dir "$inv" "$parent"; then
-    echo "${E_RED}${E_B}refusing trash $f:${E_OFF} $inv cannot write $parent" >&2
+    say_err "${E_RED}${E_B}refusing trash:${E_OFF} $inv cannot write the directory it is in" "$parent"
     echo "  The trash service runs as you, not as root, so the move out of" >&2
     echo "  that directory needs your own rights on it -- releasing the flag" >&2
     echo "  does not grant them." >&2
@@ -4649,7 +4756,7 @@ do_trash_one() {
   bin="$(helper_line_value binurl)"
   ok_row trashed "$f"
   if [ -n "$bin" ]; then
-    echo "  bin: $bin"
+    say_out "  bin" "$bin"
   elif [ "$OPT_DRY" -eq 0 ]; then
     # Without the destination the suspension cannot be finalized later,
     # and Put Back would resurrect an unsealed node with nothing watching.
@@ -4673,12 +4780,12 @@ do_mv() { # <old> <new>
   old="$(abs_leaf "$1")" || return 1
   new="$(abs_leaf "$2")" || return 1
   if [ ! -e "$old" ] && [ ! -L "$old" ]; then
-    echo "skip $old: does not exist" >&2
+    say_err "skipped, does not exist" "$old"
     log_action mv "$old" skip-noent
     return 1
   fi
   if [ -e "$new" ] || [ -L "$new" ]; then
-    echo "${E_RED}${E_B}refusing:${E_OFF} $new already exists; locked mv never clobbers" >&2
+    say_err "${E_RED}${E_B}refusing:${E_OFF} the new path already exists; locked mv never clobbers" "$new"
     log_action mv "$old" refuse-exists
     return 1
   fi
@@ -4686,14 +4793,15 @@ do_mv() { # <old> <new>
   oldparent="$(dirname "$old")"
   newparent="$(dirname "$new")"
   if [ ! -d "$newparent" ]; then
-    echo "${E_RED}${E_B}refusing:${E_OFF} $newparent is not a directory" >&2
+    say_err "${E_RED}${E_B}refusing:${E_OFF} not a directory" "$newparent"
     return 1
   fi
   # Rename cannot cross filesystems, and a copy+delete would drop the BSD
   # flags and xattrs this tool exists to keep. Say so here rather than
   # letting an EXDEV from inside the window explain it later.
   if [ "$(stat -f '%d' "$oldparent")" != "$(stat -f '%d' "$newparent")" ]; then
-    echo "${E_RED}${E_B}refusing:${E_OFF} $old and $new are on different filesystems" >&2
+    echo "${E_RED}${E_B}refusing:${E_OFF} the two paths are on different filesystems" >&2
+    value_rows "  " old id "$old" new id "$new" >&2
     echo "  a copy would drop flags and xattrs, so locked will not do it" >&2
     log_action mv "$old" refuse-xdev
     return 1
@@ -4752,7 +4860,7 @@ do_mv() { # <old> <new>
       lrc=0
       do_lock_one "$moved" || lrc=$?
       if [ "$lrc" -ne 0 ]; then
-        echo "${E_YEL}note:${E_OFF} $moved is sealed, but the chain at its new place is not settled:" >&2
+        say_err "${E_YEL}note:${E_OFF} sealed, but the chain at its new place is not settled" "$moved"
         cmd_rows "      " "sudo locked lock $moved" "seals the new chain and releases the old one" >&2
       fi
     done
@@ -4769,12 +4877,12 @@ do_rekey() { # <old> <new>
   new="$(abs_leaf "$2")" || return 1
   snap_paths "$old"
   if [ ! -f "$META" ]; then
-    echo "skip $old: not in pool (nothing to re-key)" >&2
+    say_err "skipped, not in pool (nothing to re-key)" "$old"
     return 1
   fi
   want="$(meta_field "$META" id)"
   if [ ! -e "$new" ] && [ ! -L "$new" ]; then
-    echo "${E_RED}${E_B}refusing:${E_OFF} $new does not exist" >&2
+    say_err "${E_RED}${E_B}refusing:${E_OFF} does not exist" "$new"
     cmd_rows "  " "sudo locked tombstone $old" "records it as gone instead" >&2
     return 1
   fi
@@ -4785,9 +4893,9 @@ do_rekey() { # <old> <new>
   # rewrites its id field, and refusing the repair over a spelling would be
   # the reboot bug all over again.
   if [ "$sn" -eq 1 ]; then
-    echo "${E_RED}${E_B}refusing:${E_OFF} $new is identity $cur, but the record for $old holds $want" >&2
-    echo "  The node at $new is not the one that record describes, so re-keying" >&2
-    echo "  would attach its snapshot and flag history to a different file." >&2
+    say_err "${E_RED}${E_B}refusing:${E_OFF} the node here is not the one that record describes" "$new"
+    value_rows "  " record id "$old" "recorded id" plain "$want" "id here" plain "$cur" >&2
+    echo "  Re-keying would attach its snapshot and flag history to a different file." >&2
     cmd_rows "  " "sudo locked tombstone $old" "if the recorded node is really gone" >&2
     log_action rekey "$old" refuse-identity
     return 1
@@ -4805,13 +4913,13 @@ do_tombstone_one() {
   local f state
   f="$(abs_leaf "$1")" || return 1
   if [ -e "$f" ] || [ -L "$f" ]; then
-    echo "skip $f: present on disk; use rm or trash, or unlock if you want it back" >&2
+    say_err "skipped, present on disk; use rm or trash, or unlock if you want it back" "$f"
     log_action tombstone "$f" skip-present
     return 1
   fi
   snap_paths "$f"
   if [ ! -f "$META" ]; then
-    echo "skip $f: not in pool (nothing to tombstone)" >&2
+    say_err "skipped, not in pool (nothing to tombstone)" "$f"
     log_action tombstone "$f" skip-no-meta
     return 1
   fi
@@ -5086,7 +5194,7 @@ do_status_one() {
   else
     case "$f" in
       /*) ;;
-      *) echo "cannot resolve $1" >&2; return 1 ;;
+      *) say_err "cannot resolve" "$1"; return 1 ;;
     esac
   fi
   snap_paths "$f"
@@ -5144,7 +5252,7 @@ EOF
     echo "${P_YEL}note:${P_OFF} no protected file needs these any more:"
     local i=$((${#RELEASE_PATHS[@]} - 1))
     while [ "$i" -ge 0 ]; do
-      echo "      ${RELEASE_PATHS[$i]}"
+      path_lines "      " "${RELEASE_PATHS[$i]}"
       i=$((i - 1))
     done
     echo "      The next sudo locked lock, unprotect or rm releases them."
@@ -5295,7 +5403,7 @@ do_verify() {
       fi
     done
     if ! write_verify_status "$udir" "$ulock" "$at" "$records" ${drifted[@]+"${drifted[@]}"}; then
-      echo "${E_RED}${E_B}ERROR:${E_OFF} could not write $udir/verify" >&2
+      err_val "could not write the verify status" "$udir/verify"
       status_failed=1
     fi
     total_drift=$((total_drift + ${#drifted[@]}))
@@ -5387,8 +5495,8 @@ case "$action" in
         # It still counts as a failure, so the overall exit is 3 -- it just
         # does not get the "error processing" line, which would be false.
         case "$action" in
-          rm|trash) [ "$rc" -eq 3 ] || echo "error processing $f (continuing)" >&2 ;;
-          *)        echo "error processing $f (continuing)" >&2 ;;
+          rm|trash) [ "$rc" -eq 3 ] || say_err "error processing (continuing)" "$f" ;;
+          *)        say_err "error processing (continuing)" "$f" ;;
         esac
       fi
     done

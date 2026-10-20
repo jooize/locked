@@ -249,7 +249,7 @@ sudo dscacheutil -flushcache
 ### Verify
 
 ```sh
-sudo /usr/local/sbin/locked unlock /nonexistent   # should print 'skip /nonexistent: does not exist'
+sudo /usr/local/sbin/locked unlock /nonexistent   # should print 'skipped, cannot resolve: /nonexistent'
 ```
 Touch ID/password prompt names `/usr/local/sbin/locked unlock /nonexistent`; binary runs; logs `result=skip-noent` via `log show --predicate 'eventMessage CONTAINS "locked:"' --last 1m`.
 
