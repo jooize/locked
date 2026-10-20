@@ -1773,10 +1773,11 @@ snap_paths() { # sets ENC SNAP SNAPDIR ATTIC META for path $1
 
 # ---- verify findings ----------------------------------------------------------
 #
-# verify_node reports what it finds as lines of `<word><TAB><detail>`, one
-# finding per line, and verify_rows draws them: the word first, in a field
-# of known width, the path last, each detail on a dim line under it in the
-# path's column (terminal-output Rows):
+# verify_node reports what it finds as lines of
+# `<word><TAB><weight><TAB><detail>`, one finding per line, and
+# verify_rows draws them: the word first, in a field of known width, the
+# path last, each detail on a line under it in the path's column
+# (terminal-output Rows):
 #
 #   drift  /Users/me/.zshrc
 #          owner jooize, expected _jooize-lock
@@ -1785,7 +1786,12 @@ snap_paths() { # sets ENC SNAP SNAPDIR ATTIC META for path $1
 #          intentionally unlocked; relock with: sudo locked lock
 #
 # The words: drift, open (deliberately unlocked), info (a record locked
-# repaired on its way to clean), note (a repair that needs root). A path
+# repaired on its way to clean), note (a repair that needs root). The
+# weight says what the detail is to the reader: a drift fact (what is
+# wrong, what is missing) is what the reader decides from, so it prints
+# plain, never dim (terminal-output, color roles). Context -- where a
+# node was, a command to run next -- and every detail of the other words
+# print dim, safe to skim. A path
 # inside a detail is escaped as the detail is composed, so the detail is
 # one line whatever the name holds. The findings carry no color: a
 # finding is composed before anyone knows which stream will show it (a
@@ -1795,8 +1801,10 @@ snap_paths() { # sets ENC SNAP SNAPDIR ATTIC META for path $1
 # before it and SI after it, and verify_rows turns them into reverse red
 # and back into the line's style.
 
-# vline <word> <detail>: one finding.
-vline() { printf '%s\t%s\n' "$1" "$2"; }
+# vline <word> <detail>: one finding, a fact. vctx <word> <detail>: a line
+# of context under it.
+vline() { printf '%s\tfact\t%s\n' "$1" "$2"; }
+vctx() { printf '%s\tcontext\t%s\n' "$1" "$2"; }
 
 # vpath <var> <path>: <path> escaped into <var>, for a detail line, each
 # hidden escape between SO and SI. esc_into closes an escape with a reset,
@@ -1818,30 +1826,35 @@ verify_unescape() {
 # each run of one word is a row, `<indent><word>  <path>`, its details
 # under it. Without one -- the path already ends the row above, a status
 # row or an error -- the details alone, at <indent>, a word other than
-# drift leading its own detail (`info: ...`). Prints with set_pal, so a
-# caller sends it to stderr with >&2 and it takes the colors of stderr.
+# drift leading its own detail (`info: ...`). A drift fact is plain, the
+# rest dim. Prints with set_pal, so a caller sends it to stderr with >&2
+# and it takes the colors of stderr.
 verify_rows() {
-  local ind="$1" p="" word det last="" ep col
+  local ind="$1" p="" word wt det last="" ep col st
   set_pal
   if [ -n "${2:-}" ]; then
     esc_into ep "$2" "$P_RV"
     p=1
   fi
   col=$(( ${#ind} + 5 + 2 ))
-  while IFS=$'\t' read -r word det; do
+  while IFS=$'\t' read -r word wt det; do
     [ -n "$word" ] || continue
+    st="$P_DIM"
+    if [ "$word" = "drift" ] && [ "$wt" = "fact" ]; then
+      st=""
+    fi
     det="${det//$'\016'/$P_RV}"
-    det="${det//$'\017'/$P_OFF$P_DIM}"
+    det="${det//$'\017'/$P_OFF$st}"
     if [ -n "$p" ]; then
       if [ "$word" != "$last" ]; then
         printf '%s%-5s  %s\n' "$ind" "$word" "$ep"
         last="$word"
       fi
-      printf '%*s%s%s%s\n' "$col" '' "$P_DIM" "$det" "$P_OFF"
+      printf '%*s%s%s%s\n' "$col" '' "$st" "$det" "${st:+$P_OFF}"
     elif [ "$word" = "drift" ]; then
-      printf '%s%s%s%s\n' "$ind" "$P_DIM" "$det" "$P_OFF"
+      printf '%s%s%s%s\n' "$ind" "$st" "$det" "${st:+$P_OFF}"
     else
-      printf '%s%s%s: %s%s\n' "$ind" "$P_DIM" "$word" "$det" "$P_OFF"
+      printf '%s%s%s: %s%s\n' "$ind" "$st" "$word" "$det" "${st:+$P_OFF}"
     fi
   done
 }
@@ -1915,10 +1928,10 @@ verify_node() {
       vline drift "back from the trash and unsealed"
       if [ -n "$bin" ]; then
         vpath ep "$bin"
-        vline drift "it was in the bin at: $ep"
+        vctx drift "it was in the bin at: $ep"
       fi
       vpath ep "$(shq "$f")"
-      vline drift "relock it with: sudo locked lock $ep"
+      vctx drift "relock it with: sudo locked lock $ep"
       return 1
     fi
     if [ -n "$bin" ] && [ ! -e "$bin" ] && [ ! -L "$bin" ]; then
@@ -5593,7 +5606,7 @@ verify_summary() { # <userdir>
     for line in ${paths[@]+"${paths[@]}"}; do
       path_lines "      " "$(verify_unescape "$line")"
     done
-    [ "$drifted" -le "${#paths[@]}" ] || echo "      ${P_DIM}and $((drifted - ${#paths[@]})) more${P_OFF}"
+    [ "$drifted" -le "${#paths[@]}" ] || echo "      and $((drifted - ${#paths[@]})) more"
     echo "      details: ${P_CYN}sudo locked verify${P_OFF}"
   fi
   if [ "$age" -gt $((3 * interval)) ]; then
