@@ -39,9 +39,14 @@ let
   # changes shape in the script: INSTALL_TARGET's default becomes the
   # system-profile path (stable across generations, always resolving to
   # the current build), LOCKED_HELPER's default becomes the store path of
-  # the helper built above, and LOCKED_VERIFY_INTERVAL's default becomes
+  # the helper built above, LOCKED_VERIFY_INTERVAL's default becomes
   # verifyInterval, so every verify run -- the timer's or a manual one --
-  # records the period readers judge its age against.
+  # records the period readers judge its age against, and LOCKED_GIT, the
+  # git that draws every diff, becomes pkgs.git's store path. LOCKED_GIT
+  # is a plain readonly assignment, not a `:=` default: root runs that git
+  # on bytes the invoker wrote, so no environment may name another, and
+  # like the helper's path it puts the git in the closure and under the
+  # sudoers digest.
   #
   # Deliberate non-rewrites, unlike pinned's module: the shebang is
   # already `/bin/bash -p` in the repo (see the script's own header --
@@ -64,6 +69,10 @@ let
     {
       from = '': "''${LOCKED_VERIFY_INTERVAL:=900}"'';
       to = '': "''${LOCKED_VERIFY_INTERVAL:=${toString cfg.verifyInterval}}"'';
+    }
+    {
+      from = "readonly LOCKED_GIT=/Library/Developer/CommandLineTools/usr/bin/git\n";
+      to = "readonly LOCKED_GIT=${pkgs.git}/bin/git\n";
     }
   ];
   scriptText =

@@ -68,6 +68,18 @@ VERSION=0.15.5
 # every call. As a test seam it behaves like the others -- settable when
 # the script is run directly as root, dead under sudo's env_reset.
 : "${LOCKED_HELPER:=/usr/local/sbin/locked-helper}"
+# The git that draws every diff (see git_diff). A plain assignment, not a
+# seam: root runs it on bytes the invoker wrote, so no environment may
+# name another one, the harness included -- it runs a copy with this line
+# rewritten. The nix module rewrites it to the store path of pkgs.git
+# (keep the exact `readonly LOCKED_GIT=...` shape for its anchor), and
+# verify_git checks root ownership, mode and the whole ancestry on each
+# diff. The default is the real git binary of Apple's command line tools,
+# never /usr/bin/git: that one is a shim which picks the git it runs from
+# DEVELOPER_DIR and xcode-select state -- with Xcode installed, a git
+# inside /Applications, a folder the admin group can write -- so walking
+# the shim's own path would vouch for a program it does not run.
+readonly LOCKED_GIT=/Library/Developer/CommandLineTools/usr/bin/git
 # Everything locked keeps: one root-owned dir per user under it, holding
 # that user's pool and the result of the last verify run (see the root
 # convergence block below for the shape).
@@ -2377,10 +2389,338 @@ apply_releases() {
 # ---- diff witness ----------------------------------------------------------
 
 # The diff witness renders candidate bytes, so it must not let those bytes
-# talk to the terminal. Every diff site runs with --color=never and pipes
-# the capture through UNTRUSTED_PL in its lines mode (see third-party text
-# at the top), which is the only thing in the block that emits an escape --
-# so any escape on screen is locked's own.
+# talk to the terminal. Every diff is git_diff's, which asks git for no
+# color, and the capture goes through UNTRUSTED_PL in its lines mode (see
+# third-party text at the top), which is the only thing in the block that
+# emits an escape -- so any escape on screen is locked's own.
+#
+# The engine is git, not diff(1). /usr/bin/diff is FreeBSD's and splits a
+# line at a lone carriage return: `a<CR>b` changed to `a<CR>X` reads as an
+# unchanged `a` above `-b` and `+X`, a diff whose structure is wrong
+# before anything renders it. git splits at line feeds only. Its -r also
+# follows symbolic links, so a link in a folder being relocked showed, to
+# root, the content of whatever it pointed at; git shows the link text.
+
+# verify_git: the git LOCKED_GIT names is root-owned, unwritable by anyone
+# else and reached through an ancestry no non-root process can redirect --
+# the walk verify_helper makes of the window helper, here on every diff.
+# A hand install with no git at that path refuses, naming the path last.
+verify_git() {
+  if [ ! -f "$LOCKED_GIT" ] || [ ! -x "$LOCKED_GIT" ]; then
+    err_val "git not found (a hand install needs the command line tools)" "$LOCKED_GIT"
+    return 1
+  fi
+  verify_root_owned_file "$LOCKED_GIT" || return 1
+  verify_program_ancestry "$LOCKED_GIT" || return 1
+  local real
+  real="$(readlink -f "$LOCKED_GIT")" || return 1
+  if [ "$real" != "$LOCKED_GIT" ]; then
+    verify_root_owned_file "$real" || return 1
+  fi
+}
+
+# What git_diff hands its output to: git's patch in, locked's diff out, in
+# the shape diff -u --label wrote and the lines mode of UNTRUSTED_PL reads.
+# Perl rather than awk, because awk ends a line at a NUL and git prints
+# one raw in a text diff when it sits past the first 8000 bytes; perl
+# reads bytes and keeps all of them.
+#
+# Each file section's header block (`diff --git`, mode and `index` lines,
+# `---`/`+++` naming paths) becomes `--- <label>` and `+++ <label>`: the
+# caller's label for the operand itself, the label plus the path below
+# it for a file inside an operand that is a folder, `/dev/null` for the
+# side of a file that exists on one side only (an operand that IS
+# /dev/null takes the caller's label), and ` (symlink)` after a side that
+# is a symbolic link. In a folder diff each section opens on `diff
+# <path below the folder>`, which is what tells the lines mode a new file
+# begins; a file diff has one section and no such line, as before. A
+# `Binary files` line names the labels. A hunk header ends at its closing
+# `@@`, without the function context git appends. A section that only
+# changes a mode is not content and is left out, as diff -r left it out;
+# an empty file that exists on one side only is a header pair with no
+# hunk.
+#
+# Names arrive as git writes them: a name holding a control character,
+# `"`, `\` or a byte past ASCII comes in double quotes with C escapes,
+# which this decodes exactly; any other comes bare, and a bare name with
+# a space carries a tab after it on the ---/+++ lines. A bare name cannot
+# be split from its neighbor by looking alone (`Binary files A and B
+# differ` with an ` and ` in a name), so each one is matched against the
+# operand it has to start with. A name that does not, a name with a line
+# feed (it would break the header it stands on into two lines), or any
+# line this does not know is trouble.
+#
+# FAIL CLOSED: nothing is printed until all of the input has parsed. The
+# exit status answers in git's terms from what was read -- 0 for no
+# input, 1 for a diff printed, 3 for sections that were all mode changes
+# -- and 2 for anything else, with nothing printed and one line on stderr
+# saying why, in locked's own words. Read from GD_OLD,
+# GD_NEW (the operands as passed to git) and GD_OLD_LABEL, GD_NEW_LABEL.
+# A single-quoted bash string, like UNTRUSTED_PL, so it holds no single
+# quote.
+# shellcheck disable=SC2016  # the single quotes are the point: no expansion
+readonly GIT_DIFF_PL='
+use strict;
+binmode(STDIN);
+binmode(STDOUT);
+my ($old, $new, $lo, $ln) = map { defined $ENV{$_} ? $ENV{$_} : exit 2 }
+  qw(GD_OLD GD_NEW GD_OLD_LABEL GD_NEW_LABEL);
+my $ea = "a/" . substr($old, 1);
+my $eb = "b/" . substr($new, 1);
+my %ce = (a => "\a", b => "\b", t => "\t", n => "\n", v => "\013", f => "\f",
+  r => "\r", "\"" => "\"", "\\" => "\\");
+# bad [<reason>]: stop, saying why on stderr; nothing has been printed.
+sub bad {
+  print STDERR (@_ ? $_[0] : "git printed something that is not a diff locked can read"), "\n";
+  exit 2;
+}
+# cq <text>: the C-quoted name at the start of <text>, decoded, and what
+# follows its closing quote; () when it is not one.
+sub cq {
+  my $s = shift;
+  my $o = "";
+  return () unless $s =~ s/\A"//;
+  while (1) {
+    if ($s =~ s/\A([^"\\]+)//) { $o .= $1; }
+    elsif ($s =~ s/\A"//) { return ($o, $s); }
+    elsif ($s =~ s/\A\\([0-3][0-7][0-7])//) { $o .= chr(oct($1)); }
+    elsif ($s =~ s/\A\\([abtnvfr"\\])//) { $o .= $ce{$1}; }
+    else { return (); }
+  }
+}
+# whole <text>: <text> as one name, quoted or bare; undef when it is not.
+# git quotes every name holding anything outside printable ASCII, a
+# double quote or a backslash, so a bare one holds none of them.
+sub whole {
+  my $s = shift;
+  if ($s =~ /\A"/) {
+    my ($n, $r) = cq($s);
+    return (defined $n && $r eq "") ? $n : undef;
+  }
+  return $s =~ /\A[\x20\x21\x23-\x5B\x5D-\x7E]+\z/ ? $s : undef;
+}
+# name1 <text>: the name on a ---/+++ line, a tab after it allowed.
+sub name1 {
+  my $s = shift;
+  if ($s =~ /\A"/) {
+    my ($n, $r) = cq($s);
+    return (defined $n && ($r eq "" || $r eq "\t")) ? $n : undef;
+  }
+  $s =~ s/\t\z//;
+  return whole($s);
+}
+# side <name> <a|b> <mode>: the label for one side and the path below
+# its operand ("" for the operand itself, undef for an absent side); ()
+# when the name is not one this diff can hold.
+sub side {
+  my ($p, $w, $m) = @_;
+  my ($op, $e, $l) = $w eq "a" ? ($old, $ea, $lo) : ($new, $eb, $ln);
+  return () unless defined $p;
+  return ($op eq "/dev/null" ? $l : "/dev/null", undef) if $p eq "/dev/null";
+  my $rel;
+  if ($p eq $e) { $rel = ""; }
+  elsif (substr($p, 0, length($e) + 1) eq "$e/") { $rel = substr($p, length($e)); }
+  else { return (); }
+  bad("a name in it holds a line feed, which a diff header cannot show") if $rel =~ /\n/;
+  return ($l . $rel . ((defined $m && $m eq "120000") ? " (symlink)" : ""), $rel);
+}
+my @out;
+my $st = "";
+my ($git, $ma, $mb, $nf, $df, $al, $ar);
+my ($seen, $shown, $files) = (0, 0, 0);
+# rel2 <rel a> <rel b>: the path a section is about; both sides agree.
+sub rel2 {
+  my ($x, $y) = @_;
+  bad() unless defined $x || defined $y;
+  return $y unless defined $x;
+  return $x unless defined $y;
+  bad() unless $x eq $y;
+  return $x;
+}
+# head <rel>: a section opens. One about an operand itself stands alone;
+# one about a file below a folder opens on its diff line.
+sub head {
+  my $rel = shift;
+  my $two = "git compared two files where locked handed it one";
+  if ($rel eq "") { bad($two) if $shown; $files++; }
+  else { bad($two) if $files; push @out, "diff " . substr($rel, 1) . "\n"; }
+  $shown++;
+}
+# pair <text>: the two names of a Binary files line, between its words.
+sub pair {
+  my $s = shift;
+  my ($x, $r);
+  if ($nf) {
+    return () unless $s =~ s/\A\/dev\/null and //;
+    return ("/dev/null", whole($s));
+  }
+  if ($df) {
+    return () unless $s =~ s/ and \/dev\/null\z//;
+    return (whole($s), "/dev/null");
+  }
+  if ($s =~ /\A"/) {
+    ($x, $r) = cq($s);
+    return () unless defined $x && $r =~ s/\A and //;
+    return ($x, whole($r));
+  }
+  my $i = index($s, qq{ and "});
+  return (whole(substr($s, 0, $i)), whole(substr($s, $i + 5))) if $i >= 0;
+  my $n = length($s) - length($ea) - length($eb) - 5;
+  return () if $n < 0 || $n % 2;
+  my $rel = substr($s, length($ea), $n / 2);
+  return () unless $s eq "$ea$rel and $eb$rel";
+  return ("$ea$rel", "$eb$rel");
+}
+# A header with no ---/+++ pair and no Binary line: an empty file on one
+# side only, named by its diff --git line (one name twice), or a mode
+# change, which is left out.
+sub close_hdr {
+  return unless $st eq "hdr";
+  return unless $nf || $df;
+  my ($x, $y, $r);
+  if ($git =~ /\A"/) {
+    ($x, $r) = cq($git);
+    bad() unless defined $x && $r =~ s/\A //;
+    $y = whole($r);
+  } else {
+    my $n = length($git) - 5;
+    bad() if $n < 2 || $n % 2;
+    my $p = substr($git, 2, $n / 2);
+    bad() unless $git eq "a/$p b/$p" && defined whole($p);
+    ($x, $y) = ("a/$p", "b/$p");
+  }
+  my ($l1, $r1) = $nf ? side("/dev/null", "a") : side($x, "a", $ma);
+  my ($l2, $r2) = $nf ? side($y, "b", $mb) : side("/dev/null", "b");
+  bad() unless defined $l1 && defined $l2;
+  head(rel2($r1, $r2));
+  push @out, "--- $l1\n", "+++ $l2\n";
+}
+local $/;
+my $in = <STDIN>;
+exit 0 if !defined $in || $in eq "";
+bad() unless $in =~ /\n\z/;
+for my $line ($in =~ /[^\n]*\n/g) {
+  my $t = substr($line, 0, -1);
+  if ($t =~ /\Adiff --git (.+)\z/s) {
+    bad() if $st eq "minus" || $st eq "plus";
+    close_hdr();
+    ($git, $ma, $mb, $nf, $df, $al, $ar) = ($1, undef, undef, 0, 0, undef, undef);
+    $st = "hdr";
+    $seen++;
+    next;
+  }
+  bad() if $st eq "";
+  if ($st eq "hdr") {
+    if ($t =~ /\Aold mode ([0-7]+)\z/) { $ma = $1; }
+    elsif ($t =~ /\Anew mode ([0-7]+)\z/) { $mb = $1; }
+    elsif ($t =~ /\Adeleted file mode ([0-7]+)\z/) { $ma = $1; $df = 1; }
+    elsif ($t =~ /\Anew file mode ([0-7]+)\z/) { $mb = $1; $nf = 1; }
+    elsif ($t =~ /\Aindex [0-9a-f]+\.\.[0-9a-f]+(?: ([0-7]+))?\z/) {
+      ($ma, $mb) = ($1, $1) if defined $1;
+    }
+    elsif ($t =~ /\A--- (.*)\z/s) {
+      ($al, $ar) = side(name1($1), "a", $ma);
+      bad() unless defined $al;
+      $st = "minus";
+    }
+    elsif ($t =~ /\ABinary files (.*) differ\z/s) {
+      my ($x, $y) = pair($1);
+      my ($l1, $r1) = side($x, "a", $ma);
+      my ($l2, $r2) = side($y, "b", $mb);
+      bad() unless defined $l1 && defined $l2;
+      head(rel2($r1, $r2));
+      push @out, "Binary files $l1 and $l2 differ\n";
+      $st = "bin";
+    }
+    else { bad(); }
+    next;
+  }
+  if ($st eq "minus") {
+    bad() unless $t =~ /\A\+\+\+ (.*)\z/s;
+    my ($l2, $r2) = side(name1($1), "b", $mb);
+    bad() unless defined $l2;
+    head(rel2($ar, $r2));
+    push @out, "--- $al\n", "+++ $l2\n";
+    $st = "plus";
+    next;
+  }
+  if ($t =~ /\A(\@\@ -[0-9]+(?:,[0-9]+)? \+[0-9]+(?:,[0-9]+)? \@\@)(?: |\z)/) {
+    bad() unless $st eq "plus" || $st eq "body";
+    push @out, "$1\n";
+    $st = "body";
+    next;
+  }
+  bad() unless $st eq "body" && $t =~ /\A[ +\\-]/;
+  push @out, $line;
+}
+bad() if $st eq "minus" || $st eq "plus";
+close_hdr();
+exit($seen ? 3 : 2) unless @out;
+print STDOUT @out or exit 2;
+close(STDOUT) or exit 2;
+exit 1;
+'
+
+# git_diff <old> <new> <old-label> <new-label>: the unified diff of two
+# files or two folders, labeled, on stdout. 0 for no difference, 1 for a
+# diff, 2 for trouble, so it reads as diff's own answer.
+#
+# git is started the way nothing it reads can choose what it does: an
+# empty environment but for PATH and HOME=/var/empty, no global or system
+# config, attributes from the empty tree, no fsmonitor, --no-ext-diff and
+# --no-textconv, no color, no pager, no rename pairing (an added and a
+# removed file stay what they are), the a/ b/ prefixes spelled out, and
+# run from /, which is root's and has nothing above it, so no repository
+# config or .gitattributes is found from wherever locked was started.
+# --no-index needs no repository; both operands are absolute paths. git
+# compares a symbolic link as its link text, at the top as well as inside
+# a folder. Perl, the rewriter, gets an empty environment too.
+#
+# FAIL CLOSED: git answers 1 both for "different" and for an error (an
+# operand it cannot open), and it can die halfway through a folder with
+# half a diff already printed. So the answer is accepted only when git's
+# status, the rewriter's verdict (see GIT_DIFF_PL) and git's silence on
+# stderr agree: 0 and 0, 1 and 1, or 1 and 3 (modes only, no difference
+# in content), and nothing on stderr. Anything else returns 2: what git
+# wrote to stderr is shown escaped, its own words being bytes off the
+# candidate's names, and stdout holds nothing, since the rewriter prints
+# only a diff it parsed whole. Statuses come from PIPESTATUS, so callers
+# run it as the left side of a || list, as show_diff does.
+git_diff() { # <old> <new> <old-label> <new-label>
+  local errf st dcolor
+  case "$1:$2" in
+    /*:/*) ;;
+    *) err_val "internal error: git_diff takes absolute paths" "$1"; return 2 ;;
+  esac
+  verify_git || return 2
+  errf="$(mktemp "${TMPDIR:-/tmp}/locked-diff.XXXXXX")" || return 2
+  env -i PATH="$PATH" HOME=/var/empty \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    "$LOCKED_GIT" -C / --no-pager \
+    -c attr.tree=4b825dc642cb6eb9a060e54bf8d69288fbee4904 \
+    -c core.fsmonitor=false \
+    diff --no-index --no-color --no-ext-diff --no-textconv --no-renames \
+    --src-prefix=a/ --dst-prefix=b/ -U3 -- "$1" "$2" 2>"$errf" \
+    | env -i GD_OLD="$1" GD_NEW="$2" GD_OLD_LABEL="$3" GD_NEW_LABEL="$4" \
+      /usr/bin/perl -e "$GIT_DIFF_PL"
+  st="${PIPESTATUS[0]}:${PIPESTATUS[1]}"
+  [ -s "$errf" ] && st="stderr"
+  case "$st" in
+    0:0|1:3) rm -f -- "$errf"; return 0 ;;
+    1:1)     rm -f -- "$errf"; return 1 ;;
+  esac
+  if [ "$st" = stderr ]; then
+    dcolor=0; [ -n "$E_OFF" ] && dcolor=1
+    diff_filter "$dcolor" 0 <"$errf" >&2 || true
+  elif [ "${st#*:}" != 2 ]; then
+    # Silent on stderr, and still an answer that does not fit what it
+    # printed. The rewriter has already said why when it is the one
+    # that refused (2).
+    echo "git's exit status and its output disagree (git:reader $st)" >&2
+  fi
+  rm -f -- "$errf"
+  return 2
+}
 #
 # diff_filter <1|0> [<1|0>]: stdin to stdout, every hidden character
 # escaped, the diff painted when the first argument says color is on. With
@@ -2390,13 +2730,17 @@ apply_releases() {
 diff_filter() { /usr/bin/perl -e "$UNTRUSTED_PL" -- lines "$1" "${2:-0}"; }
 
 # Diff-witness display, shared by the three diff sites (content relock,
-# anchor relock, edit). Capture FIRST: a diff that fails must abort before
-# its content is presented as reviewable -- exit 1 is "differs", anything
-# above is trouble. Into a temp file, not a variable: a tree diff can be
-# large and hold NULs. The capture is then encoded into a second file and
-# only the encoded one is ever shown; a filter that cannot run refuses the
-# display rather than falling back to raw bytes. Line count comes off the
-# encoded file, which is what the gate is about to page. Short output
+# anchor relock, edit), each handing it the two sides and their labels
+# for git_diff. Capture FIRST: a diff that fails must abort before its
+# content is presented as reviewable -- exit 1 is "differs", anything
+# above is trouble, and trouble shows none of the output: only the
+# subject path, then what git_diff said about why (escaped already, and
+# the missing or untrusted git path last when that is the cause). Into a
+# temp file, not a variable: a tree diff can be large and hold NULs. The
+# capture is then encoded into a second file and only the encoded one is
+# ever shown; a filter that cannot run refuses the display rather than
+# falling back to raw bytes. Line count comes off the encoded file, which
+# is what the gate is about to page. Short output
 # prints inline; long output on a tty is announced by a gate and
 # paged (less -RF; an early pager quit is not an error), plain cat off-tty.
 # The header starts FLUSH -- the caller owns any blank line before this
@@ -2404,23 +2748,20 @@ diff_filter() { /usr/bin/perl -e "$UNTRUSTED_PL" -- lines "$1" "${2:-0}"; }
 # candidate's bytes, and a soft-wrapped line of it restarts at column 0,
 # where it could pose as one of the rows or the question below
 # (terminal-output, third-party text has no position).
-show_diff() { # <rule> <row label> <path> <diff-cmd>...
-  local label="$1" rowlabel="$2" path="$3" raw enc rc=0 lines dcolor shown=0
+show_diff() { # <rule> <row label> <path> <old> <new> <old-label> <new-label>
+  local label="$1" rowlabel="$2" path="$3" raw enc why rc=0 lines dcolor shown=0
   shift 3
   raw="$(mktemp "${TMPDIR:-/tmp}/locked-diff.XXXXXX")" || return 1
   enc="$(mktemp "${TMPDIR:-/tmp}/locked-diff.XXXXXX")" || { rm -f -- "$raw"; return 1; }
-  "$@" >"$raw" 2>&1 || rc=$?
+  why="$(mktemp "${TMPDIR:-/tmp}/locked-diff.XXXXXX")" || { rm -f -- "$raw" "$enc"; return 1; }
+  git_diff "$1" "$2" "$3" "$4" >"$raw" 2>"$why" || rc=$?
   if [ "$rc" -gt 1 ]; then
-    # diff failed, but its output still came off the candidate, so it is
-    # encoded like any other -- with no line-ending judgment, since it
-    # may not be a diff at all, so every carriage return shows escaped.
-    # Stderr decides the color here.
-    dcolor=0; [ -n "$E_OFF" ] && dcolor=1
     err_val "diff failed" "$path"
-    diff_filter "$dcolor" 0 <"$raw" >&2 || true
-    rm -f -- "$raw" "$enc"
+    cat -- "$why" >&2
+    rm -f -- "$raw" "$enc" "$why"
     return 1
   fi
+  rm -f -- "$why"
   diff_header "$label" "$rowlabel" "$path"
   if [ "$rc" -eq 0 ]; then
     echo "(no changes)"
@@ -2694,10 +3035,11 @@ lock_witness() { # <path> <tier>
   elif [ -d "$f" ]; then
     if [ "$t" = "content" ]; then
       if [ "$live" -eq 1 ] && [ -d "$SNAPDIR" ]; then
-        # -N: a file added while unlocked shows its whole content, not
-        # only its name, so what the seal is about to freeze is on screen.
+        # A file added while unlocked shows its whole content against
+        # /dev/null, not only its name, so what the seal is about to
+        # freeze is on screen.
         show_diff 'diff snapshot → current' path "$f" \
-          diff --color=never -ruN "$SNAPDIR" "$f" || return 1
+          "$SNAPDIR" "$f" "snapshot: $f" "current: $f" || return 1
       else
         echo "adopting into pool (no prior snapshot): $ef"
       fi
@@ -2708,12 +3050,11 @@ lock_witness() { # <path> <tier>
       echo "no changes since unlock: $ef"
     else
       # Named by role and subject path: the snapshot sits in the pool under
-      # a name that tells the reader nothing. The -ru directory case above
-      # keeps diff's own headers -- it names one pair per file, and a
-      # single --label pair would mislabel every one of them.
+      # a name that tells the reader nothing. The folder case above takes
+      # the same two labels, and each file in it is named by its path
+      # below them.
       show_diff 'diff snapshot → current' path "$f" \
-        diff --color=never -u --label "snapshot: $f" --label "current: $f" \
-        "$SNAP" "$f" || return 1
+        "$SNAP" "$f" "snapshot: $f" "current: $f" || return 1
     fi
     shown=1
   else
@@ -4574,8 +4915,7 @@ do_edit_one() {
     diff_header "$label"
     echo "(no change; a mismatch is recorded for this file, see: sudo locked verify)"
   else
-    show_diff "$label" file "$f" \
-      diff --color=never -u --label "$lhs" --label "$rhs" "$old" "$stage" \
+    show_diff "$label" file "$f" "$old" "$stage" "$lhs" "$rhs" \
       || { rm -f -- "$stage"; return 1; }
   fi
   echo

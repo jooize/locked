@@ -312,9 +312,32 @@ writer of its own inside it.
 
 ### What the diff witness shows, and what it cannot
 
-The diff is `/usr/bin/diff` on bytes under the pinned PATH --
-trusted-binary != trusted-output, so no git driver and no textconv sits
-anywhere in the display path. diff's own color is disabled and `locked`
+The diff is git's (`git diff --no-index`), started so that nothing it
+reads can choose what it does: an empty environment, no global or system
+config, attributes from the empty tree, `--no-ext-diff --no-textconv`, no
+renames, no pager, and run from `/`, so no repository's config or
+`.gitattributes` is found. Trusted binary != trusted output, so no git
+driver and no textconv sits anywhere in the display path. The git is a
+constant in the script, never read from the environment: the nix module
+writes in `pkgs.git`'s store path, and a hand install uses the command
+line tools' own binary (`/Library/Developer/CommandLineTools/usr/bin/git`,
+not the `/usr/bin/git` shim, which picks the git it runs from
+`DEVELOPER_DIR` and xcode-select state). Every diff first checks that git
+is root-owned and unwritable by anyone else along its whole path, as the
+window helper is checked.
+
+Not `/usr/bin/diff`: it splits a line at a lone carriage return, so a
+changed line could show as an unchanged half above a changed half, and
+its `-r` follows symbolic links, which showed, to root, the content of
+whatever a link inside a folder pointed at. git shows a link as its link
+text.
+
+`locked` rewrites git's headers to its own labels (`snapshot: <path>`,
+`current: <path>`, and the path below a folder for each file in it), and
+takes the output only when git's exit status, the output itself and
+git's silence on stderr agree. Anything else refuses with none of the
+output shown. A name holding a line feed refuses too, since a header
+cannot show it on one line. git's own color is disabled and `locked`
 paints the `+`, `-` and `@@` lines itself, so the only escape sequences
 reaching the terminal are locked's own.
 
@@ -333,8 +356,8 @@ style. Newline and tab are layout and pass raw. Line endings are judged
 per file of the diff: when a carriage return precedes every real newline
 of a file's content lines, that file gets one header line, `CRLF line
 endings`, after its `+++` line and before its first hunk, and each pair
-draws as one break; any other carriage return is escaped where it is. A
-diff that failed keeps every carriage return escaped.
+draws as one break; any other carriage return is escaped where it is.
+What git says when it fails is shown with every carriage return escaped.
 
 One residual: homoglyphs are not distinguishable. A Cyrillic "а" is
 drawn the way a Latin "a" is.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # locked v2 test harness: flag primitives + CLI end-to-end.
 #
-#   sudo /bin/bash tests/harness.bash [--serial] [section...]
+#   sudo /bin/bash tests/harness.bash [--serial] [--git PATH] [section...]
 #
 # Ports the 2026-08-05 probe round to repeatable assertions. Every denial
 # assertion has a flag-vs-noflag control (clear the flag, re-run, expect
@@ -159,12 +159,16 @@ INV="${SUDO_USER:-}"
 
 SERIAL=0
 WANT=" "
-for a in "$@"; do
-  case "$a" in
+HARNESS_GIT=""
+USAGE="usage: sudo /bin/bash tests/harness.bash [--serial] [--git PATH] [section 1-8...]"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
     --serial) SERIAL=1 ;;
-    [1-8]) WANT="$WANT$a " ;;
-    *) bail "usage: sudo /bin/bash tests/harness.bash [--serial] [section 1-8...]" 2 ;;
+    --git) [ "$#" -ge 2 ] || bail "$USAGE" 2; HARNESS_GIT="$2"; shift ;;
+    [1-8]) WANT="$WANT$1 " ;;
+    *) bail "$USAGE" 2 ;;
   esac
+  shift
 done
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -232,7 +236,7 @@ locked() {
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$FAKE_HOME" \
       SUDO_USER="$INV" \
-      /bin/bash "$LOCKED" "$@"
+      /bin/bash "$LOCKED_RUN" "$@"
 }
 
 as_user() {
@@ -312,7 +316,7 @@ locked_home() { # <home> <args...>: locked with a different LOCKED_USER_HOME
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$h" \
       SUDO_USER="$INV" \
-      /bin/bash "$LOCKED" "$@"
+      /bin/bash "$LOCKED_RUN" "$@"
 }
 
 # Shared by sections 4, 5 and 6.
@@ -387,6 +391,38 @@ check "helper is root-owned"                  "root" "$(owner_of "$HELPER")"
 check "helper is 755"                         "755" "$(stat -f '%OLp' "$HELPER")"
 check "helper's dir is root-owned"            "root" "$(owner_of "$HELPERDIR")"
 check "helper's dir is 755"                   "755" "$(stat -f '%OLp' "$HELPERDIR")"
+
+# Every diff is drawn by the git LOCKED_GIT names, and that line is a
+# constant, not a seam: no environment reaches it, this harness's
+# included. So the verbs run a copy of the script with the line rewritten,
+# as the nix module rewrites it, beside the helper (a root-owned ancestry
+# like the helper's). The git is --git's, else the script's own default,
+# else the one git in the nix store; anything else stops here, so a case
+# below can never fail for want of a git. Every source assertion still
+# reads the repo's script.
+note "git for the diff witness"
+GIT_LINE="$(grep -E '^readonly LOCKED_GIT=' "$LOCKED")" \
+  || bail "no readonly LOCKED_GIT= line in $LOCKED"
+if [ -z "$HARNESS_GIT" ]; then
+  HARNESS_GIT="${GIT_LINE#readonly LOCKED_GIT=}"
+  if [ ! -x "$HARNESS_GIT" ]; then
+    STORE_GITS=(/nix/store/*-git-[0-9]*/bin/git)
+    [ "${#STORE_GITS[@]}" -eq 1 ] \
+      || bail "no git at $HARNESS_GIT and not one in /nix/store; pass --git PATH"
+    HARNESS_GIT="${STORE_GITS[0]}"
+  fi
+fi
+[ -x "$HARNESS_GIT" ] || bail "--git is not an executable: $HARNESS_GIT"
+note "git: $HARNESS_GIT"
+LOCKED_RUN="$HELPERDIR/locked"
+GIT_LINE_RUN="readonly LOCKED_GIT=$HARNESS_GIT"
+awk -v from="$GIT_LINE" -v to="$GIT_LINE_RUN" '$0 == from { $0 = to } { print }' \
+  "$LOCKED" >"$SCRATCH/locked.run"
+install -o root -g wheel -m 755 "$SCRATCH/locked.run" "$LOCKED_RUN"
+check "the run copy names the harness git once" "1" \
+      "$(grep -cxF -- "$GIT_LINE_RUN" "$LOCKED_RUN")"
+check "and differs from the script in that line alone" "1" \
+      "$(diff "$LOCKED" "$LOCKED_RUN" | grep -c '^>')"
 
 # The `id` verb is the whole of the script's node_id(): it runs without
 # root (unprivileged `status` needs it), reads nothing but attributes, and
@@ -704,7 +740,7 @@ EDITBODY="$SCRATCH/do_edit_one.body"
 awk '/^do_edit_one\(\) \{/,/^\}$/' "$LOCKED" >"$EDITBODY"
 ok   "the edit body was extracted"        test -s "$EDITBODY"
 ok   "the diff reads the frozen copy"     \
-     grep -qF -- '--label "$lhs" --label "$rhs" "$old" "$stage"' "$EDITBODY"
+     grep -qF -- 'show_diff "$label" file "$f" "$old" "$stage" "$lhs" "$rhs"' "$EDITBODY"
 ok   "the install reads the frozen copy"  \
      grep -qF 'atomic_replace "$stage" "$f"' "$EDITBODY"
 FREEZELN="$(grep -n 'show_diff' "$EDITBODY" | head -1 | cut -d: -f1)"
@@ -807,7 +843,49 @@ LKRC=0
 locked lock --yes "$CD" >"$LKO" 2>&1 || LKRC=$?
 check "relock with an added file"              "0" "$LKRC"
 ok   "the relock diff shows the added content" grep -qF -- "+added while unlocked" "$LKO"
+ok   "the added file opens a section of its own" grep -qxF "diff added.txt" "$LKO"
+check "its old side is /dev/null"              "--- /dev/null" \
+      "$(grep -A1 -xF "diff added.txt" "$LKO" | sed -n 2p)"
+ok   "its new side is named below the folder"  grep -qxF -- "+++ current: $CD/added.txt" "$LKO"
 ok   "verify clean after the folder relock"    locked verify
+
+note "cli: a folder relock names each change below the folder"
+# One relock over every shape a folder diff has: a changed file, a removed
+# one, one added in a new subfolder, an empty one added, a mode change and
+# nothing else, and a symbolic link to a file only root can read. git
+# shows a link as its link text, so the root-only bytes stay off the
+# screen; diff -r followed the link, as root, and showed them.
+FW="$FAKE_HOME/witdir"
+as_user mkdir -p -- "$FW"
+as_user /bin/sh -c "printf 'one\n' > '$FW/changed.txt'; printf 'bye\n' > '$FW/gone.txt'; printf 'run\n' > '$FW/tool.sh'"
+FRO="$SCRATCH/folder-rootonly"
+printf 'root only bytes\n' >"$FRO"
+chmod 600 "$FRO"
+FWO="$SCRATCH/folder-witness.out"
+FWRC=0
+locked lock --yes "$FW" >/dev/null 2>&1 || FWRC=1
+locked unlock "$FW" >/dev/null 2>&1 || FWRC=1
+as_user /bin/sh -c "printf 'two\n' > '$FW/changed.txt' && rm -- '$FW/gone.txt' && mkdir '$FW/sub' && printf 'new\n' > '$FW/sub/new.txt' && : > '$FW/blank.txt' && chmod +x '$FW/tool.sh' && ln -s '$FRO' '$FW/link'" \
+  || FWRC=1
+check "the folder fixture was set up"          "0" "$FWRC"
+locked lock --yes "$FW" >"$FWO" 2>&1 || FWRC=1
+check "the folder relock succeeded"            "0" "$FWRC"
+check "five files changed, five sections"      "5" "$(grep -c '^diff ' "$FWO")"
+ok   "a changed file: its old side"            grep -qxF -- "--- snapshot: $FW/changed.txt" "$FWO"
+ok   "  and its new side"                      grep -qxF -- "+++ current: $FW/changed.txt" "$FWO"
+check "a removed file: /dev/null for its new side" "+++ /dev/null" \
+      "$(grep -A1 -xF -- "--- snapshot: $FW/gone.txt" "$FWO" | sed -n 2p)"
+check "a file in a new subfolder opens on its path" "--- /dev/null" \
+      "$(grep -A1 -xF "diff sub/new.txt" "$FWO" | sed -n 2p)"
+ok   "  and shows its content"                 grep -qxF -- "+new" "$FWO"
+check "an added empty file is a header pair"   "+++ current: $FW/blank.txt" \
+      "$(grep -A2 -xF "diff blank.txt" "$FWO" | sed -n 3p)"
+deny "a mode change alone is not content"      grep -qxF "diff tool.sh" "$FWO"
+ok   "a link is named as one"                  grep -qxF -- "+++ current: $FW/link (symlink)" "$FWO"
+ok   "  and shows its link text"               grep -qxF -- "+$FRO" "$FWO"
+deny "  never the bytes it points at"          grep -qF "root only bytes" "$FWO"
+ok   "verify clean with the folder relocked"   locked verify
+ok   "unprotect the witness folder"            locked unprotect --yes "$FW"
 
 note "cli: edit reads the candidate as the invoker, never as root"
 # Both candidate paths sit in the invoker's own space, so a same-UID
@@ -1127,6 +1205,117 @@ check "the relock states the line endings under the +++ line" "CRLF line endings
 ok   "and draws the pair as one break"    grep -qxF "+three" "$DW"
 deny "and escapes no carriage return"     grep -qF "${BSL}u{D}" "$DW"
 deny "nor prints one raw"                 grep -q $'\r' "$DW"
+
+note "diff witness: a lone carriage return stays inside its line"
+# git splits lines at line feeds only. diff(1) on macOS also split at a
+# lone carriage return, so `a<CR>b` changed to `a<CR>X` read as an
+# unchanged `a<CR>` above `-b` and `+X`. Driven through the content
+# relock and edit --from.
+LCF="$DWD/lonecr.txt"
+printf 'k\na\rb\nz\n' >"$LCF"
+chown "$INV:staff" "$LCF"
+LCRC=0
+locked lock --yes "$LCF" >/dev/null 2>&1 || LCRC=1
+locked unlock "$LCF" >/dev/null 2>&1 || LCRC=1
+printf 'k\na\rX\nz\n' >"$LCF"
+check "the lone-CR fixture was set up"    "0" "$LCRC"
+locked lock --yes "$LCF" >"$DW" 2>&1 || LCRC=1
+check "the lone-CR relock succeeded"      "0" "$LCRC"
+check "one hunk, three lines a side"      "@@ -1,3 +1,3 @@" "$(grep '^@@' "$DW")"
+ok   "the removal is the whole line"      grep -qxF -- "-a${BSL}u{D}b" "$DW"
+ok   "the addition is the whole line"     grep -qxF -- "+a${BSL}u{D}X" "$DW"
+deny "no half of it reads as unchanged"   grep -qxF -- " a${BSL}u{D}" "$DW"
+LCP="$PROPD/lonecr.proposed"
+printf 'k\na\rY\nz\n' >"$LCP"
+chown "$INV:staff" "$LCP"
+locked edit --yes --from "$LCP" "$LCF" >"$DW" 2>&1 || LCRC=1
+check "edit --from with a lone CR succeeded" "0" "$LCRC"
+ok   "the edit diff keeps the line whole" grep -qxF -- "+a${BSL}u{D}Y" "$DW"
+deny "and splits nothing off it"          grep -qxF -- "+Y" "$DW"
+
+note "diff witness: git_diff refuses what it cannot vouch for"
+# Lifted out of locked with the helpers it calls, in a subshell, with
+# LOCKED_GIT set per case (the constant itself is the one line left out).
+# A refusal is status 2 with nothing on stdout: what is on stderr is
+# locked's own words, git's escaped, or the rewriter's reason.
+GDO="$SCRATCH/gd.out"
+GDE="$SCRATCH/gd.err"
+gd() { # <git> <old> <new> [<old-label> <new-label>]: git_diff's status
+  local rc=0
+  (
+    # locked's own PATH: the lifted helpers speak BSD stat and readlink.
+    PATH=/usr/bin:/bin:/usr/sbin:/sbin
+    # shellcheck disable=SC2034  # the git_diff eval'd below reads it
+    LOCKED_GIT="$1"
+    shift
+    # shellcheck disable=SC2034  # the err_val eval'd below reads them
+    E_OFF='' E_B='' E_RED='' E_RV=''
+    eval "$(sed -n "/^readonly UNTRUSTED_PL='\$/,/^'\$/p" "$LOCKED")"
+    eval "$(sed -n "/^readonly GIT_DIFF_PL='\$/,/^'\$/p" "$LOCKED")"
+    eval "$(sed -n -e '/^diff_filter() {/p' -e '/^err_val() {/p' \
+      -e '/^say_err() {/,/^}/p' -e '/^esc_into() {/,/^}/p' \
+      -e '/^verify_root_owned_path() {/,/^}/p' -e '/^verify_root_owned_file() {/,/^}/p' \
+      -e '/^verify_ancestor() {/,/^}/p' -e '/^verify_ancestors() {/,/^}/p' \
+      -e '/^verify_program_ancestry() {/,/^}/p' -e '/^verify_git() {/,/^}/p' \
+      -e '/^git_diff() {/,/^}/p' "$LOCKED")"
+    git_diff "$1" "$2" "${3:-old}" "${4:-new}"
+  ) >"$GDO" 2>"$GDE" || rc=$?
+  printf '%s' "$rc"
+}
+GDD="$SCRATCH/gd"
+install -d -o root -g wheel -m 755 "$GDD" "$GDD/a" "$GDD/b" "$GDD/nl-a" "$GDD/nl-b" \
+  "$GDD/ff-a" "$GDD/ff-b"
+printf 'k\na\rb\nz\n' >"$GDD/cr-old"
+printf 'k\na\rX\nz\n' >"$GDD/cr-new"
+check "a lone CR: a diff"                     "1" "$(gd "$HARNESS_GIT" "$GDD/cr-old" "$GDD/cr-new" "snapshot: /s" "current: /s")"
+check "with locked's labels and no function context" \
+      "$(printf '%s\n' '--- snapshot: /s' '+++ current: /s' '@@ -1,3 +1,3 @@' ' k' '-a'$'\r''b' '+a'$'\r''X' ' z')" \
+      "$(cat "$GDO")"
+check "identical files: no diff"              "0" "$(gd "$HARNESS_GIT" "$GDD/cr-old" "$GDD/cr-old")"
+check "  and nothing printed"                 "" "$(cat "$GDO" "$GDE")"
+# A folder pair: a removed file, an added one, a name git quotes (a tab
+# and a quote) and one with ` and ` in it, a binary file, and a file
+# whose NUL sits past the 8000 bytes git sniffs, so it is diffed as text
+# (which is why every grep of this output takes -a).
+printf 'gone\n' >"$GDD/a/removed"
+printf 'new\n' >"$GDD/b/added"
+printf '1\n' >"$GDD/a/t"$'\t''"q'
+printf '2\n' >"$GDD/b/t"$'\t''"q'
+printf '\0a' >"$GDD/a/x and y"
+printf '\0b' >"$GDD/b/x and y"
+head -c 9000 /dev/zero | tr '\0' 'x' >"$GDD/a/nul"
+{ head -c 9000 /dev/zero | tr '\0' 'x'; printf '\nseen\0after\n'; } >"$GDD/b/nul"
+check "a folder pair: a diff"                 "1" "$(gd "$HARNESS_GIT" "$GDD/a" "$GDD/b" "snapshot: /d" "current: /d")"
+check "a removed file has /dev/null for its new side" "+++ /dev/null" \
+      "$(grep -a -A1 -xF -- "--- snapshot: /d/removed" "$GDO" | sed -n 2p)"
+check "an added file has /dev/null for its old side"  "--- /dev/null" \
+      "$(grep -a -A1 -xF -- "diff added" "$GDO" | sed -n 2p)"
+ok   "a quoted name comes back as its bytes"  grep -aqxF -- "+++ current: /d/t"$'\t''"q' "$GDO"
+ok   "a name with ' and ' in it is split right" \
+     grep -aqxF -- "Binary files snapshot: /d/x and y and current: /d/x and y differ" "$GDO"
+# A bash string cannot hold a NUL, so perl counts the line.
+check "a NUL past the sniffed bytes survives" "1" \
+      "$(/usr/bin/perl -ne '$n++ if /\A\+seen\x00after\n\z/; END { print $n + 0 }' "$GDO")"
+check "each file opens a section of its own"  "5" "$(grep -ac '^diff ' "$GDO")"
+check "an operand git cannot open: refused"   "2" "$(gd "$HARNESS_GIT" "$GDD/cr-old" "$GDD/no-such")"
+check "  with nothing on stdout"              "" "$(cat "$GDO")"
+ok   "  and git's own words on stderr"        grep -qF "Could not access" "$GDE"
+printf 'a\n' >"$GDD/nl-a/x"$'\n'"y"
+printf 'b\n' >"$GDD/nl-b/x"$'\n'"y"
+check "a line feed in a name: refused"        "2" "$(gd "$HARNESS_GIT" "$GDD/nl-a" "$GDD/nl-b")"
+check "  with nothing on stdout"              "" "$(cat "$GDO")"
+ok   "  saying why"                           grep -qF "holds a line feed" "$GDE"
+mkfifo "$GDD/ff-a/p" "$GDD/ff-b/p"
+check "a fifo in a folder: refused"           "2" "$(gd "$HARNESS_GIT" "$GDD/ff-a" "$GDD/ff-b")"
+check "  with nothing on stdout"              "" "$(cat "$GDO")"
+check "no git at the path: refused"           "2" "$(gd "$SCRATCH/no-such-git" "$GDD/cr-old" "$GDD/cr-new")"
+check "  with nothing on stdout"              "" "$(cat "$GDO")"
+check "  naming the missing path last"        "$SCRATCH/no-such-git" \
+      "$(tail -1 "$GDE" | sed 's/.*: //')"
+install -o "$INV" -g staff -m 755 "$HARNESS_GIT" "$SCRATCH/raw/user-git"
+check "a git the invoker owns: refused"       "2" "$(gd "$SCRATCH/raw/user-git" "$GDD/cr-old" "$GDD/cr-new")"
+check "  with nothing on stdout"              "" "$(cat "$GDO")"
+ok   "  naming its owner"                     grep -qF "owned by $INV, expected root owner" "$GDE"
 
 note "diff witness: the renderer is the only thing that emits an escape"
 # The painter runs only on a tty, which this harness is not, so it is
@@ -1511,7 +1700,7 @@ note "cli: unprivileged status"
 # traverse, so the lock account runs the same bytes from a root-owned,
 # world-readable copy.
 SCRIPT_COPY="$SCRATCH/locked-copy"
-install -m 755 -o root -g wheel "$LOCKED" "$SCRIPT_COPY"
+install -m 755 -o root -g wheel "$LOCKED_RUN" "$SCRIPT_COPY"
 
 locked_as() { # <user> <args...>: run locked unprivileged AS <user>.
   # The seams ride the command line because sudo's env_reset drops inherited
@@ -1608,7 +1797,7 @@ locked_it() { # <install_target> <args...>: locked with a specific INSTALL_TARGE
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$FAKE_HOME" \
       SUDO_USER="$INV" \
-      /bin/bash "$LOCKED" "$@"
+      /bin/bash "$LOCKED_RUN" "$@"
 }
 
 # Accepted: strict root:wheel 755 chain (the /usr/local shape).
@@ -1972,7 +2161,7 @@ locked_fake() { # <helper> <args...>: locked with a stand-in LOCKED_HELPER
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$FAKE_HOME" \
       SUDO_USER="$INV" \
-      /bin/bash "$LOCKED" "$@"
+      /bin/bash "$LOCKED_RUN" "$@"
 }
 
 FKD="$MED/fakearea"
@@ -2043,12 +2232,12 @@ refuse "trash without an invoking user"        "must be invoked via sudo" \
        env LOCKED_STATE_ROOT="$STATEROOT" INSTALL_TARGET="$SCRATCH/not-installed" \
            LOCKED_HELPER="$HELPER" LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
            LOCKED_USER_HOME="$FAKE_HOME" SUDO_USER= \
-           /bin/bash "$LOCKED" trash --yes "$TRD/t.txt"
+           /bin/bash "$LOCKED_RUN" trash --yes "$TRD/t.txt"
 refuse "trash refuses a root invoker"          "the invoker is root" \
        env LOCKED_STATE_ROOT="$STATEROOT" INSTALL_TARGET="$SCRATCH/not-installed" \
            LOCKED_HELPER="$HELPER" LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
            LOCKED_USER_HOME="$FAKE_HOME" SUDO_USER=root \
-           /bin/bash "$LOCKED" trash --yes "$TRD/t.txt"
+           /bin/bash "$LOCKED_RUN" trash --yes "$TRD/t.txt"
 ok   "the file survived both refusals"         test -f "$TRD/t.txt"
 rmdir -- "$STATEROOT/root/pool" "$STATEROOT/root" 2>/dev/null || true
 
@@ -3068,7 +3257,7 @@ locked_conv() { # <args...>: a root run as launchd makes it, no invoker
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$FAKE_HOME" \
       SUDO_USER= \
-      /bin/bash "$LOCKED" "$@"
+      /bin/bash "$LOCKED_RUN" "$@"
 }
 legacy_pool() { # <user>: a 0.14.0-shaped pool with one record file in it
   install -d -m 711 -o root -g wheel "$CONV_LEGACY"

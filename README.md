@@ -103,7 +103,9 @@ Three tiers, named by what they protect:
 Tests: `sudo /bin/bash tests/harness.bash` (scratch-dir only; stands in
 `daemon` for the lock account, no global state touched). Its sections run
 at the same time, each in a scratch dir of its own; `--serial` runs them one
-at a time, and section numbers run only those. Its stdout is a TAP 14
+at a time, and section numbers run only those. The verbs run a copy of the
+script whose git line names `--git PATH`, else the script's own git, else
+the one git in `/nix/store`. Its stdout is a TAP 14
 stream, so `prove -v --exec 'sudo /bin/bash' tests/harness.bash` (TAP::Harness
 3.50 or later) can check it.
 
@@ -210,6 +212,17 @@ and `locked` verifies its ownership and ancestry on each use):
 clang -O2 -Wall -Wextra -framework Foundation \
   -o /tmp/locked-helper helper/locked-helper.m
 sudo install -m 755 -o root -g wheel /tmp/locked-helper /usr/local/sbin/locked-helper
+```
+
+Every diff `locked` shows (relock, edit) is drawn by the command line
+tools' git, `/Library/Developer/CommandLineTools/usr/bin/git`, and
+`locked` checks it is root-owned along its whole path before each use.
+That path is fixed in the script, so no environment can name another
+git; with no git there, a verb that would show a diff refuses. Not
+`/usr/bin/git`: that is a shim which picks the git it runs from
+`DEVELOPER_DIR` and xcode-select state. Install the tools with:
+```sh
+xcode-select --install
 ```
 
 ### 2. Lock account `_jooize-lock`
