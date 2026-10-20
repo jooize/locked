@@ -709,7 +709,7 @@ run() {
 # space, under a UTF-8 locale -- so the quoting alone does not show what
 # is there.
 dry_line() {
-  local a q out="DRY-RUN:"
+  local a q out="dry run:"
   for a in "$@"; do
     printf -v q '%q' "$a"
     esc_into q "$q" "$C_RV"
@@ -3070,7 +3070,7 @@ release_chain_node() { # <dir>
   state="$(meta_field "$META" state)"
   acl="$(meta_field "$META" acl)"
   if [ "$OPT_DRY" -eq 1 ]; then
-    say_out "DRY-RUN: release" "$d"
+    say_out "dry run: release" "$d"
     return 0
   fi
   # Flag first: it blocks chown and chmod.
@@ -3389,7 +3389,7 @@ retire_record() { # <path> <via> [quiet]
   snap_paths "$f"
   [ -f "$META" ] || return 0
   if [ "$OPT_DRY" -eq 1 ]; then
-    say_out "DRY-RUN: retire record (via=$via)" "$f"
+    say_out "dry run: retire record (via=$via)" "$f"
     return 0
   fi
   rewrite_meta_state "$META" retired "via=$via" "by=$inv" "at=$(now_utc)" || return 1
@@ -3406,7 +3406,7 @@ suspend_record() { # <path> <bin>
   snap_paths "$f"
   [ -f "$META" ] || return 0
   if [ "$OPT_DRY" -eq 1 ]; then
-    say_out "DRY-RUN: suspend record" "$f"
+    say_out "dry run: suspend record" "$f"
     return 0
   fi
   rewrite_meta_state "$META" suspended "by=$inv" "at=$(now_utc)" "bin=$bin" || return 1
@@ -3431,7 +3431,7 @@ rekey_record() { # <oldpath> <newpath>
     fi
   done
   if [ "$OPT_DRY" -eq 1 ]; then
-    move_lines "DRY-RUN: re-key record" "$old" "$new"
+    move_lines "dry run: re-key record" "$old" "$new"
     return 0
   fi
   for suffix in meta snap snapdir attic; do
