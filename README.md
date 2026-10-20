@@ -251,7 +251,7 @@ sudo dscacheutil -flushcache
 ```sh
 sudo /usr/local/sbin/locked unlock /nonexistent   # should print 'skipped, cannot resolve: /nonexistent'
 ```
-Touch ID/password prompt names `/usr/local/sbin/locked unlock /nonexistent`; binary runs; logs `result=skip-noent` via `log show --predicate 'eventMessage CONTAINS "locked:"' --last 1m`.
+Touch ID/password prompt names `/usr/local/sbin/locked unlock /nonexistent`; binary runs and refuses the path. Nothing is logged: a path that cannot be resolved stops before any action does. A path that resolves but has no record logs `result=skip-no-meta` (`log show --predicate 'eventMessage CONTAINS "locked:"' --last 1m`).
 
 ## Initial setup of a file
 
