@@ -329,10 +329,12 @@ selectors and the tag characters (the full list is in the comment above
 byte, after every valid sequence is decoded. A literal backslash that
 would begin an escape is escaped itself, so an escape on screen is always
 one. Those two kept escapes take the line's own color, not the reserved
-style. Newline and tab are layout and pass raw. When a carriage return
-precedes every newline of the content, `locked` says `(CRLF line endings)`
-once above the diff and draws each pair as one break; any other carriage
-return is escaped.
+style. Newline and tab are layout and pass raw. Line endings are judged
+per file of the diff: when a carriage return precedes every real newline
+of a file's content lines, that file gets one header line, `CRLF line
+endings`, after its `+++` line and before its first hunk, and each pair
+draws as one break; any other carriage return is escaped where it is. A
+diff that failed keeps every carriage return escaped.
 
 One residual: homoglyphs are not distinguishable. A Cyrillic "а" is
 drawn the way a Latin "a" is.

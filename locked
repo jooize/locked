@@ -149,10 +149,12 @@ set_pal   # initialize for set -u; callers on a redirected fd re-run it
 # Layout. A single-line field (a path, a name) escapes the tab and the
 # line feed like any other hidden character: a value sits on one row. A
 # document shown as lines (the diff) keeps the line feed as the break and
-# the tab as itself. A carriage return directly before every line feed of
-# the diff's content is the text's line-ending convention: the renderer
-# reports it once (show_diff prints the fact outside the text) and draws
-# each pair as one break. Any other carriage return is escaped where it is.
+# the tab as itself. Line endings are judged per file of the diff, over
+# the content lines that end in a real line feed: when every one of them
+# ends CR LF, that is the file's line-ending convention, stated once on a
+# header line of its own (`CRLF line endings`, after the file's +++ line
+# and before its first hunk), and each pair draws as one break. Any other
+# carriage return is escaped where it is.
 #
 # Two kinds of escape. A hidden-list character's escape wears reverse
 # red, the one style that means hidden, because the raw character could
@@ -179,12 +181,20 @@ set_pal   # initialize for set -u; callers on a redirected fd re-run it
 #   field <escape style> <resume style>
 #       stdin as one value. A hidden escape is wrapped in <escape style>
 #       and followed by <resume style> (esc_into composes both).
-#   lines <color 0|1> [<facts file>]
+#   lines <color 0|1> [<endings 0|1>]
 #       stdin as a unified diff, painted when color is on: file headers
 #       bold magenta, hunk headers cyan, additions green, removals red.
-#       With a facts file, `crlf` is written to it when the content's
-#       line endings are CRLF, and the pairs are drawn as one break;
-#       without one, every carriage return is escaped.
+#       With endings 1, each file's line endings are judged as above, and
+#       a CRLF file gets its header line, painted as a file header; with
+#       0 (output that may not be a diff at all), every carriage return
+#       is escaped.
+#
+# A file is a section of the diff: each run of file header lines starts
+# one. A content line whose line feed diff added (a no-newline marker
+# follows it) has no real line feed, so it is not judged, and its own
+# carriage return stays escaped. A file with no hunk header gets no
+# header line, so its carriage returns stay escaped too: the fact is
+# never drawn as layout without being stated.
 #
 # A file header is recognized by position, never by its prefix: a removed
 # line of SQL or Lua that begins -- arrives here as --- foo, and painting
@@ -251,7 +261,7 @@ if ($mode eq "field") {
 }
 exit 2 unless $mode eq "lines";
 my $on = ($ARGV[0] || 0) ? 1 : 0;
-my $facts = $ARGV[1];
+my $ends = ($ARGV[1] || 0) ? 1 : 0;
 my @l = <STDIN>;
 my @k;
 my $expect = 2;
@@ -268,29 +278,35 @@ for my $s (@l) {
          : $t =~ /^ / ? "ctx"
          : "other";
 }
-# A content line counts toward the line endings when its line feed belongs
-# to the document: one followed by a no-newline marker was added by diff.
-my @own;
-my ($n, $cr) = (0, 0);
+# Per file: a content line counts toward the line endings of its file when
+# its line feed belongs to the document; one followed by a no-newline
+# marker was added by diff. %first holds the first hunk header of each
+# file, where the header line goes.
+my (@sec, @own, %lf, %bad, %first, %crlf);
+my $n = 0;
 for my $i (0 .. $#l) {
+  $n++ if $k[$i] eq "file" && ($i == 0 || $k[$i - 1] ne "file");
+  $sec[$i] = $n;
+  $first{$n} = $i if $k[$i] eq "hunk" && !defined $first{$n};
   my $body = $k[$i] eq "add" || $k[$i] eq "del" || $k[$i] eq "ctx";
   my $next = $i < $#l ? $l[$i + 1] : "";
   $own[$i] = $body && $l[$i] =~ /\n\z/ && $next !~ /^\\ /;
   next unless $own[$i];
-  $n++;
-  $cr++ if $l[$i] =~ /\r\n\z/;
+  $lf{$n}++;
+  $bad{$n}++ unless $l[$i] =~ /\r\n\z/;
 }
-my $crlf = defined $facts && $facts ne "" && $n > 0 && $cr == $n;
-if ($crlf) {
-  open(my $fh, ">", $facts) or exit 1;
-  print $fh "crlf\n" or exit 1;
-  close($fh) or exit 1;
+if ($ends) {
+  $crlf{$_} = 1 for grep { !$bad{$_} && defined $first{$_} } keys %lf;
 }
 my %paint = (file => "\e[1;35m", hunk => "\e[36m", add => "\e[32m", del => "\e[31m");
 for my $i (0 .. $#l) {
+  if ($crlf{$sec[$i]} && $first{$sec[$i]} == $i) {
+    print STDOUT ($on ? $paint{file} . "CRLF line endings\e[0m" : "CRLF line endings"), "\n"
+      or exit 1;
+  }
   my $s = $l[$i];
   my $nl = ($s =~ s/\n\z//) ? 1 : 0;
-  $s =~ s/\r\z// if $crlf && $own[$i];
+  $s =~ s/\r\z// if $crlf{$sec[$i]} && $own[$i];
   my $pre = $on ? ($paint{$k[$i]} || "") : "";
   my $out = $on ? esc($s, "\e[7;31m", "\e[0m" . $pre, 1) : esc($s, "", "", 1);
   $out = $pre . $out . "\e[0m" if $pre ne "";
@@ -2315,11 +2331,12 @@ apply_releases() {
 # at the top), which is the only thing in the block that emits an escape --
 # so any escape on screen is locked's own.
 #
-# diff_filter <1|0> [<facts file>]: stdin to stdout, every hidden character
+# diff_filter <1|0> [<1|0>]: stdin to stdout, every hidden character
 # escaped, the diff painted when the first argument says color is on. With
-# a facts file, `crlf` lands in it when the content's line endings are
-# CRLF (show_diff states that once, outside the text).
-diff_filter() { /usr/bin/perl -e "$UNTRUSTED_PL" -- lines "$1" "${2:-}"; }
+# the second at 1, a file whose line endings are CRLF gets a `CRLF line
+# endings` header line and draws its pairs as plain breaks; at 0, every
+# carriage return shows escaped.
+diff_filter() { /usr/bin/perl -e "$UNTRUSTED_PL" -- lines "$1" "${2:-0}"; }
 
 # Diff-witness display, shared by the three diff sites (content relock,
 # anchor relock, edit). Capture FIRST: a diff that fails must abort before
@@ -2337,46 +2354,40 @@ diff_filter() { /usr/bin/perl -e "$UNTRUSTED_PL" -- lines "$1" "${2:-}"; }
 # where it could pose as one of the rows or the question below
 # (terminal-output, third-party text has no position).
 show_diff() { # <rule> <row label> <path> <diff-cmd>...
-  local label="$1" rowlabel="$2" path="$3" raw enc facts rc=0 lines dcolor shown=0
+  local label="$1" rowlabel="$2" path="$3" raw enc rc=0 lines dcolor shown=0
   shift 3
   raw="$(mktemp "${TMPDIR:-/tmp}/locked-diff.XXXXXX")" || return 1
   enc="$(mktemp "${TMPDIR:-/tmp}/locked-diff.XXXXXX")" || { rm -f -- "$raw"; return 1; }
-  facts="$(mktemp "${TMPDIR:-/tmp}/locked-diff.XXXXXX")" || { rm -f -- "$raw" "$enc"; return 1; }
   "$@" >"$raw" 2>&1 || rc=$?
   if [ "$rc" -gt 1 ]; then
     # diff failed, but its output still came off the candidate, so it is
-    # encoded like any other -- with no facts file, so every carriage
-    # return shows escaped. Stderr decides the color here.
+    # encoded like any other -- with no line-ending judgment, since it
+    # may not be a diff at all, so every carriage return shows escaped.
+    # Stderr decides the color here.
     dcolor=0; [ -n "$E_OFF" ] && dcolor=1
     err_val "diff failed" "$path"
-    diff_filter "$dcolor" <"$raw" >&2 || true
-    rm -f -- "$raw" "$enc" "$facts"
+    diff_filter "$dcolor" 0 <"$raw" >&2 || true
+    rm -f -- "$raw" "$enc"
     return 1
   fi
   diff_header "$label" "$rowlabel" "$path"
   if [ "$rc" -eq 0 ]; then
     echo "(no changes)"
-    rm -f -- "$raw" "$enc" "$facts"
+    rm -f -- "$raw" "$enc"
     return 0
   fi
   # P_OFF is empty exactly when set_pal found no tty on this fd or NO_COLOR
   # set, so the filter paints on the same condition the rest of the block
-  # colors on, including when the caller redirected fd 1.
+  # colors on, including when the caller redirected fd 1. A CRLF file's
+  # line endings are stated per file, on a header line of its own inside
+  # the diff (untrusted-text), so the line count below includes it.
   dcolor=0; [ -n "$P_OFF" ] && dcolor=1
-  if ! diff_filter "$dcolor" "$facts" <"$raw" >"$enc"; then
+  if ! diff_filter "$dcolor" 1 <"$raw" >"$enc"; then
     err_val "cannot render the diff; not showing it unescaped" "$path"
-    rm -f -- "$raw" "$enc" "$facts"
+    rm -f -- "$raw" "$enc"
     return 1
   fi
   rm -f -- "$raw"
-  # The line-ending convention is a fact about the text, stated once
-  # outside it (untrusted-text): above the diff, where the text cannot
-  # reach, and before the gate, so it is on screen whichever way the
-  # gate is answered.
-  if [ -s "$facts" ]; then
-    echo "(CRLF line endings)"
-  fi
-  rm -f -- "$facts"
   lines="$(wc -l <"$enc" | tr -d ' ')"
   if [ -t 0 ] && [ -t 1 ] && [ "$lines" -gt 24 ]; then
     # Three weights, one per job (terminal-output): bold runs to the `;`

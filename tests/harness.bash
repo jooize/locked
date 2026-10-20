@@ -1108,9 +1108,10 @@ ok   "verify clean after the witness round" locked verify
 
 note "diff witness: CRLF line endings are stated once, not escaped"
 # A carriage return before every line feed of the content is the file's
-# line-ending convention: the display says so once, above the diff, and
-# draws each pair as one break. The fixture is CRLF on both sides, so the
-# content relock's diff is CRLF throughout.
+# line-ending convention: the display says so once, on a header line of
+# the diff after the +++ line, and draws each pair as one break. The
+# fixture is CRLF on both sides, so the content relock's diff is CRLF
+# throughout.
 CRF="$DWD/crlf.txt"
 printf 'one\r\ntwo\r\n' >"$CRF"
 chown "$INV:staff" "$CRF"
@@ -1121,7 +1122,8 @@ printf 'one\r\nthree\r\n' >"$CRF"
 check "the CRLF fixture was set up"       "0" "$CRRC"
 locked lock --yes "$CRF" >"$DW" 2>&1 || CRRC=1
 check "the CRLF relock succeeded"         "0" "$CRRC"
-ok   "the relock states the line endings" grep -qxF "(CRLF line endings)" "$DW"
+check "the relock states the line endings under the +++ line" "CRLF line endings" \
+      "$(grep -A1 '^+++ ' "$DW" | sed -n 2p)"
 ok   "and draws the pair as one break"    grep -qxF "+three" "$DW"
 deny "and escapes no carriage return"     grep -qF "${BSL}u{D}" "$DW"
 deny "nor prints one raw"                 grep -q $'\r' "$DW"
@@ -1175,35 +1177,42 @@ check "color off emits no escape at all"   "0" \
 check "color off still escapes the character" "1" \
       "$(grep -cF -- "${BSL}u{1B}" "$DWPOUT" || true)"
 
-# Line endings: CRLF throughout is stated through the facts file and drawn
-# as plain breaks; a mix keeps every carriage return escaped, and so does
-# a call with no facts file. A content line whose newline diff added (the
-# no-newline marker follows it) is not counted.
-DWFACTS="$SCRATCH/painter.facts"
-: >"$DWFACTS"
-printf '%b' '--- a\n+++ b\n@@ -1,2 +1,2 @@\n one\r\n-two\r\n+three\r\n' \
-  | /usr/bin/perl "$DWFILT" lines 0 "$DWFACTS" >"$DWPOUT" 2>&1 || true
-check "CRLF throughout is reported"        "crlf" "$(cat "$DWFACTS")"
-check "and drawn without the carriage returns" "0" \
+# Line endings, judged per file: a file whose content is CRLF throughout
+# gets one header line after its +++ line and draws its pairs as plain
+# breaks, while the next file in the same diff, with a mix, keeps every
+# carriage return escaped. A content line whose newline diff added (the
+# no-newline marker follows it) is not counted. With the judgment off
+# (a failed diff), every carriage return is escaped.
+printf '%b' 'diff -ruN a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n one\r\n-two\r\n+three\r\ndiff -ruN a/y b/y\n--- a/y\n+++ b/y\n@@ -1 +1 @@\n-lf\n+mixed\r\n' \
+  | /usr/bin/perl "$DWFILT" lines 0 1 >"$DWPOUT" 2>&1 || true
+check "a CRLF file states its line endings once" "1" \
+      "$(grep -cxF -- "CRLF line endings" "$DWPOUT" || true)"
+check "on the line after its +++ line"     "CRLF line endings" \
+      "$(grep -A1 -xF -- "+++ b/x" "$DWPOUT" | sed -n 2p)"
+check "and draws its pairs as plain breaks" "1" \
+      "$(grep -cxF -- "+three" "$DWPOUT" || true)"
+check "a mixed file in the same diff keeps its carriage return escaped" "1" \
+      "$(grep -cxF -- "+mixed${BSL}u{D}" "$DWPOUT" || true)"
+check "and states nothing"                 "@@ -1 +1 @@" \
+      "$(grep -A1 -xF -- "+++ b/y" "$DWPOUT" | sed -n 2p)"
+check "no carriage return is printed raw"  "0" \
       "$(LC_ALL=C grep -c $'\r' "$DWPOUT" || true)"
-check "and without their escapes"          "0" \
-      "$(grep -cF -- "${BSL}u{D}" "$DWPOUT" || true)"
-: >"$DWFACTS"
-printf '%b' '--- a\n+++ b\n@@ -1 +1 @@\n-two\n+three\r\n' \
-  | /usr/bin/perl "$DWFILT" lines 0 "$DWFACTS" >"$DWPOUT" 2>&1 || true
-check "mixed endings are not reported"     "" "$(cat "$DWFACTS")"
-check "and their carriage return is escaped" "1" \
-      "$(grep -cxF -- "+three${BSL}u{D}" "$DWPOUT" || true)"
-: >"$DWFACTS"
 printf '%b' '--- a\n+++ b\n@@ -1 +1 @@\n-two\r\n+three\r\n\\ No newline at end of file\n' \
-  | /usr/bin/perl "$DWFILT" lines 0 "$DWFACTS" >"$DWPOUT" 2>&1 || true
-check "a last line without a newline still reads as CRLF" "crlf" "$(cat "$DWFACTS")"
+  | /usr/bin/perl "$DWFILT" lines 0 1 >"$DWPOUT" 2>&1 || true
+check "a last line without a newline still reads as CRLF" "1" \
+      "$(grep -cxF -- "CRLF line endings" "$DWPOUT" || true)"
 check "and its own carriage return stays escaped" "1" \
       "$(grep -cxF -- "+three${BSL}u{D}" "$DWPOUT" || true)"
 printf '%b' '--- a\n+++ b\n@@ -1 +1 @@\n-two\r\n+three\r\n' \
-  | /usr/bin/perl "$DWFILT" lines 0 >"$DWPOUT" 2>&1 || true
-check "without a facts file every carriage return is escaped" "2" \
+  | /usr/bin/perl "$DWFILT" lines 0 0 >"$DWPOUT" 2>&1 || true
+check "with the judgment off every carriage return is escaped" "2" \
       "$(grep -cF -- "${BSL}u{D}" "$DWPOUT" || true)"
+check "and nothing is stated"              "0" \
+      "$(grep -cF -- "CRLF" "$DWPOUT" || true)"
+printf '%b' '--- a\n+++ b\n@@ -1 +1 @@\n-two\r\n+three\r\n' \
+  | /usr/bin/perl "$DWFILT" lines 1 1 >"$DWPOUT" 2>&1 || true
+check "on color the header line is painted as a file header" "1" \
+      "$(grep -cxF -- "${DW_ESC}[1;35mCRLF line endings${DW_ESC}[0m" "$DWPOUT" || true)"
 
 # Field mode, the form every path takes: a tab and a line feed are
 # escaped (a value sits on one row), and only the bytes that fail UTF-8
