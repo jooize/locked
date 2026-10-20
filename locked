@@ -405,6 +405,22 @@ say_err() {
 }
 err_val() { say_err "${E_RED}${E_B}✗ error:${E_OFF} $1" "$2"; }
 
+# shq <path>: <path> as one shell word that bash, zsh and fish all read
+# back as the same bytes, on stdout, for a command line the reader may
+# paste: bare when every character is one no shell treats specially,
+# else in single quotes, a quote inside written '\'' (each of the three
+# reads that the same way). A suggested command embeds it, and the
+# display escapes the whole line after (cmd_disp, esc_into): a name with
+# a hidden character shows the escape, so a command that would not paste
+# as shown never pretends to.
+shq() {
+  local LC_ALL=C q="'" r="'\\''"
+  case "$1" in
+    *[!A-Za-z0-9._/+@:,=-]*|'') printf "'%s'" "${1//$q/$r}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
 # path_lines <indent> <path>...: one path per line on stdout, each escaped
 # and alone on its line. Prints with set_pal, so a caller sends it to
 # stderr with >&2 and keeps its color.
@@ -1872,7 +1888,7 @@ verify_node() {
         vpath ep "$bin"
         vline drift "it was in the bin at: $ep"
       fi
-      vpath ep "$f"
+      vpath ep "$(shq "$f")"
       vline drift "relock it with: sudo locked lock $ep"
       return 1
     fi
@@ -2870,8 +2886,8 @@ release_node() {
     # this path is an ancestor, not the leaf. Say which one.
     say_err "skipped, not in pool" "$f"
     chain_diagnosis "$f" \
-      "sudo locked unlock --chain $f" "releases the chain above it" \
-      "sudo locked rm $f" "removes it through a bounded window" >&2
+      "sudo locked unlock --chain $(shq "$f")" "releases the chain above it" \
+      "sudo locked rm $(shq "$f")" "removes it through a bounded window" >&2
     log_action unlock "$f" skip-no-meta
     return 0
   fi
@@ -2968,7 +2984,7 @@ release_node() {
   pflags="$(flags_of "$(dirname "$f")")"
   case ",$pflags," in
     *,uappnd,*|*,sappnd,*|*,uchg,*|*,schg,*)
-      esc_into ef "$f" "$C_RV" "$C_CYN"
+      esc_into ef "$(shq "$f")" "$C_RV" "$C_CYN"
       echo "  ${C_YEL}note:${C_OFF} its parent is flagged ($pflags), so atomic-save editors"
       echo "        (write-then-rename) will fail. In-place edits work, or use:"
       echo "        ${C_CYN}sudo locked unlock --chain $ef${C_OFF}"
@@ -3197,7 +3213,7 @@ reseal_after_window() {
       log_action reseal "$n" reseal-backstop
     else
       local en
-      esc_into en "$n" "$E_RV"
+      esc_into en "$(shq "$n")" "$E_RV"
       echo "    could not re-seal it. Restore by hand:" >&2
       echo "    sudo chflags -h $want $en" >&2
       log_action reseal "$n" reseal-failed
@@ -3252,7 +3268,7 @@ helper_outcome() { # <verb> <path>
       ;;
     2)
       local ef
-      esc_into ef "$f" "$E_RV" "$E_CYN"
+      esc_into ef "$(shq "$f")" "$E_RV" "$E_CYN"
       say_err "${E_RED}${E_B}✗ refused:${E_OFF} the node the helper opened is not the one recorded" "$f"
       echo "  nothing was changed. Check it, then re-run: ${E_CYN}sudo locked status $ef${E_OFF}" >&2
       log_action "$verb" "$f" refuse-identity
@@ -3466,7 +3482,7 @@ EOF
     echo "${P_YEL}note:${P_OFF} acting on it takes those paths with it, so their records"
     echo "      change too."
     cmd_rows "      " \
-      "sudo locked $verb --recursive $target" "proceeds and updates them"
+      "sudo locked $verb --recursive $(shq "$target")" "proceeds and updates them"
   } >&2
   log_action "$verb" "$target" refuse-subtree
   return 1
@@ -3538,18 +3554,41 @@ blocking_ancestor() { # <path>
 # `sudo` bold, the program token bold cyan (a dir part, were one ever
 # shown, plain cyan around a bold basename), option flags bold blue --
 # marked LEXICALLY, the token starts with `-` -- paths cyan, a <placeholder>
-# dim, everything else plain. Tokens come from splitting on the single
-# spaces the call sites composed the string with -- by read, so a path
-# holding * or ? is never expanded as a glob -- and each is escaped
-# (esc_into); a spaced path merely splits its color, never its bytes. Into
-# CMD_DISP, never through a command substitution, so a token that cannot
-# be rendered ends locked rather than a subshell. Uses the P_* palette:
-# callers run set_pal first.
+# dim, everything else plain. The string is split into shell words the way
+# the shell will read it when pasted: on spaces outside single quotes,
+# a backslash keeping the next byte in its word, so a path shq quoted is
+# one word and is never expanded as a glob. Each word is escaped
+# (esc_into). Into CMD_DISP, never through a command substitution, so a
+# word that cannot be rendered ends locked rather than a subshell. Uses
+# the P_* palette: callers run set_pal first.
 CMD_DISP=""
 cmd_disp() { # <command-string>
-  local out="" sep="" tok st prog_pending=1
+  local out="" sep="" tok="" st prog_pending=1 s="$1" c i n inq=0
   local -a toks=()
-  IFS=' ' read -r -d '' -a toks < <(printf '%s' "$1") || true
+  # Bytes, so a multibyte character passes through one byte at a time and
+  # is put back together in its word.
+  local LC_ALL=C
+  n="${#s}"
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    c="${s:$i:1}"
+    i=$((i + 1))
+    if [ "$inq" -eq 1 ]; then
+      tok="$tok$c"
+      [ "$c" != "'" ] || inq=0
+      continue
+    fi
+    case "$c" in
+      "'") inq=1; tok="$tok$c" ;;
+      '\') tok="$tok$c${s:$i:1}"; i=$((i + 1)) ;;
+      ' ')
+        [ -z "$tok" ] || toks+=("$tok")
+        tok=""
+        ;;
+      *) tok="$tok$c" ;;
+    esac
+  done
+  [ -z "$tok" ] || toks+=("$tok")
   for tok in ${toks[@]+"${toks[@]}"}; do
     case "$tok" in
       sudo)  st="$P_B" ;;
@@ -3636,7 +3675,7 @@ explain_blocker() { # <node> <flag> [<command> <description>]...
   else
     echo "      locked has no record of that flag -- it was set outside the"
     echo "      pool, so no locked verb releases it."
-    cmd_rows "      " "sudo chflags no$fl $n" "releases it (re-apply it yourself after)"
+    cmd_rows "      " "sudo chflags no$fl $(shq "$n")" "releases it (re-apply it yourself after)"
   fi
 }
 
@@ -3965,7 +4004,7 @@ $chain"
 $chain
 EOF
     local ef
-    esc_into ef "$f" "$C_RV" "$C_CYN"
+    esc_into ef "$(shq "$f")" "$C_RV" "$C_CYN"
     echo "chain released; relock with: ${C_CYN}sudo locked lock $ef${C_OFF}"
   fi
 }
@@ -4137,7 +4176,7 @@ sealed_folder_for() { # <path> <is-new>
   if [ "$(meta_field "$META" state)" != "locked" ]; then
     say_err "skipped, its folder is unlocked" "$f"
     value_rows "  " folder id "$d" >&2
-    cmd_rows "  " "sudo locked lock $d" "seals it again once you have edited the file directly" >&2
+    cmd_rows "  " "sudo locked lock $(shq "$d")" "seals it again once you have edited the file directly" >&2
     return 1
   fi
   cur="$(node_id "$d")" || {
@@ -4149,7 +4188,7 @@ sealed_folder_for() { # <path> <is-new>
   if [ "$sn" -ne 0 ]; then
     say_err "skipped, its folder is not the node its record names" "$f"
     value_rows "  " folder id "$d" >&2
-    cmd_rows "  " "sudo locked status $d" "shows what the record says" >&2
+    cmd_rows "  " "sudo locked status $(shq "$d")" "shows what the record says" >&2
     return 1
   fi
   # Every node from the file up to the folder: lock-owned and frozen, as
@@ -4170,7 +4209,7 @@ sealed_folder_for() { # <path> <is-new>
     if [ "$bad" -eq 1 ]; then
       say_err "skipped, a node is not sealed as its folder's record says" "$f"
       value_rows "  " node id "$n" folder id "$d" >&2
-      cmd_rows "  " "sudo locked status $d" "shows what the record says" >&2
+      cmd_rows "  " "sudo locked status $(shq "$d")" "shows what the record says" >&2
       return 1
     fi
     case ",$(flags_of "$n")," in
@@ -4178,7 +4217,7 @@ sealed_folder_for() { # <path> <is-new>
       *)
         say_err "skipped, a node is not frozen (uchg) as its folder's record says" "$f"
         value_rows "  " node id "$n" folder id "$d" >&2
-        cmd_rows "  " "sudo locked status $d" "shows what the record says" >&2
+        cmd_rows "  " "sudo locked status $(shq "$d")" "shows what the record says" >&2
         return 1
         ;;
     esac
@@ -4344,7 +4383,7 @@ do_edit_one() {
     esac
     if [ "$state" != "locked" ]; then
       say_err "skipped, currently unlocked" "$f"
-      cmd_rows "  " "sudo locked lock $f" "seals it again once you have edited it directly" >&2
+      cmd_rows "  " "sudo locked lock $(shq "$f")" "seals it again once you have edited it directly" >&2
       return 1
     fi
   fi
@@ -4663,7 +4702,7 @@ do_rm_one() {
     if [ -n "$(ls -A -- "$f" 2>/dev/null)" ]; then
       say_err "skipped, directory is not empty" "$f"
       cmd_rows "  " \
-        "sudo locked rm --recursive $f" "removes it and everything under it" >&2
+        "sudo locked rm --recursive $(shq "$f")" "removes it and everything under it" >&2
       log_action rm "$f" skip-nonempty
       return 1
     fi
@@ -4817,7 +4856,7 @@ do_trash_one() {
     echo "  The trash service runs as you, not as root, so the move out of" >&2
     echo "  that directory needs your own rights on it -- releasing the flag" >&2
     echo "  does not grant them." >&2
-    cmd_rows "  " "sudo locked rm $f" "removes it outright instead" >&2
+    cmd_rows "  " "sudo locked rm $(shq "$f")" "removes it outright instead" >&2
     log_action trash "$f" refuse-parent-perm
     return 1
   fi
@@ -4943,7 +4982,7 @@ do_mv() { # <old> <new>
       do_lock_one "$moved" || lrc=$?
       if [ "$lrc" -ne 0 ]; then
         say_err "${E_YEL}note:${E_OFF} sealed, but the chain at its new place is not settled" "$moved"
-        cmd_rows "      " "sudo locked lock $moved" "seals the new chain and releases the old one" >&2
+        cmd_rows "      " "sudo locked lock $(shq "$moved")" "seals the new chain and releases the old one" >&2
       fi
     done
   fi
@@ -4965,7 +5004,7 @@ do_rekey() { # <old> <new>
   want="$(meta_field "$META" id)"
   if [ ! -e "$new" ] && [ ! -L "$new" ]; then
     say_err "${E_RED}${E_B}✗ refusing:${E_OFF} does not exist" "$new"
-    cmd_rows "  " "sudo locked tombstone $old" "records it as gone instead" >&2
+    cmd_rows "  " "sudo locked tombstone $(shq "$old")" "records it as gone instead" >&2
     return 1
   fi
   cur="$(node_id "$new")" || return 1
@@ -4978,7 +5017,7 @@ do_rekey() { # <old> <new>
     say_err "${E_RED}${E_B}✗ refusing:${E_OFF} the node here is not the one that record describes" "$new"
     value_rows "  " record id "$old" "recorded id" plain "$want" "id here" plain "$cur" >&2
     echo "  Re-keying would attach its snapshot and flag history to a different file." >&2
-    cmd_rows "  " "sudo locked tombstone $old" "if the recorded node is really gone" >&2
+    cmd_rows "  " "sudo locked tombstone $(shq "$old")" "if the recorded node is really gone" >&2
     log_action rekey "$old" refuse-identity
     return 1
   fi
@@ -5128,13 +5167,13 @@ do_why_one() {
       echo "${P_YEL}note:${P_OFF} this path is immutable ($self_block), so its contents cannot"
       echo "      change while it is sealed: $ef"
       cmd_rows "      " \
-        "sudo locked edit $f" "edits it without ever leaving it unlocked" \
-        "sudo locked unlock $f" "releases it until the next lock"
+        "sudo locked edit $(shq "$f")" "edits it without ever leaving it unlocked" \
+        "sudo locked unlock $(shq "$f")" "releases it until the next lock"
     else
       echo "${P_YEL}note:${P_OFF} this path is immutable ($self_block), and locked has no record of"
       echo "      that flag; it was set outside the pool: $ef"
       cmd_rows "      " \
-        "sudo chflags no$self_block $f" "releases it (re-apply it yourself after)"
+        "sudo chflags no$self_block $(shq "$f")" "releases it (re-apply it yourself after)"
     fi
   fi
   if blocking_ancestor "$f"; then
@@ -5142,16 +5181,16 @@ do_why_one() {
     echo
     if { [ -e "$f" ] || [ -L "$f" ]; } && user_can_write_dir "$inv" "$(dirname "$f")"; then
       explain_blocker "$BLOCK_PATH" "$BLOCK_FLAG" \
-        "sudo locked rm $f" "removes it through a bounded window" \
-        "sudo locked trash $f" "moves it to your trash instead" \
-        "sudo locked mv $f <new>" "renames it through the same window"
+        "sudo locked rm $(shq "$f")" "removes it through a bounded window" \
+        "sudo locked trash $(shq "$f")" "moves it to your trash instead" \
+        "sudo locked mv $(shq "$f") <new>" "renames it through the same window"
     elif [ -e "$f" ] || [ -L "$f" ]; then
       # The trash service moves the entry as you, and this parent does not
       # let you remove what is in it (a placement seal's entry adds only),
       # so do_trash_one would refuse the command. rm and mv run as root.
       explain_blocker "$BLOCK_PATH" "$BLOCK_FLAG" \
-        "sudo locked rm $f" "removes it through a bounded window" \
-        "sudo locked mv $f <new>" "renames it through the same window"
+        "sudo locked rm $(shq "$f")" "removes it through a bounded window" \
+        "sudo locked mv $(shq "$f") <new>" "renames it through the same window"
     else
       # There is nothing there to remove or rename, so offering the verbs
       # that do those would only produce commands that refuse.
@@ -5260,7 +5299,7 @@ status_row() { # <path> [brief]
   status_line "$P_RED" '✗' drifted "$tier" "$flag" "$n"
   if [ "$brief" = "brief" ]; then
     local en
-    esc_into en "$n" "$P_RV" "$P_DIM"
+    esc_into en "$(shq "$n")" "$P_RV" "$P_DIM"
     status_note "details: sudo locked status $en"
   else
     verify_node "$n" "$META" "$lock_user" | verify_rows "$pad" || true
@@ -5281,7 +5320,7 @@ print_chain() { # <path> [brief]
   if chain="$(chain_for "$f" 2>/dev/null)"; then
     :
   else
-    esc_into ef "$f" "$P_RV" "$P_CYN"
+    esc_into ef "$(shq "$f")" "$P_RV" "$P_CYN"
     echo "  ${P_RED}✗${P_OFF} the chain stop node is not root-owned; see: ${P_CYN}sudo locked lock $ef${P_OFF}"
     if chain_skips_parent "$f"; then
       chain="$(dirname "$(dirname "$f")")"

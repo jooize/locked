@@ -2154,6 +2154,14 @@ ok   "and names it last"                       grep -qF "be removed or renamed w
 ok   "why offers the mediated rm"              grep -qF "sudo locked rm $WHYF" "$OUTF"
 ok   "why offers the mediated trash"           grep -qF "sudo locked trash $WHYF" "$OUTF"
 ok   "why offers the mediated mv"              grep -qF "sudo locked mv $WHYF" "$OUTF"
+# A suggested command is pasted, so a path a shell would split or expand
+# is one single-quoted word, a quote inside it written '\''.
+WHYQ="$MED/why it's *.txt"
+# shellcheck disable=SC2016  # $1 is the inner shell's argument
+as_user /bin/sh -c 'echo w > "$1"' sh "$WHYQ"
+locked why "$WHYQ" >"$OUTF" 2>&1 || true
+ok   "why quotes a path the shell would split" \
+     grep -qF "sudo locked rm '$MED/why it'\\''s *.txt'" "$OUTF"
 locked why "$XAF" >"$OUTF" 2>&1 || true
 ok   "why names an immutable pool leaf"        grep -qF "is immutable (uchg)" "$OUTF"
 ok   "why offers edit on a pool leaf"          grep -qF "sudo locked edit $XAF" "$OUTF"
