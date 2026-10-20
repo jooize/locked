@@ -2442,7 +2442,11 @@ show_diff() { # <rule> <row label> <path> <diff-cmd>...
       "$P_B" "$lines" "$P_OFF" "$P_BLU" "$P_OFF" \
       "$P_DIM" "$P_OFF" "$P_BLU" "$P_OFF" "$P_DIM" "$P_OFF"
     if gate_answer 1 "$gate" 1; then
-      /usr/bin/less -RF -- "$enc" || true
+      # A clean environment and secure mode: no lesskey file (which can
+      # bind a key to a shell command), LESS or LESSOPEN from the caller
+      # reaches this root less, and its shell, pipe and edit commands are off.
+      env -i PATH="$PATH" HOME=/var/empty TERM="${TERM:-dumb}" \
+        LESSSECURE=1 LESSCHARSET=utf-8 /usr/bin/less -RF -- "$enc" || true
       shown=1
     fi
   else
