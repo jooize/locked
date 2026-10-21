@@ -160,12 +160,12 @@ INV="${SUDO_USER:-}"
 SERIAL=0
 WANT=" "
 HARNESS_GIT=""
-USAGE="usage: sudo /bin/bash tests/harness.bash [--serial] [--git PATH] [section 1-8...]"
+USAGE="usage: sudo /bin/bash tests/harness.bash [--serial] [--git PATH] [section 1-9...]"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --serial) SERIAL=1 ;;
     --git) [ "$#" -ge 2 ] || bail "$USAGE" 2; HARNESS_GIT="$2"; shift ;;
-    [1-8]) WANT="$WANT$1 " ;;
+    [1-9]) WANT="$WANT$1 " ;;
     *) bail "$USAGE" 2 ;;
   esac
   shift
@@ -241,6 +241,21 @@ locked() {
 
 as_user() {
   sudo -u "$INV" "$@"
+}
+
+# locked with the test-build helper and its pause hook armed, for the
+# between-plan-and-apply case: <verb>:<fifo> makes the helper's <verb> wait
+# on <fifo> before it opens anything. Same env as locked() otherwise.
+locked_th() { # <pause spec> <args...>
+  local pause="$1"; shift
+  env LOCKED_STATE_ROOT="$STATEROOT" \
+      INSTALL_TARGET="$SCRATCH/not-installed" \
+      LOCKED_HELPER="$HELPER_TEST" \
+      LOCKED_HELPER_TEST_PAUSE="$pause" \
+      LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
+      LOCKED_USER_HOME="$FAKE_HOME" \
+      SUDO_USER="$INV" \
+      "$LOCKED_RUN" "$@"
 }
 
 ok() {   # ok <desc> <cmd...>: expect success; prints the output on failure
@@ -391,6 +406,20 @@ check "helper is root-owned"                  "root" "$(owner_of "$HELPER")"
 check "helper is 755"                         "755" "$(stat -f '%OLp' "$HELPER")"
 check "helper's dir is root-owned"            "root" "$(owner_of "$HELPERDIR")"
 check "helper's dir is 755"                   "755" "$(stat -f '%OLp' "$HELPERDIR")"
+# The release build carries no test hook; the between-plan-and-apply case
+# (section 9) needs one, so a second build with -DLOCKED_HELPER_TEST sits
+# beside it, root-owned the same way so verify_helper accepts it. It still
+# refuses to act without root -- only the pause hook is added -- so it is a
+# test seam, not a weakening of the installed binary.
+check "the release helper holds no test hook" "0" \
+      "$(/usr/bin/strings "$HELPER" | grep -c LOCKED_HELPER_TEST || true)"
+HELPER_TEST="$HELPERDIR/locked-helper-test"
+/usr/bin/clang -O2 -Wall -Wextra -DLOCKED_HELPER_TEST -framework Foundation \
+    -o "$SCRATCH/locked-helper-test.built" "$HELPERSRC" \
+  || bail "could not build the test helper"
+install -o root -g wheel -m 755 "$SCRATCH/locked-helper-test.built" "$HELPER_TEST"
+check "the test helper has the pause hook"    "1" \
+      "$(/usr/bin/strings "$HELPER_TEST" | grep -c LOCKED_HELPER_TEST_PAUSE || true)"
 
 # Every diff is drawn by the git LOCKED_GIT names, and that line is a
 # constant, not a seam: no environment reaches it, this harness's
@@ -3364,6 +3393,125 @@ ok   "at 600 again, runs pass"                 locked_conv verify --quiet
 
 }
 
+# ---- 9. the owner gate on a planted node -----------------------------------
+section_9() {
+#
+# The headline defect: a user gives a root-owned file a second name (a hard
+# link) inside a folder they own, and locked -- running as root -- then
+# chowns or reflags it. The seal now acts per inode through the helper's
+# owner gate, so a node owned by anyone but the invoker is refused, link or
+# not, whatever folder it sits in. These cases are root's to run: only root
+# can own the planted node, and the pause build makes the plan-to-apply
+# window deterministic without ever shipping in a release helper.
+
+note "owner gate: fixtures"
+OG="$SCRATCH/owner-gate"
+install -d -o "$INV" -g staff -m 755 "$OG"
+OGOUT="$SCRATCH/owner-gate-out.txt"
+# A root-owned file to reach for. Under SCRATCH (one filesystem), so a hard
+# link to it can be made; mode 644 so reaching it is never a read-permission
+# question -- the gate is about the owner, not the bytes.
+ROOTF="$SCRATCH/root-owned.txt"
+install -o root -g wheel -m 644 /dev/null "$ROOTF"
+printf 'root bytes\n' >"$ROOTF"
+
+note "owner gate: a hard link to a root file, named directly"
+# The exact live defect. lock names the link; plan_node reads its owner --
+# root, because owner is the file's, not the name's -- and refuses before
+# touching anything. Were it sealed, unlock's chown would hand you the root
+# file.
+LINKD="$OG/linkdir"
+install -d -o "$INV" -g staff -m 755 "$LINKD"
+if as_user ln "$ROOTF" "$LINKD/sudoers-ish" 2>/dev/null; then
+  refuse "a hard link to a root file is refused" "not owned by you" \
+         locked lock --yes "$LINKD/sudoers-ish"
+  check "the root file keeps its owner"          "root" "$(owner_of "$ROOTF")"
+  check "and carries no flag"                    "" "$(flags_of "$ROOTF")"
+  deny  "no record was written for the link"     test -e "$(pool_meta "$LINKD/sudoers-ish")"
+  as_user rm -f -- "$LINKD/sudoers-ish"
+else
+  tap_skip "a hard link to a root file is refused" "the user may not hard-link here"
+fi
+
+note "owner gate: a foreign-owned node inside a tree"
+# A root-owned node anywhere in a tree you ask to seal -- a hard link, or
+# as here a file placed by root -- is refused, with its owner named, and
+# nothing in the tree is sealed.
+FOT="$OG/foreign-tree"
+install -d -o "$INV" -g staff -m 755 "$FOT" "$FOT/sub"
+as_user /bin/sh -c "echo mine > '$FOT/mine.txt'"
+install -o root -g wheel -m 644 "$ROOTF" "$FOT/sub/theirs.txt"
+locked lock --yes "$FOT" >"$OGOUT" 2>&1 || true
+ok   "the tree seal is refused"                grep -qF "holds nodes you do not own" "$OGOUT"
+ok   "the refusal names the foreign owner"     grep -qF "owned by root" "$OGOUT"
+check "nothing in the tree was flagged"        "" "$(find "$FOT" -flags +uchg -print 2>/dev/null)"
+check "the tree is still yours"                "$INV" "$(owner_of "$FOT/mine.txt")"
+
+note "owner gate: a node that is not a file, directory or symlink"
+FIT="$OG/fifo-tree"
+install -d -o "$INV" -g staff -m 755 "$FIT"
+as_user /bin/sh -c "echo a > '$FIT/a.txt'"
+as_user mkfifo "$FIT/pipe"
+locked lock --yes "$FIT" >"$OGOUT" 2>&1 || true
+ok   "a tree with a fifo is refused"           grep -qF "not files, directories or symlinks" "$OGOUT"
+check "nothing in it was flagged"              "" "$(find "$FIT" -flags +uchg -print 2>/dev/null)"
+as_user rm -f -- "$FIT/pipe"
+
+note "owner gate: a node planted between plan and apply"
+# plan_node reads the tree and finds it all yours; then, in the window
+# before the helper seals it, a root-owned node appears deep inside. The
+# helper hands each directory over and freezes it before reading its
+# entries, so the plant is on the final listing and meets the gate like any
+# other node. It refuses (exit 7) and rolls back every freeze it made, so
+# the tree is left exactly as the plan found it.
+RT="$OG/race-tree"
+install -d -o "$INV" -g staff -m 755 "$RT" "$RT/a" "$RT/a/b"
+as_user /bin/sh -c "echo one > '$RT/one.txt'; echo two > '$RT/a/two.txt'; echo three > '$RT/a/b/three.txt'"
+FIFO="$SCRATCH/s9-pause"
+as_user mkfifo "$FIFO" 2>/dev/null || mkfifo "$FIFO"
+RROUT="$SCRATCH/race-out.txt"
+RRC=0
+locked_th "seal:$FIFO" lock --yes "$RT" >"$RROUT" 2>&1 &
+RPID=$!
+# Opening the write end unblocks only once the helper has reached the pause
+# -- which is after it took the snapshot, so the plant lands in the seal
+# window exactly. Then plant, release, and let it finish.
+if exec 3>"$FIFO"; then
+  install -o root -g wheel -m 644 "$ROOTF" "$RT/a/b/planted.txt"
+  printf 'x' >&3
+  exec 3>&-
+fi
+wait "$RPID" || RRC=$?
+check "the planted lock exits nonzero"         "1" "$RRC"
+ok   "the helper refused the planted node"     \
+     grep -qE "not owned by you|not one locked may act on" "$RROUT"
+check "no node in the tree is frozen"          "" "$(find "$RT" -flags +uchg -print 2>/dev/null)"
+check "the top is still yours"                 "$INV" "$(owner_of "$RT")"
+check "a frozen directory was rolled back"     "$INV" "$(owner_of "$RT/a/b")"
+check "the planted node is still root's"       "root" "$(owner_of "$RT/a/b/planted.txt")"
+rm -f -- "$FIFO"
+
+note "owner gate: a relock after a swap for a root-owned link"
+# A node sealed and then unlocked sits at a path in your space. Swap it for
+# a hard link to a root file during the window, and the relock refuses: a
+# relock gates the owner exactly as a first seal does.
+SWF="$OG/swapme.txt"
+as_user /bin/sh -c "echo mine > '$SWF'"
+ok   "seal the swap fixture"                   locked lock --yes "$SWF"
+ok   "unlock it"                               locked unlock "$SWF"
+as_user rm -f -- "$SWF"
+if as_user ln "$ROOTF" "$SWF" 2>/dev/null; then
+  refuse "a relock over a root-owned link is refused" "not owned by you" \
+         locked lock --yes "$SWF"
+  check "the root file is untouched"             "root" "$(owner_of "$ROOTF")"
+  check "and unflagged"                          "" "$(flags_of "$ROOTF")"
+  as_user rm -f -- "$SWF"
+else
+  tap_skip "a relock over a root-owned link is refused" "the user may not hard-link here"
+fi
+
+}
+
 # ---- run the sections ------------------------------------------------------
 #
 # Section 0 ran above, in this process: it built the helper every other
@@ -3378,7 +3526,7 @@ ok   "at 600 again, runs pass"                 locked_conv verify --quiet
 # every number is assigned here, in this one process, at the point of
 # printing. Whatever else a job printed (its stderr shares the file) goes
 # out as comments, where it stood.
-JOBS=("1" "2" "3" "4" "5" "6" "7 8")
+JOBS=("1" "2" "3" "4" "5" "6" "7 8" "9")
 RESULTS="$SCRATCH/results"
 install -d -m 700 "$RESULTS"
 
