@@ -3482,7 +3482,7 @@ if exec 3>"$FIFO"; then
   exec 3>&-
 fi
 wait "$RPID" || RRC=$?
-check "the planted lock exits nonzero"         "1" "$RRC"
+check "the planted lock exits 3 (a failed item)" "3" "$RRC"
 ok   "the helper refused the planted node"     \
      grep -qE "not owned by you|not one locked may act on" "$RROUT"
 check "no node in the tree is frozen"          "" "$(find "$RT" -flags +uchg -print 2>/dev/null)"

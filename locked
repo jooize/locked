@@ -3583,7 +3583,9 @@ release_node() {
   # recorded node and only what the lock account owns (node_op). A node
   # already back with its owner is let through too, so an unlock cut short
   # can be run again -- but only when that owner is you: root hands back
-  # nothing that is not already yours or sealed for you.
+  # nothing that is not already yours or sealed for you. The snapshot read
+  # takes the same owners, so a node that drifted back to you (flag cleared,
+  # owner reset) can still be unlocked to repair it.
   local rid owners="$lock_user"
   rid="$(helper_id_for "$f")"
   [ "$owner" = "$inv" ] && owners="$lock_user,$inv"
@@ -3592,12 +3594,12 @@ release_node() {
       local -a how=(--path "$f" --id "$rid" --owner "$owners"
         --chown "${owner}:${group}" --flag "$flag")
       if [ "$recursive" = "1" ]; then
-        run snapshot_tree "$f" "$SNAPDIR" "$lock_user" "$rid" || return 1
+        run snapshot_tree "$f" "$SNAPDIR" "$owners" "$rid" || return 1
         node_op unlock "$f" unseal "${how[@]}" --mode "$mode" --recursive || return 1
       elif [ "$is_link" -eq 1 ]; then
         node_op unlock "$f" unseal "${how[@]}" || return 1
       else
-        run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 "$lock_user" "$rid" || return 1
+        run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 "$owners" "$rid" || return 1
         node_op unlock "$f" unseal "${how[@]}" --mode "$mode" || return 1
       fi
       ;;
