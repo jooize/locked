@@ -3026,8 +3026,8 @@ plan_tree_refusals() {
   [ "$bad" -eq 0 ]
 }
 
-# plan_notes <path> <first seal: 0|1>: what the person sealing this path
-# probably did not intend, or should know, said before the question. A
+# plan_notes <path> <first seal: 0|1> <tier>: what the person sealing this
+# path probably did not intend, or should know, said before the question. A
 # note, not a refusal: none of these lets root do more than the invoker
 # could. On stderr with the plan; each list of paths stacked, one a line.
 #
@@ -3035,22 +3035,28 @@ plan_tree_refusals() {
 #     The flag and the owner are the file's, not the name's, so every name
 #     is frozen and handed to the lock account with it, wherever it sits.
 #     Names that all sit inside a sealed folder say nothing new, so only a
-#     file with fewer names in the folder than links is listed.
+#     file with fewer names in the folder than links is listed. An anchor
+#     file keeps its owner, so its other names are only frozen; an anchor
+#     folder seals no node below it, so it has no notes.
 #   - A symlink inside a folder, on its first seal: the link is sealed as a
 #     link, and what it points at is not sealed at all. Said once, when the
 #     folder is adopted, rather than on every relock.
 plan_notes() {
-  local p="$1" first="$2" sp n i j c
+  local p="$1" first="$2" tier="$3" sp n i j c
   local -a hp=() hi=() hn=() outside=() links=()
   [ -L "$p" ] && return 0
   if [ ! -d "$p" ]; then
     n="$(stat -f '%l' "$p")" || return 0
-    if [ "$n" -gt 1 ]; then
+    if [ "$n" -gt 1 ] && [ "$tier" = anchor ]; then
+      echo "${E_YEL}note:${E_OFF} this file has $n names (hard links); the flag is on the file," >&2
+      echo "      so its other names are frozen with it" >&2
+    elif [ "$n" -gt 1 ]; then
       echo "${E_YEL}note:${E_OFF} this file has $n names (hard links); the seal is on the file," >&2
       echo "      so its other names are frozen and handed to the lock account with it" >&2
     fi
     return 0
   fi
+  [ "$tier" = anchor ] && return 0
   while IFS= read -r -d '' sp; do
     hp+=("$sp")
     hi+=("$(stat -f '%i' "$sp")")
@@ -4558,16 +4564,16 @@ EOF
   release_rows "  " "$w" "$qw"
   echo >&2
   # Caveats, not refusals: said under the plan they are about, before the
-  # question. Only for a content leaf this plan actually seals: an anchor
-  # keeps its owner and seals no node below it, so neither note is true of
-  # one (and for ~ the scan would walk the whole home folder).
-  case "$leaf_tier:${plan_actions[0]}" in
-    anchor:*|*:"already locked"|*:protect) ;;
+  # question, and only for a leaf this plan actually seals. An anchor folder
+  # has none (it seals no node below it, and for ~ the scan would walk the
+  # whole home folder); plan_notes says so itself.
+  case "${plan_actions[0]}" in
+    "already locked"|protect) ;;
     *)
       local first=1
       snap_paths "$f"
       record_live "$META" && first=0
-      plan_notes "$f" "$first"
+      plan_notes "$f" "$first" "$leaf_tier"
       ;;
   esac
 

@@ -1102,6 +1102,24 @@ check "reverted content"                 "Host example" "$(head -1 "$SSHCFG")"
 check "reverted owner stays user"        "$INV" "$(owner_of "$SSHCFG")"
 check "reverted flag schg"               "schg" "$(flags_of "$SSHCFG")"
 ok   "verify clean with ssh in pool"     locked verify
+# An anchor file with a second name: the flag is the file's, so the other
+# name is frozen too, and the plan says so. The owner never changes, so the
+# note does not say the lock account takes it.
+SSHKH="$FAKE_HOME/.ssh/known_hosts"
+install -d -o "$INV" -g staff -m 755 "$SCRATCH/ssh-links"
+SSHKL="$SCRATCH/ssh-links/known-hosts-link"
+as_user /bin/sh -c "printf 'example ssh-ed25519 AAAA\n' > '$SSHKH'; ln -- '$SSHKH' '$SSHKL'"
+SSHOUT="$SCRATCH/ssh-link-out.txt"
+SSHRC=0
+locked lock --yes "$SSHKH" >"$SSHOUT" 2>&1 || SSHRC=$?
+check "lock an anchor file with two names" "0" "$SSHRC"
+ok   "the plan notes the other name"     grep -qF "this file has 2 names (hard links); the flag is on the file," "$SSHOUT"
+deny "and does not say it changes hands" grep -qF "handed to the lock account" "$SSHOUT"
+check "the other name is frozen too"     "schg" "$(flags_of "$SSHKL")"
+check "and still yours"                  "$INV" "$(owner_of "$SSHKL")"
+ok   "unprotect the two-name file"       locked unprotect --yes "$SSHKH"
+as_user rm -f -- "$SSHKL"
+ok   "remove it from the append-only ~/.ssh" locked rm --yes "$SSHKH"
 
 note "cli: diff witness encodes controls and invisibles"
 # The diff is the trust decision, so the candidate must not be able to
