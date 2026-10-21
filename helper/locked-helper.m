@@ -2896,6 +2896,13 @@ cmd_tree(int argc, char **argv, int sealing)
 		errf("--recursive needs --chown");
 		return (EX_HELPER_USAGE);
 	}
+	/* An unseal's first pass freezes with uchg, and only the flag the
+	 * unseal clears comes off in the second: any other flag would leave
+	 * those freezes behind. A tree is sealed with uchg alone. */
+	if (o.recursive && t.flag != UF_IMMUTABLE) {
+		errf("--recursive takes --flag uchg");
+		return (EX_HELPER_USAGE);
+	}
 	t.sealing = sealing;
 	t.owners = &owners;
 	t.recursive = o.recursive;

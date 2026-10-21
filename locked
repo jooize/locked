@@ -4556,9 +4556,11 @@ EOF
   release_rows "  " "$w" "$qw"
   echo >&2
   # Caveats, not refusals: said under the plan they are about, before the
-  # question. Only for a leaf this plan actually seals.
-  case "${plan_actions[0]}" in
-    "already locked"|protect) ;;
+  # question. Only for a content leaf this plan actually seals: an anchor
+  # keeps its owner and seals no node below it, so neither note is true of
+  # one (and for ~ the scan would walk the whole home folder).
+  case "$leaf_tier:${plan_actions[0]}" in
+    anchor:*|*:"already locked"|*:protect) ;;
     *)
       local first=1
       snap_paths "$f"

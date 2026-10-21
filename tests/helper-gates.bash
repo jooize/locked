@@ -181,6 +181,9 @@ check "its target does not" "" "$(flags_of "$T")"
 unseal --path "$SCRATCH/t2-link" --id - "${OWN[@]}" --flag uchg
 expect "--recursive without --chown is a usage error" 4 "--recursive needs --chown" \
   seal --path "$T" --id - --owner "$ME" --flag uchg --recursive
+expect "--recursive with a flag other than uchg is a usage error" 4 "--recursive takes --flag uchg" \
+  unseal --path "$T" --id - "${OWN[@]}" --flag uappnd --recursive
+check "and nothing in the tree was frozen" "" "$(flagged_under "$T")"
 
 note "set-user-id"
 SU="$T/setuid-tool"
