@@ -1014,24 +1014,76 @@ same_node() { # <recorded> <live>
 # chflags gotcha (probed 2026-08-05): "--" must come BEFORE the flag word;
 # after it, BSD getopt treats "--" as a filename and poisons the exit code.
 #
-# The single-node form always passes -h: a symlink argument is sealed as the
-# node it is (see leaf_path), so the flag has to land on the LINK and never
-# on whatever it points at -- the target is somebody else's node. On
-# anything that is not a link -h changes nothing, which is why it is
-# unconditional here rather than a branch. The -R form needs no -h: its
-# traversal is -P by default, so a link inside a sealed tree already takes
-# the flag on itself rather than on its target (probed 2026-09-14, which is
-# also why verify's find(1) stray scan does not trip over one).
-fset() {   # fset <flagword> <path> [-R]
-  local flagword="$1" path="$2" recur="${3:-}"
-  if [ -n "$recur" ]; then
-    run chflags -R -- "$flagword" "$path"
-  else
-    run chflags -h -- "$flagword" "$path"
-  fi
+# Always -h: a symlink argument is sealed as the node it is (see
+# leaf_path), so the flag has to land on the LINK and never on whatever it
+# points at -- the target is somebody else's node. On anything that is not
+# a link -h changes nothing, which is why it is unconditional here rather
+# than a branch. There is no recursive form: a tree is sealed node by node
+# through the helper (node_op), which gates each node by its owner. A link
+# inside a sealed tree takes the flag on itself there too (probed
+# 2026-09-14 for chflags -R, which is also why verify's find(1) stray scan
+# does not trip over one).
+fset() {   # fset <flagword> <path>
+  run chflags -h -- "$1" "$2"
 }
-fclear() { # fclear <flagword> <path> [-R]
-  fset "no$1" "$2" "${3:-}"
+fclear() { # fclear <flagword> <path>
+  fset "no$1" "$2"
+}
+
+# node_op <log verb> <path> <seal|unseal> <helper options>...: change a
+# node you protect -- its owner, mode and flag, and with --recursive every
+# node under it -- through the window helper, on each node's own
+# descriptor. This is how root acts on anything in the invoker's space
+# that a same-UID process could have swapped or linked into place after the
+# plan was made: the helper takes only a directory, a file or a symlink,
+# owned by the account its --owner names, and the node its --id names, and
+# it rolls back what it had already changed when it refuses. Root never
+# does more to an inode than the invoker could do themselves; a hard link to
+# a root-owned file is still root's, so it is refused, whatever folder it
+# was linked into. fset and fclear above stay for nodes no other process
+# can reach: chain directories, and files inside a sealed folder.
+#
+# The helper names the node it refused and why, on its own line; the line
+# here says what that means for the run. Returns 0 only when the change was
+# made (or a dry run printed it).
+node_op() {
+  local lv="$1" p="$2" first
+  shift 2
+  helper_call "$@"
+  [ "$OPT_DRY" -eq 1 ] && return 0
+  case "$HELPER_RC" in
+    0) return 0 ;;
+    2)
+      say_err "${E_RED}${E_B}✗ refused:${E_OFF} not the node the plan or the record names; nothing was changed" "$p"
+      log_action "$lv" "$p" refuse-identity
+      ;;
+    7)
+      say_err "${E_RED}${E_B}✗ refused:${E_OFF} a node is not one locked may act on (named above); nothing was changed" "$p"
+      log_action "$lv" "$p" refuse-gate
+      ;;
+    3)
+      say_err "${E_RED}${E_B}✗ failed:${E_OFF} nothing was changed" "$p"
+      log_action "$lv" "$p" fail
+      ;;
+    5)
+      # The roll back itself failed: the nodes on the helper's window-open
+      # lines (escaped by the helper) are not as they were found. Printed
+      # as they came, for the reason helper_outcome gives.
+      echo >&2
+      echo "${E_RED}${E_B}!!! a refused change could not be rolled back whole !!!${E_OFF}" >&2
+      say_err "    target" "$p"
+      printf '%s\n' "$HELPER_OUT" \
+        | awk -F'\t' '$1=="window-open"{printf "    not restored: %s\n", $2}' >&2
+      echo "    The record is not updated. See what differs: sudo locked verify" >&2
+      log_action "$lv" "$p" alarm-rollback
+      ;;
+    *)
+      first="the window helper exited $HELPER_RC, which locked does not know how to read"
+      say_err "${E_RED}${E_B}✗ error:${E_OFF} $first; treating the target as unchanged" "$p"
+      log_action "$lv" "$p" fail-unknown
+      ;;
+  esac
+  return 1
 }
 
 # ---- placement ACL entry ---------------------------------------------------
@@ -1719,24 +1771,42 @@ fi
 # immutable and even root's chown got EPERM); the dest is created fresh,
 # and meta owns flag state -- sealing re-applies it. TODO(parent-swap) on
 # the dst side was already closed by same-fs staging + atomic rename under
-# a chain-sealed parent. Directory trees (snapshot_tree) still copy with
-# cp -Rp and keep the per-file residuals; that is the one TODO left open.
-atomic_replace() {
-  local src="$1" dst="$2" owner="$3" mode="$4"
+# a chain-sealed parent.
+#
+# <src owner> is whose the source may be, and the helper asks it of the
+# descriptor it reads from: root reads only a file the invoker owns, one
+# sealed for them (the lock account's), or locked's own staging (root's)
+# -- never a second name the invoker planted for somebody else's file. A
+# hard link keeps its owner wherever it is linked, so the gate is the
+# owner, not the link count. <src id> pins the source further, a record's
+# identity or the one a plan saw; without it the live node's is taken.
+#
+# AR_ID is set to the identity of the staged file, which the rename makes
+# the destination's: a caller flagging the installed file afterwards names
+# that inode, so a name swapped in after the rename is refused rather than
+# flagged.
+AR_ID=""
+atomic_replace() { # <src> <dst> <owner:group> <mode> <src owner> [<src id>]
+  local src="$1" dst="$2" owner="$3" mode="$4" src_owner="$5" src_id="${6:-}"
   local stage_dir="$USER_POOL/.staging"
   install -d -m 700 -o "$lock_user" -g "$lock_user" "$stage_dir" || return 1
-  local src_id tmp
-  src_id="$(node_id "$src")" || return 1
+  local tmp
+  AR_ID=""
+  if [ -z "$src_id" ]; then
+    src_id="$(node_id "$src")" || return 1
+  fi
   verify_helper || return 1
   # The helper insists on creating the dest itself (O_EXCL), so hand it a
   # fresh name: mktemp reserves one, the unlink frees it, and nothing else
   # can take it in between -- the staging dir is root-provisioned mode 700.
   tmp="$(mktemp "${stage_dir}/replace.XXXXXX")" || return 1
   rm -f -- "$tmp" || return 1
-  "$LOCKED_HELPER" copy --src "$src" --src-id "${src_id/./:}" --dest "$tmp" \
+  "$LOCKED_HELPER" copy --src "$src" --src-id "${src_id/./:}" \
+    --owner "$src_owner" --dest "$tmp" \
     || { rm -f -- "$tmp" 2>/dev/null; return 1; }
   chown "$owner" "$tmp" || { rm -f -- "$tmp"; return 1; }
   chmod "$mode" "$tmp" || { rm -f -- "$tmp"; return 1; }
+  AR_ID="$(node_id "$tmp")" || { rm -f -- "$tmp"; return 1; }
   local stage_dev dst_dev dst_parent
   dst_parent="$(dirname "$dst")"
   stage_dev="$(stat -f '%d' "$tmp")"
@@ -1785,18 +1855,46 @@ atomic_replace() {
   [ "$rc" -eq 0 ] || { rm -f -- "$tmp" 2>/dev/null || true; return 1; }
 }
 
-# Directory snapshots: whole-tree copy under .snapdir, staged then swapped.
-snapshot_tree() {
-  local src="$1" snapdir="$2"
-  local stage_dir="$USER_POOL/.staging"
-  install -d -m 700 -o "$lock_user" -g "$lock_user" "$stage_dir"
-  local tmp
+# stage_copy <src> <src owner> <src id>: a copy of one file in lock-account
+# staging, read through the same owner gate as atomic_replace; prints its
+# path. What root shows the invoker (a diff witness) or compares for them
+# is read from such a copy, never from a path in the invoker's own space.
+stage_copy() {
+  local stage_dir="$USER_POOL/.staging" tmp
+  install -d -m 700 -o "$lock_user" -g "$lock_user" "$stage_dir" || return 1
+  verify_helper || return 1
+  tmp="$(mktemp "${stage_dir}/copy.XXXXXX")" || return 1
+  rm -f -- "$tmp" || return 1
+  "$LOCKED_HELPER" copy --src "$1" --src-id "${3/./:}" --owner "$2" \
+    --dest "$tmp" || { rm -f -- "$tmp" 2>/dev/null; return 1; }
+  printf '%s\n' "$tmp"
+}
+
+# stage_tree <src> <src owner> <src id>: the folder counterpart, a copy in
+# a fresh staging dir (the path printed is the copy; its parent is the
+# caller's to remove). The helper's copy-tree verb walks the folder by
+# descriptor and gates every node as a seal does: a directory, a file or a
+# symlink, owned by <src owner>. Nothing it refuses is ever read, whatever
+# was linked or renamed into the folder; cp -Rp read whatever was there.
+# Data, extended attributes and ACLs travel; flags never do, and permission
+# bits travel without set-user-id, set-group-id and sticky.
+stage_tree() {
+  local stage_dir="$USER_POOL/.staging" tmp
+  install -d -m 700 -o "$lock_user" -g "$lock_user" "$stage_dir" || return 1
+  verify_helper || return 1
   tmp="$(mktemp -d "${stage_dir}/tree.XXXXXX")" || return 1
-  cp -Rp -- "$src" "$tmp/tree" || { rm -rf -- "$tmp"; return 1; }
-  # Same cp -p flag-preservation hazard as in atomic_replace: strip flags
-  # from the whole copied tree before touching it.
-  chflags -R -- 0 "$tmp" || { rm -rf -- "$tmp"; return 1; }
-  chown -R "$lock_user:$lock_user" "$tmp" || { rm -rf -- "$tmp"; return 1; }
+  "$LOCKED_HELPER" copy-tree --src "$1" --src-id "${3/./:}" --owner "$2" \
+    --dest "$tmp/tree" --chown "$lock_user:$lock_user" \
+    || { rm -rf -- "$tmp"; return 1; }
+  printf '%s\n' "$tmp/tree"
+}
+
+# Directory snapshots: whole-tree copy under .snapdir, staged then swapped.
+snapshot_tree() { # <src> <snapdir> <src owner> <src id>
+  local snapdir="$2" copy tmp
+  local stage_dir="$USER_POOL/.staging"
+  copy="$(stage_tree "$1" "$3" "$4")" || return 1
+  tmp="$(dirname "$copy")"
   if [ -d "$snapdir" ]; then
     local old
     old="$(mktemp -d "${stage_dir}/old.XXXXXX")" || return 1
@@ -2872,6 +2970,121 @@ content_targets() { # <path>
   fi
 }
 
+# plan_tree_refusals <dir>: everything inside a folder about to be sealed
+# that the helper's gate would refuse, raised before the question with each
+# node named on a row of its own (at most three of each kind): a node owned
+# by anyone but you, with its owner; a group other than the folder's (the
+# unlock restores one group to the whole tree); a node that is not a file,
+# directory or symlink; a set-user-id or set-group-id file. Uses T_GROUP,
+# so content_targets runs first.
+plan_tree_refusals() {
+  local p="$1" sp bad=0
+  local -a own=() grp=() odd=() setid=()
+  # NUL-separated, so a name holding a newline stays one path.
+  while IFS= read -r -d '' sp; do
+    own+=("$sp")
+    [ "${#own[@]}" -lt 3 ] || break
+  done < <(find "$p" ! -user "$inv" -print0 2>/dev/null)
+  while IFS= read -r -d '' sp; do
+    grp+=("$sp")
+    [ "${#grp[@]}" -lt 3 ] || break
+  done < <(find "$p" ! -group "$T_GROUP" ! -group "$lock_user" -print0 2>/dev/null)
+  while IFS= read -r -d '' sp; do
+    odd+=("$sp")
+    [ "${#odd[@]}" -lt 3 ] || break
+  done < <(find "$p" ! -type d ! -type f ! -type l -print0 2>/dev/null)
+  while IFS= read -r -d '' sp; do
+    setid+=("$sp")
+    [ "${#setid[@]}" -lt 3 ] || break
+  done < <(find "$p" -type f -perm +6000 -print0 2>/dev/null)
+  if [ "${#own[@]}" -gt 0 ]; then
+    # Owned by someone else: often a hard link to another account's file,
+    # which keeps that account as its owner wherever it is linked.
+    err_val "holds nodes you do not own; a seal acts only on your own" "$p"
+    for sp in "${own[@]}"; do
+      say_err "    owned by $(stat -f '%Su' "$sp")" "$sp"
+    done
+    bad=1
+  fi
+  if [ "${#grp[@]}" -gt 0 ]; then
+    err_val "mixed groups in the tree; the content tier needs a uniform tree" "$p"
+    path_lines "    " "${grp[@]}" >&2
+    bad=1
+  fi
+  if [ "${#odd[@]}" -gt 0 ]; then
+    err_val "holds nodes that are not files, directories or symlinks" "$p"
+    for sp in "${odd[@]}"; do
+      say_err "    $(stat -f '%HT' "$sp" | tr '[:upper:]' '[:lower:]')" "$sp"
+    done
+    bad=1
+  fi
+  if [ "${#setid[@]}" -gt 0 ]; then
+    err_val "holds set-user-id or set-group-id files; sealed, they would run as the lock account" "$p"
+    path_lines "    " "${setid[@]}" >&2
+    bad=1
+  fi
+  [ "$bad" -eq 0 ]
+}
+
+# plan_notes <path> <first seal: 0|1>: what the person sealing this path
+# probably did not intend, or should know, said before the question. A
+# note, not a refusal: none of these lets root do more than the invoker
+# could. On stderr with the plan; each list of paths stacked, one a line.
+#
+#   - A file with other names (hard links) outside what is being sealed.
+#     The flag and the owner are the file's, not the name's, so every name
+#     is frozen and handed to the lock account with it, wherever it sits.
+#     Names that all sit inside a sealed folder say nothing new, so only a
+#     file with fewer names in the folder than links is listed.
+#   - A symlink inside a folder, on its first seal: the link is sealed as a
+#     link, and what it points at is not sealed at all. Said once, when the
+#     folder is adopted, rather than on every relock.
+plan_notes() {
+  local p="$1" first="$2" sp n i j c
+  local -a hp=() hi=() hn=() outside=() links=()
+  [ -L "$p" ] && return 0
+  if [ ! -d "$p" ]; then
+    n="$(stat -f '%l' "$p")" || return 0
+    if [ "$n" -gt 1 ]; then
+      echo "${E_YEL}note:${E_OFF} this file has $n names (hard links); the seal is on the file," >&2
+      echo "      so its other names are frozen and handed to the lock account with it" >&2
+    fi
+    return 0
+  fi
+  while IFS= read -r -d '' sp; do
+    hp+=("$sp")
+    hi+=("$(stat -f '%i' "$sp")")
+    hn+=("$(stat -f '%l' "$sp")")
+  done < <(find "$p" -type f -links +1 -print0 2>/dev/null)
+  i=0
+  while [ "$i" -lt "${#hp[@]}" ]; do
+    c=0 j=0
+    while [ "$j" -lt "${#hp[@]}" ]; do
+      [ "${hi[$j]}" = "${hi[$i]}" ] && c=$((c + 1))
+      j=$((j + 1))
+    done
+    [ "$c" -lt "${hn[$i]}" ] && outside+=("${hp[$i]}")
+    i=$((i + 1))
+  done
+  if [ "${#outside[@]}" -gt 0 ]; then
+    echo "${E_YEL}note:${E_OFF} $(plural "${#outside[@]}" "a file in it has" "${#outside[@]} files in it have") other names (hard links) outside it;" >&2
+    echo "      the seal is on the file, so those names are frozen and handed to the" >&2
+    echo "      lock account too:" >&2
+    path_lines "      " "${outside[@]:0:5}" >&2
+    [ "${#outside[@]}" -le 5 ] || echo "      and $(( ${#outside[@]} - 5 )) more" >&2
+  fi
+  [ "$first" -eq 1 ] || return 0
+  while IFS= read -r -d '' sp; do
+    links+=("$sp")
+  done < <(find "$p" -mindepth 1 -type l -print0 2>/dev/null)
+  if [ "${#links[@]}" -gt 0 ]; then
+    echo "${E_YEL}note:${E_OFF} $(plural "${#links[@]}" "a symlink in it is" "${#links[@]} symlinks in it are") sealed as $(plural "${#links[@]}" "a link" links); what $(plural "${#links[@]}" "it points" "they point") at" >&2
+    echo "      is not sealed:" >&2
+    path_lines "      " "${links[@]:0:5}" >&2
+    [ "${#links[@]}" -le 5 ] || echo "      and $(( ${#links[@]} - 5 )) more" >&2
+  fi
+}
+
 # plan_node <path> <tier> [<anchor flagword>]: what sealing this node would
 # do, decided without touching it. Prints the action word; on a node that
 # cannot be sealed at all it prints the refusal on stderr and returns 1, so
@@ -2920,31 +3133,36 @@ plan_node() {
     content)
       # A symlink is never a tree: it has no children of its own, and -d
       # would answer for whatever it points at.
-      local is_dir=0
-      if [ ! -L "$p" ] && [ -d "$p" ]; then
+      local is_dir=0 is_link=0
+      [ -L "$p" ] && is_link=1
+      if [ "$is_link" -eq 0 ] && [ -d "$p" ]; then
         is_dir=1
       fi
       content_targets "$p" || return 1
-      if [ "$live" -eq 0 ] && [ "$T_OWNER" != "$inv" ]; then
-        say_err "skipped, not owned by you (owner $T_OWNER)" "$p"
+      # A seal hands the node to the lock account, so it has to be yours to
+      # hand over -- on a first seal and on every relock alike: a relock
+      # finds whatever sits at the path after an unlock window, and a hard
+      # link planted there to a root-owned file is still root's. The helper
+      # asks again at apply time, on the descriptor it changes.
+      local owner_now
+      owner_now="$(stat -f '%Su' "$p")" || return 1
+      if [ "$owner_now" != "$inv" ]; then
+        say_err "skipped, not owned by you (owner $owner_now)" "$p"
         log_action lock "$p" skip-not-owned
         return 1
       fi
+      if [ "$is_dir" -eq 0 ] && [ "$is_link" -eq 0 ] &&
+         [ $(( 0$(stat -f '%OLp' "$p") & 06000 )) -ne 0 ]; then
+        err_val "set-user-id or set-group-id; sealed, it would run as the lock account, which owns every sealed node" "$p"
+        log_action lock "$p" refuse-setid
+        return 1
+      fi
       # Recursive adoption sanity: single owner + single group across the
-      # tree, so unlock's chown -R restore is lossless.
+      # tree, so unlock's restore is lossless. The owner is the gate the
+      # helper enforces per node; this pass raises it before the question,
+      # naming whose each stray is.
       if [ "$is_dir" -eq 1 ]; then
-        local -a stray=()
-        local sp
-        # NUL-separated, so a name holding a newline stays one path.
-        while IFS= read -r -d '' sp; do
-          stray+=("$sp")
-          [ "${#stray[@]}" -lt 3 ] || break
-        done < <(find "$p" \( ! -user "$T_OWNER" ! -user "$lock_user" \) -o \( ! -group "$T_GROUP" ! -group "$lock_user" \) -print0 2>/dev/null)
-        if [ "${#stray[@]}" -gt 0 ]; then
-          err_val "mixed ownership in the tree; the content tier needs a uniform tree" "$p"
-          path_lines "    " "${stray[@]}" >&2
-          return 1
-        fi
+        plan_tree_refusals "$p" || return 1
       fi
       ;;
     placement)
@@ -2990,6 +3208,15 @@ plan_node() {
       fi
       ;;
     anchor)
+      # An anchor never changes owner, and the OS checks it against yours:
+      # a node that is not yours is not one to anchor, however it got here.
+      local anchor_owner
+      anchor_owner="$(stat -f '%Su' "$p")" || return 1
+      if [ "$anchor_owner" != "$inv" ]; then
+        say_err "skipped, not owned by you (owner $anchor_owner)" "$p"
+        log_action lock "$p" skip-not-owned
+        return 1
+      fi
       if [ "$state" = "locked" ]; then
         # Tier-internal escalation (sappnd <-> schg): a normal relock that
         # clears the previous system flag before applying the new one.
@@ -3023,8 +3250,14 @@ plan_node() {
 # placement parent has no content of its own, and a symlink's content IS
 # its target, which is one line rather than a diff. The block owns its
 # trailing blank line, which separates it from the plan below it.
-lock_witness() { # <path> <tier>
-  local f="$1" t="$2" shown=0 live=0 ef
+#
+# Root draws this diff, so it reads the current side from a staged copy
+# made through the helper's owner gate (stage_copy, stage_tree), never from
+# the path: the leaf sits in your own space until it is sealed, and a hard
+# link planted there to a root-only file would otherwise be shown to you.
+# The copy is of <id>, the node do_lock_one pinned.
+lock_witness() { # <path> <tier> <id>
+  local f="$1" t="$2" id="$3" shown=0 live=0 ef cur rc=0
   esc_into ef "$f" "$C_RV"
   [ "$t" = "placement" ] && return 0
   snap_paths "$f"
@@ -3050,15 +3283,19 @@ lock_witness() { # <path> <tier>
         # A file added while unlocked shows its whole content against
         # /dev/null, not only its name, so what the seal is about to
         # freeze is on screen.
+        cur="$(stage_tree "$f" "$inv" "$id")" || return 1
         show_diff 'diff snapshot → current' path "$f" \
-          "$SNAPDIR" "$f" "snapshot: $f" "current: $f" || return 1
+          "$SNAPDIR" "$cur" "snapshot: $f" "current: $f" || rc=1
+        rm -rf -- "$(dirname "$cur")"
+        [ "$rc" -eq 0 ] || return 1
       else
         echo "adopting into pool (no prior snapshot): $ef"
       fi
       shown=1
     fi
   elif [ "$live" -eq 1 ] && [ -f "$SNAP" ]; then
-    if cmp -s "$SNAP" "$f"; then
+    cur="$(stage_copy "$f" "$inv" "$id")" || return 1
+    if cmp -s "$SNAP" "$cur"; then
       echo "no changes since unlock: $ef"
     else
       # Named by role and subject path: the snapshot sits in the pool under
@@ -3066,8 +3303,10 @@ lock_witness() { # <path> <tier>
       # the same two labels, and each file in it is named by its path
       # below them.
       show_diff 'diff snapshot → current' path "$f" \
-        "$SNAP" "$f" "snapshot: $f" "current: $f" || return 1
+        "$SNAP" "$cur" "snapshot: $f" "current: $f" || rc=1
     fi
+    rm -f -- "$cur"
+    [ "$rc" -eq 0 ] || return 1
     shown=1
   else
     echo "adopting into pool (no prior snapshot): $ef"
@@ -3081,11 +3320,13 @@ lock_witness() { # <path> <tier>
 
 # ---- seal / release primitives ---------------------------------------------
 
-# seal_content <path>: apply a decided content-tier seal. The node is a
-# file, a directory (sealed recursively) or a symlink (sealed as the link
-# node itself). Whether it may be sealed at all was settled by plan_node.
+# seal_content <path> <id>: apply a decided content-tier seal. The node is
+# a file, a directory (sealed recursively) or a symlink (sealed as the link
+# node itself). Whether it may be sealed at all was settled by plan_node,
+# against the node <id> names; the helper holds the seal to that node and
+# asks the owner again of every node it changes (node_op).
 seal_content() {
-  local f="$1"
+  local f="$1" id="${2:--}"
   snap_paths "$f"
   local is_dir=0 is_link=0
   [ -L "$f" ] && is_link=1
@@ -3113,27 +3354,26 @@ seal_content() {
   # A retired record's snapshot is replaced for the same reason.
   if [ "$is_link" -eq 0 ]; then
     if [ "$is_dir" -eq 0 ] && { [ "$live" -eq 0 ] || [ ! -f "$SNAP" ]; }; then
-      run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || return 1
+      run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 "$inv" "$id" || return 1
     elif [ "$is_dir" -eq 1 ] && { [ "$live" -eq 0 ] || [ ! -d "$SNAPDIR" ]; }; then
-      run snapshot_tree "$f" "$SNAPDIR" || return 1
+      run snapshot_tree "$f" "$SNAPDIR" "$inv" "$id" || return 1
     fi
   fi
 
-  # Seal: ownership, mode, then flag LAST (flags block chmod/chown).
+  # Seal: ownership, mode, then flag LAST (flags block chmod/chown), each
+  # node on its own descriptor. A folder is handed over top-down, each
+  # directory frozen before its entries are read, so nothing planted in it
+  # meanwhile escapes the owner gate (see the helper's seal_walk). No mode
+  # on a link: a link's own mode gates nothing on macOS, and what may
+  # replace it is governed by its parent directory, which the chain seals.
+  local -a how=(--path "$f" --id "${id/./:}" --owner "$inv"
+    --chown "${lock_user}:${lock_user}" --flag uchg)
   if [ "$is_dir" -eq 1 ]; then
-    run chown -R "${lock_user}:${lock_user}" "$f" || return 1
-    run chmod "$target_mode" "$f" || return 1
-    fset uchg "$f" -R || return 1
+    node_op lock "$f" seal "${how[@]}" --mode "$target_mode" --recursive || return 1
+  elif [ "$is_link" -eq 1 ]; then
+    node_op lock "$f" seal "${how[@]}" || return 1
   else
-    run chown -h "${lock_user}:${lock_user}" "$f" || return 1
-    # No chmod on a link: chmod(2) follows, so it would restyle the
-    # TARGET -- somebody else's node -- and a link's own mode gates
-    # nothing on macOS. What may replace the link is governed by its
-    # parent directory, which the chain seals.
-    if [ "$is_link" -eq 0 ]; then
-      run chmod "$target_mode" "$f" || return 1
-    fi
-    fset uchg "$f" || return 1
+    node_op lock "$f" seal "${how[@]}" --mode "$target_mode" || return 1
   fi
 
   if [ "$OPT_DRY" -eq 0 ]; then
@@ -3236,9 +3476,11 @@ seal_placement() {
 # snapshot (ssh config class: ownership never changes but the content is
 # what's being sealed); dirs (~, ~/.ssh) have no content snapshot. <role> is
 # leaf for a node you named, chain for one a leaf below needs; the caller
-# decides, because only it knows which node was named.
+# decides, because only it knows which node was named. <id> pins the node
+# the plan saw ("-" for an ancestor, which its owner alone gates): an
+# anchor stays yours, so the helper takes it only while it is.
 seal_anchor() {
-  local f="$1" flagword="$2" role="$3"
+  local f="$1" flagword="$2" role="$3" id="${4:--}"
   snap_paths "$f"
   local is_file=0
   [ -f "$f" ] && is_file=1
@@ -3269,14 +3511,16 @@ seal_anchor() {
     # Tier-internal escalation (sappnd <-> schg) is a normal relock: clear
     # the previous system flag before applying the new one. The plan named
     # the change as "reflag anchor" and the gate approved it.
-    fclear "$prev_flag" "$f" || return 1
+    node_op lock "$f" unseal --path "$f" --id "${id/./:}" --owner "$inv" \
+      --flag "$prev_flag" || return 1
   fi
 
   if [ "$is_file" -eq 1 ] && { [ "$live" -eq 0 ] || [ ! -f "$SNAP" ]; }; then
-    run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || return 1
+    run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 "$inv" "$id" || return 1
   fi
 
-  fset "$flagword" "$f" || return 1
+  node_op lock "$f" seal --path "$f" --id "${id/./:}" --owner "$inv" \
+    --flag "$flagword" || return 1
   if [ "$OPT_DRY" -eq 0 ]; then
     write_meta "$META" \
       "owner=$owner_now" \
@@ -3333,25 +3577,41 @@ release_node() {
   local is_link=0
   [ -L "$f" ] && is_link=1
 
-  # Clear flag FIRST (flags block chmod/chown), then restore identity.
+  # The snapshot first, read while the node is still sealed and so still
+  # the recorded one; then the helper clears the flag and puts the owner
+  # and mode back, node by node on each node's descriptor, taking only the
+  # recorded node and only what the lock account owns (node_op). A node
+  # already back with its owner is let through too, so an unlock cut short
+  # can be run again -- but only when that owner is you: root hands back
+  # nothing that is not already yours or sealed for you.
+  local rid owners="$lock_user"
+  rid="$(helper_id_for "$f")"
+  [ "$owner" = "$inv" ] && owners="$lock_user,$inv"
   case "$tier" in
     content)
+      local -a how=(--path "$f" --id "$rid" --owner "$owners"
+        --chown "${owner}:${group}" --flag "$flag")
       if [ "$recursive" = "1" ]; then
-        fclear "$flag" "$f" -R || return 1
-        run snapshot_tree "$f" "$SNAPDIR" || return 1
-        run chown -R "${owner}:${group}" "$f" || return 1
+        run snapshot_tree "$f" "$SNAPDIR" "$lock_user" "$rid" || return 1
+        node_op unlock "$f" unseal "${how[@]}" --mode "$mode" --recursive || return 1
+      elif [ "$is_link" -eq 1 ]; then
+        node_op unlock "$f" unseal "${how[@]}" || return 1
       else
-        fclear "$flag" "$f" || return 1
-        if [ "$is_link" -eq 0 ]; then
-          run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || return 1
-        fi
-        run chown -h "${owner}:${group}" "$f" || return 1
-      fi
-      if [ "$is_link" -eq 0 ]; then
-        run chmod "$mode" "$f" || return 1
+        run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 "$lock_user" "$rid" || return 1
+        node_op unlock "$f" unseal "${how[@]}" --mode "$mode" || return 1
       fi
       ;;
-    placement|anchor)
+    anchor)
+      # Anchor files keep the snapshot flow so the relock diff-witness has
+      # a baseline; ownership is untouched either way, and an anchor is
+      # always yours.
+      if [ -f "$f" ]; then
+        run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 "$inv" "$rid" || return 1
+      fi
+      node_op unlock "$f" unseal --path "$f" --id "$rid" --owner "$inv" \
+        --flag "$flag" || return 1
+      ;;
+    placement)
       fclear "$flag" "$f" || return 1
       # Placement keeps lock-account ownership and its ACL entry through
       # the unlock, deliberately: that IS the seal's structure, not drift.
@@ -3362,11 +3622,6 @@ release_node() {
       # root's own operations). The flag is the whole of what an unlock
       # lifts; the recorded owner/group/mode are the pre-adoption identity,
       # kept for a release.
-      # Anchor files keep the snapshot flow so the relock diff-witness has
-      # a baseline (ownership untouched either way).
-      if [ "$tier" = "anchor" ] && [ -f "$f" ]; then
-        run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || return 1
-      fi
       ;;
     *)
       err_val "the record has unknown tier '$tier'" "$f"
@@ -4199,6 +4454,11 @@ do_lock_one() {
   local -a plan_paths plan_tiers plan_flags plan_actions
   plan_paths=(); plan_tiers=(); plan_flags=(); plan_actions=()
   local act
+  # The leaf is pinned by identity before it is planned: the witness reads
+  # this node and the seal acts on this node, by descriptor, so a node
+  # swapped in after the plan is refused rather than sealed.
+  local leaf_id
+  leaf_id="$(node_id "$f")" || return 1
   act="$(plan_node "$f" "$leaf_tier" "$leaf_flag")" || return 1
   # An anchor that is already sealed as somebody's chain node becomes yours
   # by name: nothing on disk changes, but the record's role does, and from
@@ -4264,7 +4524,7 @@ EOF
   # was released), then the plan, then the one question.
   case "${plan_actions[0]}" in
     "already locked"|protect) ;;
-    *) lock_witness "$f" "$leaf_tier" || return 1 ;;
+    *) lock_witness "$f" "$leaf_tier" "$leaf_id" || return 1 ;;
   esac
 
   # Root-most first: a tree reads top-down, and the node that governs
@@ -4295,6 +4555,17 @@ EOF
   done
   release_rows "  " "$w" "$qw"
   echo >&2
+  # Caveats, not refusals: said under the plan they are about, before the
+  # question. Only for a leaf this plan actually seals.
+  case "${plan_actions[0]}" in
+    "already locked"|protect) ;;
+    *)
+      local first=1
+      snap_paths "$f"
+      record_live "$META" && first=0
+      plan_notes "$f" "$first"
+      ;;
+  esac
 
   if [ "$OPT_DRY" -eq 1 ]; then
     echo "dry run: nothing changed" >&2
@@ -4341,7 +4612,7 @@ EOF
         ;;
       *)
         case "${plan_tiers[$i]}" in
-          content)   seal_content "${plan_paths[$i]}" || return $? ;;
+          content)   seal_content "${plan_paths[$i]}" "$leaf_id" || return $? ;;
           placement) seal_placement "${plan_paths[$i]}" || return $? ;;
           anchor)
             # The named node is a leaf. An ancestor keeps a leaf role it
@@ -4356,7 +4627,11 @@ EOF
                 role=leaf
               fi
             fi
-            seal_anchor "${plan_paths[$i]}" "${plan_flags[$i]}" "$role" || return $?
+            # Only the leaf was pinned at plan time; an ancestor anchor is
+            # gated by its owner alone.
+            local aid=-
+            [ "$i" -eq 0 ] && aid="$leaf_id"
+            seal_anchor "${plan_paths[$i]}" "${plan_flags[$i]}" "$role" "$aid" || return $?
             ;;
         esac
         ;;
@@ -4532,22 +4807,27 @@ unprotect_leaf() {
   mode="$(meta_field "$META" mode)"
   state="$(meta_field "$META" state)"
   if [ "$state" = "locked" ]; then
+    # Through the helper, as release_node does it: the recorded node only,
+    # each node gated by its owner on its own descriptor.
+    local rid owners="$lock_user"
+    rid="$(helper_id_for "$f")"
+    [ "$owner" = "$inv" ] && owners="$lock_user,$inv"
     case "$tier" in
       content)
+        local -a how=(--path "$f" --id "$rid" --owner "$owners"
+          --chown "${owner}:${group}" --flag "$flag")
         if [ "$recursive" = "1" ]; then
-          fclear "$flag" "$f" -R || return 1
-          run chown -R "${owner}:${group}" "$f" || return 1
+          node_op unprotect "$f" unseal "${how[@]}" --mode "$mode" --recursive || return 1
+        elif [ -L "$f" ]; then
+          # No mode on a link: a link's own mode gates nothing.
+          node_op unprotect "$f" unseal "${how[@]}" || return 1
         else
-          fclear "$flag" "$f" || return 1
-          run chown -h "${owner}:${group}" "$f" || return 1
-        fi
-        # No chmod on a link: chmod(2) follows it to the target.
-        if [ ! -L "$f" ]; then
-          run chmod "$mode" "$f" || return 1
+          node_op unprotect "$f" unseal "${how[@]}" --mode "$mode" || return 1
         fi
         ;;
       anchor)
-        fclear "$flag" "$f" || return 1
+        node_op unprotect "$f" unseal --path "$f" --id "$rid" --owner "$inv" \
+          --flag "$flag" || return 1
         ;;
       *)
         err_val "the record has tier '$tier'; only a leaf can be unprotected" "$f"
@@ -4808,6 +5088,22 @@ do_edit_one() {
     fi
   fi
 
+  # Whose the sealed file is, and which node it is: every read of it below
+  # and every change to its flag goes through the helper gated on both. A
+  # file in a sealed folder has no record of its own; sealed_folder_for
+  # just checked it is the lock account's and frozen, so its live identity
+  # is the one to pin.
+  local sealed_owner="$lock_user" fid="-"
+  [ "$tier" = "anchor" ] && sealed_owner="$inv"
+  if [ "$is_new" -eq 0 ]; then
+    if [ -n "$folder" ]; then
+      fid="$(node_id "$f")" || return 1
+    else
+      fid="$(helper_id_for "$f")"
+    fi
+    fid="${fid/./:}"
+  fi
+
   # Two ways to produce the candidate. Both end with it frozen in $stage,
   # and everything from there down -- the no-change check, the diff, the
   # install -- reads ONLY $stage; neither the editor's copy nor the --from
@@ -4850,7 +5146,14 @@ do_edit_one() {
     if [ "$is_new" -eq 1 ]; then
       : >"$copy" || { rm -rf -- "$editdir"; return 1; }
     else
-      cp -- "$f" "$copy" || { rm -rf -- "$editdir"; return 1; }
+      # Root reads the sealed file into a copy you are given, so it reads
+      # it through the owner gate, pinned to the sealed node, into staging
+      # first; the working copy is then a plain cp of that, as before.
+      local held
+      held="$(stage_copy "$f" "$sealed_owner" "$fid")" \
+        || { rm -rf -- "$editdir"; return 1; }
+      cp -- "$held" "$copy" || { rm -f -- "$held"; rm -rf -- "$editdir"; return 1; }
+      rm -f -- "$held"
     fi
     chown -R "$inv" "$editdir" || { rm -rf -- "$editdir"; return 1; }
     chmod 700 "$editdir" || { rm -rf -- "$editdir"; return 1; }
@@ -4902,10 +5205,8 @@ do_edit_one() {
   # candidate that has none of its own, never a merge, and nothing the
   # candidate might have carried is trusted. A new file has none to keep.
   if [ "$is_new" -eq 0 ]; then
-    local fid
-    fid="$(node_id "$f")" || { rm -f -- "$stage"; return 1; }
-    "$LOCKED_HELPER" xattrs-from --src "$f" --src-id "${fid/./:}" \
-      --dest "$stage" || {
+    "$LOCKED_HELPER" xattrs-from --src "$f" --src-id "$fid" \
+      --owner "$sealed_owner" --dest "$stage" || {
       rm -f -- "$stage"
       say_err "edit: cannot carry the file's extended attributes onto the candidate" "$f"
       log_action edit "$f" refuse-xattrs
@@ -4966,7 +5267,10 @@ do_edit_one() {
     if [ "$is_new" -eq 0 ]; then
       fclear "$flag" "$f" || { rm -f -- "$stage"; return 1; }
     fi
-    run atomic_replace "$stage" "$f" "${lock_user}:${lock_user}" "$mode" || {
+    # Inside a sealed folder no process of yours can reach the name: the
+    # folder is the lock account's and frozen, and atomic_replace lifts its
+    # flag only while it is closed to you. So the flags here go by path.
+    run atomic_replace "$stage" "$f" "${lock_user}:${lock_user}" "$mode" root || {
       rm -f -- "$stage"
       # The old file is still there: freeze it again before failing.
       [ "$is_new" -eq 1 ] || fset "$flag" "$f" || true
@@ -4990,13 +5294,19 @@ do_edit_one() {
   fi
 
   # Snapshot := pre-edit content, so revert undoes exactly this edit.
-  run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 || { rm -f -- "$stage"; return 1; }
+  run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 "$sealed_owner" "$fid" || { rm -f -- "$stage"; return 1; }
 
+  # The file's own parent is yours and unsealed, so once its flag is off
+  # the name can be swapped: the flag comes off the sealed node by its
+  # identity, and goes back on the installed inode by ITS identity (AR_ID),
+  # so a name planted in between is refused rather than flagged.
   local install_owner="${lock_user}:${lock_user}"
   [ "$tier" = "anchor" ] && install_owner="${owner}:${group}"
-  fclear "$flag" "$f" || { rm -f -- "$stage"; return 1; }
-  run atomic_replace "$stage" "$f" "$install_owner" "$mode" || { rm -f -- "$stage"; return 1; }
-  fset "$flag" "$f" || { rm -f -- "$stage"; return 1; }
+  node_op edit "$f" unseal --path "$f" --id "$fid" --owner "$sealed_owner" \
+    --flag "$flag" || { rm -f -- "$stage"; return 1; }
+  run atomic_replace "$stage" "$f" "$install_owner" "$mode" root || { rm -f -- "$stage"; return 1; }
+  node_op edit "$f" seal --path "$f" --id "${AR_ID/./:}" \
+    --owner "${install_owner%%:*}" --flag "$flag" || { rm -f -- "$stage"; return 1; }
   what="$(check_install "$f" "$stage" "${install_owner%%:*}" "$mode" "$flag" "$dflags")" || true
   rm -f -- "$stage"
   # The record follows the installed node either way, so verify reports
@@ -5041,14 +5351,11 @@ do_revert_one() {
     log_action revert "$f" skip-no-snap
     return 0
   fi
-  # Guard against double-revert: if file already matches snapshot, the
-  # current attic IS the legitimate discarded edit; preserve it.
-  if cmp -s "$f" "$SNAP"; then
-    say_err "skipped, file already matches snapshot (preserving existing .attic)" "$f"
-    log_action revert "$f" skip-already-reverted
-    return 0
-  fi
-
+  # Read once, through the helper's owner gate, and pinned while the file
+  # is sealed: the comparison and the attic both come from that copy. The
+  # file's own parent is yours and unsealed, so its name is only as good as
+  # its flag; a hard link planted there to a root-only file is still root's
+  # and is refused, never compared or kept.
   local was_locked=0 tier="" flag="" mode=600 owner="" group=""
   if [ -f "$META" ]; then
     tier="$(meta_field "$META" tier)"
@@ -5058,6 +5365,20 @@ do_revert_one() {
     group="$(meta_field "$META" group)"
     [ "$(meta_field "$META" state)" = "locked" ] && was_locked=1
   fi
+  local cur_owner="$inv" cid="-" cur
+  if [ "$was_locked" -eq 1 ]; then
+    [ "$tier" = "anchor" ] || cur_owner="$lock_user"
+    cid="$(helper_id_for "$f")"
+  fi
+  cur="$(stage_copy "$f" "$cur_owner" "$cid")" || return 1
+  # Guard against double-revert: if file already matches snapshot, the
+  # current attic IS the legitimate discarded edit; preserve it.
+  if cmp -s "$cur" "$SNAP"; then
+    rm -f -- "$cur"
+    say_err "skipped, file already matches snapshot (preserving existing .attic)" "$f"
+    log_action revert "$f" skip-already-reverted
+    return 0
+  fi
 
   # Locked-state ownership depends on tier: content files belong to the
   # lock account, anchor files stay the user's (ssh owner checks).
@@ -5065,12 +5386,16 @@ do_revert_one() {
   [ "$tier" = "anchor" ] && restore_owner="${owner}:${group}"
 
   if [ "$was_locked" -eq 1 ]; then
-    fclear "$flag" "$f" || return 1
+    node_op revert "$f" unseal --path "$f" --id "$cid" --owner "$cur_owner" \
+      --flag "$flag" || { rm -f -- "$cur"; return 1; }
   fi
-  run atomic_replace "$f" "$ATTIC" "${lock_user}:${lock_user}" 600 || return 1
+  run atomic_replace "$cur" "$ATTIC" "${lock_user}:${lock_user}" 600 root || { rm -f -- "$cur"; return 1; }
+  rm -f -- "$cur"
   if [ "$was_locked" -eq 1 ]; then
-    run atomic_replace "$SNAP" "$f" "$restore_owner" "$mode" || return 1
-    fset "$flag" "$f" || return 1
+    run atomic_replace "$SNAP" "$f" "$restore_owner" "$mode" "$lock_user" || return 1
+    # The flag goes back on the inode just installed, by its identity.
+    node_op revert "$f" seal --path "$f" --id "${AR_ID/./:}" \
+      --owner "${restore_owner%%:*}" --flag "$flag" || return 1
     if [ "$OPT_DRY" -eq 0 ]; then
       write_meta "$META" \
         "owner=$owner" \
@@ -5086,7 +5411,7 @@ do_revert_one() {
         "state=locked" || return 1
     fi
   else
-    run atomic_replace "$SNAP" "$f" "${owner:-$inv}:${group:-staff}" "$mode" || return 1
+    run atomic_replace "$SNAP" "$f" "${owner:-$inv}:${group:-staff}" "$mode" "$lock_user" || return 1
   fi
   ok_row "reverted from snapshot" "$f"
   say_out "  discarded content saved to" "$ATTIC"
