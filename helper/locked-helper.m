@@ -2946,10 +2946,16 @@ cmd_tree(int argc, char **argv, int sealing)
 	if (sealing) {
 		rc = seal_walk(&t, &top, o.path, "", 0);
 	} else {
-		rc = check_walk(&t, &top, o.path, "", 0);
+		/* Only a tree has a first pass. A single node (a file, a link,
+		 * or a directory such as a chain anchor whose entries are not
+		 * part of the seal) was gated above, and nothing below it is
+		 * read, gated or frozen. */
+		if (t.recursive)
+			rc = check_walk(&t, &top, o.path, "", 0);
 		/* The first pass may have frozen the top; the second reads
 		 * its flag word as it now is. */
-		if (rc == EX_HELPER_OK && fstat(top.fd, &top.st) != 0) {
+		if (t.recursive && rc == EX_HELPER_OK &&
+		    fstat(top.fd, &top.st) != 0) {
 			errf("cannot stat (%s): %s", strerror(errno), o.path);
 			rc = EX_HELPER_OPFAIL;
 		}

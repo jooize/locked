@@ -185,6 +185,17 @@ expect "--recursive with a flag other than uchg is a usage error" 4 "--recursive
   unseal --path "$T" --id - "${OWN[@]}" --flag uappnd --recursive
 check "and nothing in the tree was frozen" "" "$(flagged_under "$T")"
 
+note "a single-node unseal of a directory"
+# A chain anchor is one directory whose entries are not part of its seal:
+# they may be anyone's, sealed or not. Its unseal touches the top alone.
+/usr/bin/mkfifo "$T/a/zz-fifo"
+seal --path "$T" --id - --owner "$ME" --flag uappnd
+expect "an anchor-style unseal succeeds over entries the gate would refuse" 0 - \
+  unseal --path "$T" --id - --owner "$ME" --flag uappnd
+check "the flag is off the top" "" "$(flags_of "$T")"
+check "and nothing below it was frozen" "" "$(flagged_under "$T")"
+/bin/rm -f -- "$T/a/zz-fifo"
+
 note "set-user-id"
 SU="$T/setuid-tool"
 printf 'x\n' >"$SU"
