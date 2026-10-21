@@ -16,15 +16,28 @@
  * fd-based form (lchflags on a symlink, and the path handed to the trash
  * service). Every other operation is an *at() call against a held fd.
  *
+ * The same discipline carries the seal itself. `seal` and `unseal` change a
+ * node's owner, mode and flag word, and `copy-tree` copies a folder, each
+ * from a descriptor opened O_NOFOLLOW (O_SYMLINK for a link) and checked on
+ * that descriptor: only a directory, a regular file or a symlink, and only
+ * one owned by an account the caller names. Root never does more to an
+ * inode than the invoking user could do themselves, and a second name for
+ * an inode someone else owns -- a hard link the user planted after the
+ * plan was made -- is still owned by that someone else, so it is refused.
+ *
  * Exit codes are interface; the bash caller dispatches on them:
  *   0  ok
  *   2  identity refusal -- nothing was touched
- *   3  operation failed -- the window was restored
+ *   3  operation failed -- the window was restored, or a seal rolled back
  *   4  usage error or not root
  *   5  flag restore FAILED -- a window is LEFT OPEN; `window-open\t<path>`
- *      lines on stdout tell the bash backstop what to re-seal
+ *      lines on stdout tell the bash backstop what to re-seal (for seal and
+ *      unseal: the nodes a roll back could not restore, names escaped)
  *   6  operation completed but the parent's entry list changed in a way the
  *      operation does not account for; `anomaly` lines on stdout
+ *   7  refused: a node is not a directory, file or symlink, or is not owned
+ *      by an account the caller named -- nothing changed, and whatever a
+ *      seal had already changed was rolled back
  *
  * Node identity (`--parent-id`, `--target-id`, `--src-id`, and what the `id`
  * verb prints) is `<volume uuid>:<inode>`, or `<st_dev>:<inode>` on a
@@ -60,7 +73,9 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <limits.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -78,6 +93,7 @@
 #define EX_HELPER_USAGE    4
 #define EX_HELPER_WINOPEN  5
 #define EX_HELPER_ANOMALY  6
+#define EX_HELPER_REFUSED  7
 
 /* The flags that block unlink/rename of a node, or of entries in a directory.
  * Nothing else in the flag word is ever touched: hidden, nodump, opaque and
@@ -120,9 +136,16 @@ usage(void)
 "       locked-helper trash --parent <dir> --parent-id <id|-> --name <entry>\n"
 "                           --target-id <id|-> --uid <uid> --gid <gid>\n"
 "                           --home <dir>\n"
-"       locked-helper copy --src <path> --src-id <id|-> --dest <path>\n"
+"       locked-helper copy --src <path> --src-id <id|-> --owner <users>\n"
+"                          --dest <path>\n"
+"       locked-helper copy-tree --src <dir> --src-id <id|-> --owner <users>\n"
+"                               --dest <dir> --chown <user>:<group>\n"
 "       locked-helper xattrs-from --src <path> --src-id <id|->\n"
-"                                 --dest <path>\n"
+"                                 --owner <users> --dest <path>\n"
+"       locked-helper seal|unseal --path <path> --id <id|-> --owner <users>\n"
+"                                 --flag <uchg|uappnd|schg|sappnd>\n"
+"                                 [--chown <user>:<group>] [--mode <octal>]\n"
+"                                 [--recursive]\n"
 "       locked-helper id <path>\n",
 	    stderr);
 }
@@ -1210,6 +1233,12 @@ typedef struct {
 	const char	*uid;
 	const char	*gid;
 	const char	*home;
+	const char	*path;
+	const char	*id;
+	const char	*owner;
+	const char	*flag;
+	const char	*chown;
+	const char	*mode;
 	int		 recursive;
 } opts_t;
 
@@ -1264,6 +1293,12 @@ parse_opts(int argc, char **argv, opts_t *o)
 		TRY("--uid", uid)
 		TRY("--gid", gid)
 		TRY("--home", home)
+		TRY("--path", path)
+		TRY("--id", id)
+		TRY("--owner", owner)
+		TRY("--flag", flag)
+		TRY("--chown", chown)
+		TRY("--mode", mode)
 #undef TRY
 		errf("unknown option %s", a);
 		return (-1);
@@ -1330,6 +1365,713 @@ parse_ids(const char *s, nodeid_t *out, const char *what)
 		return (-1);
 	}
 	return (0);
+}
+
+/* ---- accounts, modes and flag words ------------------------------------- */
+
+/* A user by name or by number, the way chown(8) takes one. */
+static int
+parse_user(const char *s, uid_t *out)
+{
+	struct passwd *pw;
+	char *end;
+	unsigned long v;
+
+	if (s[0] == '\0')
+		return (-1);
+	if (strspn(s, "0123456789") == strlen(s)) {
+		errno = 0;
+		v = strtoul(s, &end, 10);
+		if (errno != 0 || *end != '\0' || v > UINT32_MAX)
+			return (-1);
+		*out = (uid_t)v;
+		return (0);
+	}
+	pw = getpwnam(s);
+	if (pw == NULL)
+		return (-1);
+	*out = pw->pw_uid;
+	return (0);
+}
+
+static int
+parse_group(const char *s, gid_t *out)
+{
+	struct group *gr;
+	char *end;
+	unsigned long v;
+
+	if (s[0] == '\0')
+		return (-1);
+	if (strspn(s, "0123456789") == strlen(s)) {
+		errno = 0;
+		v = strtoul(s, &end, 10);
+		if (errno != 0 || *end != '\0' || v > UINT32_MAX)
+			return (-1);
+		*out = (gid_t)v;
+		return (0);
+	}
+	gr = getgrnam(s);
+	if (gr == NULL)
+		return (-1);
+	*out = gr->gr_gid;
+	return (0);
+}
+
+#define MAX_OWNERS 4
+
+/* The accounts a node may be owned by for a verb to act on it. */
+typedef struct {
+	uid_t	v[MAX_OWNERS];
+	int	n;
+} owners_t;
+
+/* --owner: one account, or a comma list of up to four. */
+static int
+parse_owners(const char *s, owners_t *o)
+{
+	char buf[256], *p, *tok;
+
+	o->n = 0;
+	if (strlcpy(buf, s, sizeof(buf)) >= sizeof(buf))
+		return (-1);
+	p = buf;
+	while ((tok = strsep(&p, ",")) != NULL) {
+		if (o->n == MAX_OWNERS || parse_user(tok, &o->v[o->n]) != 0)
+			return (-1);
+		o->n++;
+	}
+	return (o->n > 0 ? 0 : -1);
+}
+
+/* --chown: <user>:<group>, names or numbers. */
+static int
+parse_chown(const char *s, uid_t *u, gid_t *g)
+{
+	char buf[256], *colon;
+
+	if (strlcpy(buf, s, sizeof(buf)) >= sizeof(buf))
+		return (-1);
+	colon = strchr(buf, ':');
+	if (colon == NULL)
+		return (-1);
+	*colon = '\0';
+	if (parse_user(buf, u) != 0 || parse_group(colon + 1, g) != 0)
+		return (-1);
+	return (0);
+}
+
+/* --mode: octal permission bits, as stat -f '%OLp' prints them. */
+static int
+parse_mode(const char *s, mode_t *m)
+{
+	char *end;
+	unsigned long v;
+
+	if (s[0] == '\0' || strspn(s, "01234567") != strlen(s))
+		return (-1);
+	errno = 0;
+	v = strtoul(s, &end, 8);
+	if (errno != 0 || *end != '\0' || v > 07777)
+		return (-1);
+	*m = (mode_t)v;
+	return (0);
+}
+
+/* --flag: the one flag a seal sets or an unseal clears. */
+static int
+parse_flag(const char *s, uint32_t *bit)
+{
+	if (strcmp(s, "uchg") == 0)
+		*bit = UF_IMMUTABLE;
+	else if (strcmp(s, "uappnd") == 0)
+		*bit = UF_APPEND;
+	else if (strcmp(s, "schg") == 0)
+		*bit = SF_IMMUTABLE;
+	else if (strcmp(s, "sappnd") == 0)
+		*bit = SF_APPEND;
+	else
+		return (-1);
+	return (0);
+}
+
+/* An account for prose: its name, or its number when it has none. */
+static void
+user_name(uid_t u, char *buf, size_t n)
+{
+	struct passwd *pw = getpwuid(u);
+
+	if (pw != NULL)
+		snprintf(buf, n, "%s", pw->pw_name);
+	else
+		snprintf(buf, n, "uid %lu", (unsigned long)u);
+}
+
+/* ---- reaching a node by descriptor -------------------------------------- */
+
+/*
+ * The directory that holds the last component of an absolute path, reached
+ * one component at a time from "/" with O_NOFOLLOW, so no symlink anywhere on
+ * the way can redirect the walk. The callers pass canonical paths (the bash
+ * side resolves the parent with readlink -f), so a symlink met here means the
+ * path changed after it was resolved, and that is a refusal: -2, where any
+ * other failure is -1. On success *leaf points into `buf`.
+ * O_SEARCH: a walk needs to pass through each directory, never to read one.
+ */
+static int
+open_parent(const char *path, char *buf, size_t bufsz, const char **leaf)
+{
+	char *p, *slash;
+	int fd, nfd, e;
+
+	if (strlcpy(buf, path, bufsz) >= bufsz) {
+		errf("path too long: %s", path);
+		return (-1);
+	}
+	fd = open("/", O_SEARCH | O_CLOEXEC);
+	if (fd < 0) {
+		errf("cannot open /: %s", strerror(errno));
+		return (-1);
+	}
+	p = buf + 1;
+	for (;;) {
+		slash = strchr(p, '/');
+		if (slash != NULL)
+			*slash = '\0';
+		if (p[0] == '\0' || strcmp(p, ".") == 0 || strcmp(p, "..") == 0) {
+			errf("refusing a path that is not canonical: %s", path);
+			close(fd);
+			return (-2);
+		}
+		if (slash == NULL)
+			break;
+		nfd = openat(fd, p, O_SEARCH | O_NOFOLLOW | O_CLOEXEC);
+		e = errno;
+		close(fd);
+		if (nfd < 0) {
+			if (e == ELOOP || e == ENOTDIR) {
+				errf("refusing, a directory on the path is a "
+				    "symlink or not a directory: %s", path);
+				return (-2);
+			}
+			errf("cannot open a directory on the path (%s): %s",
+			    strerror(e), path);
+			return (-1);
+		}
+		fd = nfd;
+		p = slash + 1;
+	}
+	*leaf = p;
+	return (fd);
+}
+
+/* A node held by descriptor, with what fstat said of that descriptor. */
+typedef struct {
+	int		fd;
+	struct stat	st;
+} node_t;
+
+static const char *
+kind_of(mode_t m)
+{
+	if (S_ISFIFO(m))
+		return ("fifo");
+	if (S_ISSOCK(m))
+		return ("socket");
+	if (S_ISCHR(m))
+		return ("character device");
+	if (S_ISBLK(m))
+		return ("block device");
+	return ("node of an unknown type");
+}
+
+/*
+ * Open the entry `name` of the held directory `pfd` as the node it is: a
+ * directory O_DIRECTORY|O_NOFOLLOW, a file or a symlink O_SYMLINK, which
+ * opens a link itself and never what it points at. Anything else -- a fifo,
+ * a socket, a device -- is refused before it is opened. The descriptor is
+ * authoritative from here, so its own fstat must agree with the entry's: a
+ * swap between the two calls is refused, never followed.
+ */
+static int
+node_at(int pfd, const char *name, const char *path, node_t *n)
+{
+	struct stat st0;
+	int flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC;
+
+	n->fd = -1;
+	if (fstatat(pfd, name, &st0, AT_SYMLINK_NOFOLLOW) != 0) {
+		errf("cannot stat (%s): %s", strerror(errno), path);
+		return (EX_HELPER_OPFAIL);
+	}
+	if (!S_ISDIR(st0.st_mode) && !S_ISREG(st0.st_mode) &&
+	    !S_ISLNK(st0.st_mode)) {
+		errf("refusing, a %s is not a file, directory or symlink: %s",
+		    kind_of(st0.st_mode), path);
+		return (EX_HELPER_REFUSED);
+	}
+	flags |= S_ISDIR(st0.st_mode) ? (O_DIRECTORY | O_NOFOLLOW) : O_SYMLINK;
+	n->fd = openat(pfd, name, flags);
+	if (n->fd < 0) {
+		if (errno == ELOOP || errno == ENOTDIR) {
+			errf("refusing, it changed type between stat and "
+			    "open: %s", path);
+			return (EX_HELPER_REFUSED);
+		}
+		errf("cannot open (%s): %s", strerror(errno), path);
+		return (EX_HELPER_OPFAIL);
+	}
+	if (fstat(n->fd, &n->st) != 0) {
+		errf("cannot stat (%s): %s", strerror(errno), path);
+		close(n->fd);
+		n->fd = -1;
+		return (EX_HELPER_OPFAIL);
+	}
+	if ((n->st.st_mode & S_IFMT) != (st0.st_mode & S_IFMT) ||
+	    n->st.st_ino != st0.st_ino || n->st.st_dev != st0.st_dev) {
+		errf("refusing, it changed between stat and open: %s", path);
+		close(n->fd);
+		n->fd = -1;
+		return (EX_HELPER_REFUSED);
+	}
+	return (EX_HELPER_OK);
+}
+
+/*
+ * The owner gate. A node's owner says whose it is: a second name for a file
+ * the invoker owns gives them nothing new, while a hard link to a root-owned
+ * file is still root's, whatever directory it was linked into. So the gate
+ * is the owner, never the link count, and it is asked of the descriptor the
+ * verb then acts on.
+ */
+static int
+gate_owner(const struct stat *st, const char *path, const owners_t *ok)
+{
+	char got[64], one[64], want[300];
+	int i;
+
+	for (i = 0; i < ok->n; i++)
+		if (st->st_uid == ok->v[i])
+			return (EX_HELPER_OK);
+	user_name(st->st_uid, got, sizeof(got));
+	want[0] = '\0';
+	for (i = 0; i < ok->n; i++) {
+		user_name(ok->v[i], one, sizeof(one));
+		if (i > 0)
+			strlcat(want, " or ", sizeof(want));
+		strlcat(want, one, sizeof(want));
+	}
+	errf("refusing, owned by %s and not by %s: %s", got, want, path);
+	return (EX_HELPER_REFUSED);
+}
+
+/*
+ * `setid` is for a seal that gives the node to another account: a
+ * set-user-id or set-group-id file would then run as that account, and the
+ * lock account owns every sealed node. Root's chown keeps those bits, so the
+ * seal refuses the file instead.
+ */
+static int
+gate(const node_t *n, const char *path, const owners_t *ok, int setid)
+{
+	if (gate_owner(&n->st, path, ok) != EX_HELPER_OK)
+		return (EX_HELPER_REFUSED);
+	if (setid && S_ISREG(n->st.st_mode) &&
+	    (n->st.st_mode & (S_ISUID | S_ISGID)) != 0) {
+		errf("refusing, a set-user-id or set-group-id file would run "
+		    "as its new owner once sealed: %s", path);
+		return (EX_HELPER_REFUSED);
+	}
+	return (EX_HELPER_OK);
+}
+
+/* <rel>/<name>, or <name> when rel is the top itself (""). */
+static char *
+rel_join(const char *rel, const char *name)
+{
+	return (rel[0] == '\0' ? xstrdup(name) : join_path(rel, name));
+}
+
+#ifdef LOCKED_HELPER_TEST
+/*
+ * TEST BUILDS ONLY. Compiled in by -DLOCKED_HELPER_TEST, which neither the
+ * nix module nor the README's build line passes; the harness builds this
+ * variant separately and checks that the release build holds none of it.
+ * LOCKED_HELPER_TEST_PAUSE=<verb>:<fifo> makes that verb wait, before it
+ * opens anything, until a byte arrives on the fifo: the moment between
+ * locked's plan and the helper's apply, held open so a test can plant a
+ * node there deterministically. A test build also skips the root gate, so
+ * the gates below can be exercised as an ordinary user, with that user's
+ * own rights.
+ */
+static void
+test_pause(const char *verb)
+{
+	const char *v = getenv("LOCKED_HELPER_TEST_PAUSE");
+	size_t n = strlen(verb);
+	char c;
+	int fd;
+
+	if (v == NULL || strncmp(v, verb, n) != 0 || v[n] != ':')
+		return;
+	fd = open(v + n + 1, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return;
+	(void)read(fd, &c, 1);
+	close(fd);
+}
+#define TEST_PAUSE(verb)	test_pause(verb)
+#else
+#define TEST_PAUSE(verb)	((void)0)
+#endif
+
+/* ---- seal and unseal ---------------------------------------------------- */
+
+/*
+ * What a node was before this run changed it. A seal or an unseal is all or
+ * nothing: on any refusal or failure every journaled node is put back, so a
+ * refused run leaves the tree exactly as it found it.
+ */
+typedef struct {
+	char		*rel;	/* path below the top, "" for the top itself */
+	mode_t		 type;	/* S_IFDIR, S_IFREG or S_IFLNK */
+	ino_t		 ino;
+	uid_t		 uid;
+	gid_t		 gid;
+	mode_t		 mode;	/* permission bits */
+	uint32_t	 flags;
+} jent_t;
+
+typedef struct {
+	int		 sealing;	/* 1 seal, 0 unseal */
+	const owners_t	*owners;
+	uint32_t	 flag;
+	int		 chown;
+	uid_t		 uid;
+	gid_t		 gid;
+	int		 has_mode;
+	mode_t		 mode;
+	int		 recursive;
+	dev_t		 dev;
+	int		 topfd;
+	const char	*top;
+	jent_t		*jv;
+	size_t		 jn;
+	size_t		 jcap;
+} tree_t;
+
+static void
+journal_push(tree_t *t, const char *rel, const struct stat *st)
+{
+	jent_t *e;
+
+	if (t->jn == t->jcap) {
+		size_t cap = t->jcap ? t->jcap * 2 : 64;
+		jent_t *v = realloc(t->jv, cap * sizeof(*v));
+
+		if (v == NULL)
+			fatal("out of memory");
+		t->jv = v;
+		t->jcap = cap;
+	}
+	e = &t->jv[t->jn++];
+	e->rel = xstrdup(rel);
+	e->type = st->st_mode & S_IFMT;
+	e->ino = st->st_ino;
+	e->uid = st->st_uid;
+	e->gid = st->st_gid;
+	e->mode = st->st_mode & 07777;
+	e->flags = st->st_flags;
+}
+
+/* True when this run already changed that inode: a second name inside the
+ * same tree for a file the walk has sealed, met again further on. */
+static int
+journal_has(const tree_t *t, ino_t ino)
+{
+	size_t i;
+
+	for (i = 0; i < t->jn; i++)
+		if (t->jv[i].ino == ino)
+			return (1);
+	return (0);
+}
+
+static void
+journal_free(tree_t *t)
+{
+	size_t i;
+
+	for (i = 0; i < t->jn; i++)
+		free(t->jv[i].rel);
+	free(t->jv);
+	t->jv = NULL;
+	t->jn = 0;
+	t->jcap = 0;
+}
+
+/*
+ * One node's change, on its own descriptor. The blocking bits come off first
+ * when the owner or the mode has to change, since both are refused on an
+ * immutable or append-only node, root included; then the owner; then the
+ * mode (the top node only, and never a link: a link's mode gates nothing on
+ * macOS); then the flag word, as found with the seal's flag added or the
+ * unseal's taken away. Journaled before anything moves.
+ */
+static int
+node_apply(tree_t *t, const node_t *n, const char *path, const char *rel,
+    int is_top)
+{
+	const struct stat *st = &n->st;
+	uint32_t cur = st->st_flags, want;
+	const char *what;
+	int own, mod;
+
+	want = t->sealing ? (cur | t->flag) : (cur & ~t->flag);
+	own = t->chown && (st->st_uid != t->uid || st->st_gid != t->gid);
+	mod = t->has_mode && is_top && !S_ISLNK(st->st_mode) &&
+	    (st->st_mode & 07777) != t->mode;
+	if (!own && !mod && want == cur)
+		return (EX_HELPER_OK);
+	journal_push(t, rel, st);
+	if ((own || mod) && (cur & BLOCKING_FLAGS) != 0) {
+		cur &= ~(uint32_t)BLOCKING_FLAGS;
+		what = "lift the flags on";
+		if (fchflags(n->fd, cur) != 0)
+			goto fail;
+	}
+	what = "change the owner of";
+	if (own && fchown(n->fd, t->uid, t->gid) != 0)
+		goto fail;
+	what = "change the mode of";
+	if (mod && fchmod(n->fd, t->mode) != 0)
+		goto fail;
+	what = "set the flags on";
+	if (want != cur && fchflags(n->fd, want) != 0)
+		goto fail;
+	return (EX_HELPER_OK);
+fail:
+	errf("cannot %s it (%s): %s", what, strerror(errno), path);
+	return (EX_HELPER_OPFAIL);
+}
+
+/*
+ * Reach a journaled node again from the held top descriptor, by its path
+ * below the top, O_NOFOLLOW at every step, and put it back as it was. It must
+ * still be the inode the journal names.
+ */
+static int
+restore_one(const tree_t *t, const jent_t *e)
+{
+	struct stat st;
+	char *buf, *p, *slash;
+	uint32_t cur;
+	int fd = -1, dfd, nfd, own, mod, rc = -1;
+
+	if (e->rel[0] == '\0') {
+		fd = dup_cloexec(t->topfd);
+	} else {
+		buf = xstrdup(e->rel);
+		p = buf;
+		dfd = dup_cloexec(t->topfd);
+		while (dfd >= 0 && (slash = strchr(p, '/')) != NULL) {
+			*slash = '\0';
+			nfd = openat(dfd, p, O_SEARCH | O_NOFOLLOW |
+			    O_CLOEXEC);
+			close(dfd);
+			dfd = nfd;
+			p = slash + 1;
+		}
+		if (dfd >= 0) {
+			fd = openat(dfd, p, O_RDONLY | O_NONBLOCK | O_CLOEXEC |
+			    (e->type == S_IFDIR ? (O_DIRECTORY | O_NOFOLLOW) :
+			    O_SYMLINK));
+			close(dfd);
+		}
+		free(buf);
+	}
+	if (fd < 0)
+		return (-1);
+	if (fstat(fd, &st) != 0 || st.st_ino != e->ino ||
+	    (st.st_mode & S_IFMT) != e->type)
+		goto out;
+	cur = st.st_flags;
+	own = st.st_uid != e->uid || st.st_gid != e->gid;
+	mod = e->type != S_IFLNK && (st.st_mode & 07777) != e->mode;
+	if ((own || mod) && (cur & BLOCKING_FLAGS) != 0) {
+		cur &= ~(uint32_t)BLOCKING_FLAGS;
+		if (fchflags(fd, cur) != 0)
+			goto out;
+	}
+	if (own && fchown(fd, e->uid, e->gid) != 0)
+		goto out;
+	if (mod && fchmod(fd, e->mode) != 0)
+		goto out;
+	if (cur != e->flags && fchflags(fd, e->flags) != 0)
+		goto out;
+	rc = 0;
+out:
+	close(fd);
+	return (rc);
+}
+
+/*
+ * Newest first, so a directory is put back after everything below it, while
+ * it still holds them closed. A node that cannot be put back is named on a
+ * window-open line, escaped: it is not as it was found.
+ */
+static int
+rollback(const tree_t *t)
+{
+	size_t i;
+	int bad = 0;
+
+	for (i = t->jn; i > 0; i--) {
+		const jent_t *e = &t->jv[i - 1];
+		char *p;
+
+		if (restore_one(t, e) == 0)
+			continue;
+		p = e->rel[0] == '\0' ? xstrdup(t->top) :
+		    join_path(t->top, e->rel);
+		errf("cannot put it back as it was: %s", p);
+		fputs("window-open\t", stdout);
+		print_escaped(p);
+		fputc('\n', stdout);
+		free(p);
+		bad = 1;
+	}
+	return (bad);
+}
+
+typedef int (*walk_fn)(tree_t *, const node_t *, const char *, const char *,
+    int);
+
+/*
+ * Every entry of a held directory, each opened, checked and walked in turn.
+ * The names are read first and the directory list freed after: by the time a
+ * walk reads a directory it is frozen, so nothing can join it in between.
+ */
+static int
+walk_children(tree_t *t, const node_t *dir, const char *path, const char *rel,
+    int depth, walk_fn fn)
+{
+	elist_t names;
+	size_t i;
+	int rc = EX_HELPER_OK;
+
+	if (depth >= MAX_DEPTH) {
+		errf("refusing a tree deeper than %d levels: %s", MAX_DEPTH,
+		    t->top);
+		return (EX_HELPER_REFUSED);
+	}
+	if (snapshot(dir->fd, path, &names) != 0)
+		return (EX_HELPER_OPFAIL);
+	for (i = 0; i < names.n && rc == EX_HELPER_OK; i++) {
+		const char *name = names.v[i].name;
+		char *cpath = join_path(path, name);
+		char *crel = rel_join(rel, name);
+		node_t c;
+
+		rc = node_at(dir->fd, name, cpath, &c);
+		if (rc == EX_HELPER_OK && c.st.st_dev != t->dev) {
+			errf("refusing, a mount point inside the tree: %s",
+			    cpath);
+			rc = EX_HELPER_REFUSED;
+		}
+		if (rc == EX_HELPER_OK)
+			rc = fn(t, &c, cpath, crel, depth + 1);
+		if (c.fd >= 0)
+			close(c.fd);
+		free(cpath);
+		free(crel);
+	}
+	elist_free(&names);
+	return (rc);
+}
+
+/*
+ * Lock direction, top-down. Each directory is handed over and frozen BEFORE
+ * its entries are read: a uchg on a directory the user still owns binds
+ * nobody, since the owner can clear it, but once the lock account owns it
+ * and the flag is on, no process running as the user can add, remove or
+ * rename an entry. The list read after that is the final one, so anything
+ * planted while the directory was still the user's is on it and meets the
+ * gate like every other entry.
+ */
+static int
+seal_walk(tree_t *t, const node_t *n, const char *path, const char *rel,
+    int depth)
+{
+	int rc;
+
+	if (depth > 0) {
+		/* A second name for a file this walk already sealed: it is
+		 * the lock account's now because of this run, not a plant. */
+		if (n->st.st_nlink > 1 && !S_ISDIR(n->st.st_mode) &&
+		    journal_has(t, n->st.st_ino))
+			return (EX_HELPER_OK);
+		rc = gate(n, path, t->owners, t->chown);
+		if (rc != EX_HELPER_OK)
+			return (rc);
+	}
+	rc = node_apply(t, n, path, rel, depth == 0);
+	if (rc != EX_HELPER_OK || !S_ISDIR(n->st.st_mode) || !t->recursive)
+		return (rc);
+	return (walk_children(t, n, path, rel, depth, seal_walk));
+}
+
+/*
+ * Unlock direction, first pass: every directory frozen before it is read,
+ * every node gated, nothing else changed. The tree is the lock account's,
+ * so a directory frozen here stays closed to the user, and a refusal rolls
+ * back the freezes this pass applied.
+ */
+static int
+check_walk(tree_t *t, const node_t *n, const char *path, const char *rel,
+    int depth)
+{
+	if (depth > 0 && gate(n, path, t->owners, 0) != EX_HELPER_OK)
+		return (EX_HELPER_REFUSED);
+	if (!S_ISDIR(n->st.st_mode))
+		return (EX_HELPER_OK);
+	if ((n->st.st_flags & UF_IMMUTABLE) == 0) {
+		journal_push(t, rel, &n->st);
+		if (fchflags(n->fd, n->st.st_flags | UF_IMMUTABLE) != 0) {
+			errf("cannot freeze it (%s): %s", strerror(errno),
+			    path);
+			return (EX_HELPER_OPFAIL);
+		}
+	}
+	return (walk_children(t, n, path, rel, depth, check_walk));
+}
+
+/*
+ * Unlock direction, second pass, bottom-up: everything below a directory is
+ * handed back while the directory is still frozen, and the directory last.
+ * A node already in the state the unseal asks for (a second name for a file
+ * handed back further up the walk) is left alone.
+ */
+static int
+unseal_walk(tree_t *t, const node_t *n, const char *path, const char *rel,
+    int depth)
+{
+	int rc;
+
+	if (depth > 0) {
+		if ((!t->chown || (n->st.st_uid == t->uid &&
+		    n->st.st_gid == t->gid)) && (n->st.st_flags & t->flag) == 0)
+			return (EX_HELPER_OK);
+		rc = gate(n, path, t->owners, 0);
+		if (rc != EX_HELPER_OK)
+			return (rc);
+	}
+	if (S_ISDIR(n->st.st_mode) && t->recursive) {
+		rc = walk_children(t, n, path, rel, depth, unseal_walk);
+		if (rc != EX_HELPER_OK)
+			return (rc);
+	}
+	return (node_apply(t, n, path, rel, depth == 0));
 }
 
 /* ---- verb: rm ----------------------------------------------------------- */
@@ -1887,14 +2629,21 @@ cmd_copy(int argc, char **argv)
 {
 	opts_t o;
 	nodeid_t sid;
+	owners_t owners;
 	struct stat st;
 	int sfd = -1, dfd = -1, status = EX_HELPER_OK;
 
 	if (parse_opts(argc, argv, &o) != 0)
 		return (EX_HELPER_USAGE);
 	if (need_abs(o.src, "--src") != 0 || need_abs(o.dest, "--dest") != 0 ||
-	    parse_ids(o.src_id, &sid, "--src-id") != 0)
+	    parse_ids(o.src_id, &sid, "--src-id") != 0 ||
+	    need(o.owner, "--owner") != 0)
 		return (EX_HELPER_USAGE);
+	if (parse_owners(o.owner, &owners) != 0) {
+		errf("--owner is not a list of accounts");
+		return (EX_HELPER_USAGE);
+	}
+	TEST_PAUSE("copy");
 
 	sfd = open(o.src, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
 	if (sfd < 0) {
@@ -1914,6 +2663,13 @@ cmd_copy(int argc, char **argv)
 	if (!S_ISREG(st.st_mode)) {
 		errf("%s is not a regular file", o.src);
 		status = EX_HELPER_OPFAIL;
+		goto cleanup;
+	}
+	/* Root reads only what the owner gate lets through: a file the
+	 * invoker owns, or one sealed for them -- never a second name the
+	 * invoker planted for somebody else's file. */
+	if (gate_owner(&st, o.src, &owners) != EX_HELPER_OK) {
+		status = EX_HELPER_REFUSED;
 		goto cleanup;
 	}
 	/* The read from here on is from the verified fd, so a swap of the
@@ -1969,25 +2725,32 @@ cleanup:
  * is exactly what the human approved in the diff, and mode, owner and the
  * flag word belong to the install step (see the cp -p hazard in cmd_copy).
  *
- * The source is pinned by identity, not by ownership -- an anchor-tier node
- * (~/.ssh/config) is legitimately owned by the invoker, so ownership says
- * nothing here, while the recorded identity says exactly which node this
- * has to be. The destination must be root-owned: it is the staging file the
- * caller just created, and anything else is not ours to write to.
+ * The source is pinned by identity, and gated by owner: the caller names
+ * whose it may be (the lock account for a sealed file, the invoker for an
+ * anchor-tier node such as ~/.ssh/config), and the recorded identity says
+ * exactly which node this has to be. The destination must be root-owned: it
+ * is the staging file the caller just created, and anything else is not ours
+ * to write to.
  */
 static int
 cmd_xattrs_from(int argc, char **argv)
 {
 	opts_t o;
 	nodeid_t sid;
+	owners_t owners;
 	struct stat st;
 	int sfd = -1, dfd = -1, status = EX_HELPER_OK;
 
 	if (parse_opts(argc, argv, &o) != 0)
 		return (EX_HELPER_USAGE);
 	if (need_abs(o.src, "--src") != 0 || need_abs(o.dest, "--dest") != 0 ||
-	    parse_ids(o.src_id, &sid, "--src-id") != 0)
+	    parse_ids(o.src_id, &sid, "--src-id") != 0 ||
+	    need(o.owner, "--owner") != 0)
 		return (EX_HELPER_USAGE);
+	if (parse_owners(o.owner, &owners) != 0) {
+		errf("--owner is not a list of accounts");
+		return (EX_HELPER_USAGE);
+	}
 
 	sfd = open(o.src, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
 	if (sfd < 0) {
@@ -2007,6 +2770,11 @@ cmd_xattrs_from(int argc, char **argv)
 	if (!S_ISREG(st.st_mode)) {
 		errf("%s is not a regular file", o.src);
 		status = EX_HELPER_OPFAIL;
+		goto cleanup;
+	}
+	/* Attributes are read like bytes: only through the owner gate. */
+	if (gate_owner(&st, o.src, &owners) != EX_HELPER_OK) {
+		status = EX_HELPER_REFUSED;
 		goto cleanup;
 	}
 
@@ -2045,6 +2813,358 @@ cleanup:
 	if (dfd >= 0)
 		close(dfd);
 	return (status);
+}
+
+/* ---- verbs: seal and unseal --------------------------------------------- */
+
+/*
+ * A seal or an unseal runs to its end or rolls back, and the roll back needs
+ * the walk to finish first: a Ctrl-C or a kill waits until the verb returns
+ * and then dies with the process, which discards it. The bash side's own
+ * trap still sees it.
+ */
+static void
+block_signals(void)
+{
+	sigset_t s;
+
+	sigemptyset(&s);
+	sigaddset(&s, SIGINT);
+	sigaddset(&s, SIGTERM);
+	sigaddset(&s, SIGHUP);
+	(void)sigprocmask(SIG_BLOCK, &s, NULL);
+}
+
+/*
+ * seal: give the node at --path (and, with --recursive, every node under it)
+ * to --chown, set --mode on the top node, and add --flag to each node's flag
+ * word. unseal: the same with the flag taken away. Every node must be a
+ * directory, a regular file or a symlink, owned by one of --owner; the top
+ * node must also be --id. A seal that gives nodes away refuses a set-user-id
+ * or set-group-id file. On any refusal or failure everything already changed
+ * is put back.
+ *
+ * unseal --recursive runs in two passes: the first freezes every directory
+ * before reading it and gates every node, changing nothing else, so a
+ * refusal finds the tree as it was; the second hands the nodes back, bottom
+ * up.
+ */
+static int
+cmd_tree(int argc, char **argv, int sealing)
+{
+	opts_t o;
+	nodeid_t want;
+	owners_t owners;
+	tree_t t;
+	node_t top;
+	char buf[PATH_MAX];
+	const char *leaf;
+	int pfd, rc;
+
+	if (parse_opts(argc, argv, &o) != 0)
+		return (EX_HELPER_USAGE);
+	if (need_abs(o.path, "--path") != 0 ||
+	    parse_ids(o.id, &want, "--id") != 0 ||
+	    need(o.owner, "--owner") != 0 || need(o.flag, "--flag") != 0)
+		return (EX_HELPER_USAGE);
+	memset(&t, 0, sizeof(t));
+	if (parse_owners(o.owner, &owners) != 0) {
+		errf("--owner is not a list of accounts");
+		return (EX_HELPER_USAGE);
+	}
+	if (parse_flag(o.flag, &t.flag) != 0) {
+		errf("--flag must be one of uchg, uappnd, schg, sappnd");
+		return (EX_HELPER_USAGE);
+	}
+	if (o.chown != NULL) {
+		if (parse_chown(o.chown, &t.uid, &t.gid) != 0) {
+			errf("--chown must be <user>:<group>");
+			return (EX_HELPER_USAGE);
+		}
+		t.chown = 1;
+	}
+	if (o.mode != NULL) {
+		if (parse_mode(o.mode, &t.mode) != 0) {
+			errf("--mode must be octal permission bits");
+			return (EX_HELPER_USAGE);
+		}
+		t.has_mode = 1;
+	}
+	/* A directory the user still owns is closed by no flag, since its
+	 * owner can clear one; a tree is walked only as it changes hands. */
+	if (o.recursive && !t.chown) {
+		errf("--recursive needs --chown");
+		return (EX_HELPER_USAGE);
+	}
+	t.sealing = sealing;
+	t.owners = &owners;
+	t.recursive = o.recursive;
+	t.top = o.path;
+	t.topfd = -1;
+
+	TEST_PAUSE(sealing ? "seal" : "unseal");
+	block_signals();
+
+	pfd = open_parent(o.path, buf, sizeof(buf), &leaf);
+	if (pfd < 0)
+		return (pfd == -2 ? EX_HELPER_REFUSED : EX_HELPER_OPFAIL);
+	rc = node_at(pfd, leaf, o.path, &top);
+	if (rc != EX_HELPER_OK) {
+		close(pfd);
+		return (rc);
+	}
+	/* A link has no descriptor getattrlist answers for; its volume is
+	 * asked by the held parent and the name, never by a path. */
+	if (check_id("node", o.path, &want, &top.st, S_ISLNK(top.st.st_mode) ?
+	    at_name(pfd, leaf) : at_fd(top.fd)) != 0) {
+		close(pfd);
+		close(top.fd);
+		return (EX_HELPER_IDENT);
+	}
+	close(pfd);
+	rc = gate(&top, o.path, &owners, sealing && t.chown);
+	if (rc == EX_HELPER_OK && sealing && t.chown && t.has_mode &&
+	    S_ISREG(top.st.st_mode) && (t.mode & (S_ISUID | S_ISGID)) != 0) {
+		errf("refusing, a set-user-id or set-group-id mode would run "
+		    "as the file's new owner once sealed: %s", o.path);
+		rc = EX_HELPER_REFUSED;
+	}
+	if (rc != EX_HELPER_OK) {
+		close(top.fd);
+		return (rc);
+	}
+	t.dev = top.st.st_dev;
+	t.topfd = top.fd;
+
+	if (sealing) {
+		rc = seal_walk(&t, &top, o.path, "", 0);
+	} else {
+		rc = check_walk(&t, &top, o.path, "", 0);
+		/* The first pass may have frozen the top; the second reads
+		 * its flag word as it now is. */
+		if (rc == EX_HELPER_OK && fstat(top.fd, &top.st) != 0) {
+			errf("cannot stat (%s): %s", strerror(errno), o.path);
+			rc = EX_HELPER_OPFAIL;
+		}
+		if (rc == EX_HELPER_OK)
+			rc = unseal_walk(&t, &top, o.path, "", 0);
+	}
+	if (rc != EX_HELPER_OK && rollback(&t) != 0)
+		rc = EX_HELPER_WINOPEN;
+	journal_free(&t);
+	close(top.fd);
+	return (rc);
+}
+
+/* ---- verb: copy-tree ---------------------------------------------------- */
+
+typedef struct {
+	const owners_t	*owners;
+	uid_t		 uid;
+	gid_t		 gid;
+	dev_t		 dev;
+	const char	*top;
+} ctree_t;
+
+static int copy_dir(ctree_t *, int, const char *, int, int);
+
+/*
+ * A link's text is read by name: macOS refuses read(2) on a link's own
+ * descriptor. The text is no secret -- readlink needs no permission on the
+ * link -- and the entry must still be the inode the gate passed.
+ */
+static int
+copy_link(const ctree_t *c, int sfd, const char *name, const char *path,
+    const node_t *n, int dfd)
+{
+	char target[PATH_MAX + 1];
+	struct stat after;
+	ssize_t k;
+
+	k = readlinkat(sfd, name, target, PATH_MAX);
+	if (k < 0 || k >= PATH_MAX) {
+		errf("cannot read the link (%s): %s",
+		    k < 0 ? strerror(errno) : "too long", path);
+		return (EX_HELPER_OPFAIL);
+	}
+	target[k] = '\0';
+	if (fstatat(sfd, name, &after, AT_SYMLINK_NOFOLLOW) != 0 ||
+	    after.st_ino != n->st.st_ino || !S_ISLNK(after.st_mode)) {
+		errf("refusing, it changed while it was read: %s", path);
+		return (EX_HELPER_REFUSED);
+	}
+	if (symlinkat(target, dfd, name) != 0 ||
+	    fchownat(dfd, name, c->uid, c->gid, AT_SYMLINK_NOFOLLOW) != 0) {
+		errf("cannot copy the link (%s): %s", strerror(errno), path);
+		return (EX_HELPER_OPFAIL);
+	}
+	return (EX_HELPER_OK);
+}
+
+/*
+ * One entry: gated like a seal's, then copied from its own descriptor.
+ * Permission bits travel without the set-user-id, set-group-id and sticky
+ * bits; the owner is --chown's; data, extended attributes and ACLs travel
+ * for a file. Flags never do.
+ */
+static int
+copy_entry(ctree_t *c, int sfd, const char *spath, int dfd, const char *name,
+    int depth)
+{
+	char *path = join_path(spath, name);
+	node_t n;
+	int rc, ofd = -1;
+
+	rc = node_at(sfd, name, path, &n);
+	if (rc == EX_HELPER_OK && n.st.st_dev != c->dev) {
+		errf("refusing, a mount point inside the tree: %s", path);
+		rc = EX_HELPER_REFUSED;
+	}
+	if (rc == EX_HELPER_OK)
+		rc = gate(&n, path, c->owners, 0);
+	if (rc != EX_HELPER_OK)
+		goto out;
+	if (S_ISDIR(n.st.st_mode)) {
+		if (mkdirat(dfd, name, 0700) != 0 ||
+		    (ofd = openat(dfd, name, O_RDONLY | O_DIRECTORY |
+		    O_NOFOLLOW | O_CLOEXEC)) < 0) {
+			errf("cannot create the copy (%s): %s",
+			    strerror(errno), path);
+			rc = EX_HELPER_OPFAIL;
+			goto out;
+		}
+		rc = copy_dir(c, n.fd, path, ofd, depth + 1);
+	} else if (S_ISREG(n.st.st_mode)) {
+		ofd = openat(dfd, name, O_WRONLY | O_CREAT | O_EXCL |
+		    O_NOFOLLOW | O_CLOEXEC, 0600);
+		if (ofd < 0 || fcopyfile(n.fd, ofd, NULL,
+		    COPYFILE_DATA | COPYFILE_XATTR | COPYFILE_ACL) != 0) {
+			errf("cannot copy (%s): %s", strerror(errno), path);
+			rc = EX_HELPER_OPFAIL;
+			goto out;
+		}
+	} else {
+		rc = copy_link(c, sfd, name, path, &n, dfd);
+		goto out;
+	}
+	if (rc == EX_HELPER_OK && (fchown(ofd, c->uid, c->gid) != 0 ||
+	    fchmod(ofd, n.st.st_mode & 0777) != 0)) {
+		errf("cannot set the owner and mode of the copy (%s): %s",
+		    strerror(errno), path);
+		rc = EX_HELPER_OPFAIL;
+	}
+out:
+	if (ofd >= 0)
+		close(ofd);
+	if (n.fd >= 0)
+		close(n.fd);
+	free(path);
+	return (rc);
+}
+
+static int
+copy_dir(ctree_t *c, int sfd, const char *spath, int dfd, int depth)
+{
+	elist_t names;
+	size_t i;
+	int rc = EX_HELPER_OK;
+
+	if (depth >= MAX_DEPTH) {
+		errf("refusing a tree deeper than %d levels: %s", MAX_DEPTH,
+		    c->top);
+		return (EX_HELPER_REFUSED);
+	}
+	if (snapshot(sfd, spath, &names) != 0)
+		return (EX_HELPER_OPFAIL);
+	for (i = 0; i < names.n && rc == EX_HELPER_OK; i++)
+		rc = copy_entry(c, sfd, spath, dfd, names.v[i].name, depth);
+	elist_free(&names);
+	return (rc);
+}
+
+/*
+ * copy-tree: copy the folder at --src, every node of it gated as a seal
+ * gates them (a directory, a file or a symlink, owned by one of --owner),
+ * into a new folder at --dest owned by --chown. This is what root reads a
+ * folder through -- its snapshot and the diff witness above a relock -- so
+ * no inode the owner gate refuses is ever read, whatever was linked or
+ * renamed into the folder.
+ *
+ * --dest is root's own staging, created here and never present before; it
+ * is named by path the way `copy` names its destination. On failure the
+ * partial copy is left for the caller to remove.
+ */
+static int
+cmd_copy_tree(int argc, char **argv)
+{
+	opts_t o;
+	nodeid_t sid;
+	owners_t owners;
+	ctree_t c;
+	node_t top;
+	char buf[PATH_MAX];
+	const char *leaf;
+	int pfd, dfd = -1, rc;
+
+	if (parse_opts(argc, argv, &o) != 0)
+		return (EX_HELPER_USAGE);
+	if (need_abs(o.src, "--src") != 0 || need_abs(o.dest, "--dest") != 0 ||
+	    parse_ids(o.src_id, &sid, "--src-id") != 0 ||
+	    need(o.owner, "--owner") != 0 || need(o.chown, "--chown") != 0)
+		return (EX_HELPER_USAGE);
+	memset(&c, 0, sizeof(c));
+	if (parse_owners(o.owner, &owners) != 0) {
+		errf("--owner is not a list of accounts");
+		return (EX_HELPER_USAGE);
+	}
+	if (parse_chown(o.chown, &c.uid, &c.gid) != 0) {
+		errf("--chown must be <user>:<group>");
+		return (EX_HELPER_USAGE);
+	}
+	c.owners = &owners;
+	c.top = o.src;
+
+	TEST_PAUSE("copy-tree");
+
+	pfd = open_parent(o.src, buf, sizeof(buf), &leaf);
+	if (pfd < 0)
+		return (pfd == -2 ? EX_HELPER_REFUSED : EX_HELPER_OPFAIL);
+	rc = node_at(pfd, leaf, o.src, &top);
+	close(pfd);
+	if (rc != EX_HELPER_OK)
+		return (rc);
+	if (check_id("source", o.src, &sid, &top.st, at_fd(top.fd)) != 0) {
+		close(top.fd);
+		return (EX_HELPER_IDENT);
+	}
+	rc = gate(&top, o.src, &owners, 0);
+	if (rc == EX_HELPER_OK && !S_ISDIR(top.st.st_mode)) {
+		errf("not a directory: %s", o.src);
+		rc = EX_HELPER_OPFAIL;
+	}
+	if (rc != EX_HELPER_OK) {
+		close(top.fd);
+		return (rc);
+	}
+	c.dev = top.st.st_dev;
+
+	if (mkdir(o.dest, 0700) != 0 ||
+	    (dfd = open(o.dest, O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+	    O_CLOEXEC)) < 0) {
+		errf("cannot create (%s): %s", strerror(errno), o.dest);
+		close(top.fd);
+		return (EX_HELPER_OPFAIL);
+	}
+	rc = copy_dir(&c, top.fd, o.src, dfd, 0);
+	if (rc == EX_HELPER_OK && (fchown(dfd, c.uid, c.gid) != 0 ||
+	    fchmod(dfd, top.st.st_mode & 0777) != 0)) {
+		errf("cannot set the owner and mode of the copy (%s): %s",
+		    strerror(errno), o.dest);
+		rc = EX_HELPER_OPFAIL;
+	}
+	close(dfd);
+	close(top.fd);
+	return (rc);
 }
 
 /* ---- verb: id ----------------------------------------------------------- */
@@ -2123,10 +3243,12 @@ main(int argc, char **argv)
 		return (status);
 	}
 
+#ifndef LOCKED_HELPER_TEST
 	if (geteuid() != 0) {
 		errf("must run as root");
 		return (EX_HELPER_USAGE);
 	}
+#endif
 
 	if (strcmp(argv[1], "rm") == 0)
 		status = cmd_rm(argc, argv);
@@ -2138,6 +3260,12 @@ main(int argc, char **argv)
 		status = cmd_copy(argc, argv);
 	else if (strcmp(argv[1], "xattrs-from") == 0)
 		status = cmd_xattrs_from(argc, argv);
+	else if (strcmp(argv[1], "copy-tree") == 0)
+		status = cmd_copy_tree(argc, argv);
+	else if (strcmp(argv[1], "seal") == 0)
+		status = cmd_tree(argc, argv, 1);
+	else if (strcmp(argv[1], "unseal") == 0)
+		status = cmd_tree(argc, argv, 0);
 	else {
 		errf("unknown verb %s", argv[1]);
 		usage();
