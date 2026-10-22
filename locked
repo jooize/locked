@@ -88,8 +88,10 @@ VERSION=0.16.0
 readonly LOCKED_GIT=/Library/Developer/CommandLineTools/usr/bin/git
 # Everything locked keeps: one root-owned dir per user under it, holding
 # that user's pool and the result of the last verify run (see the root
-# convergence block below for the shape).
-: "${LOCKED_STATE_ROOT:=/var/db/locked}"
+# convergence block below for the shape). Spelled without the /var symlink:
+# the helper walks every path it reads from "/" and refuses a symlink on
+# the way, and the staging copies it reads live under here.
+: "${LOCKED_STATE_ROOT:=/private/var/db/locked}"
 # Where 0.14.0 and earlier kept the pools. Read once, by the one-shot
 # conversion in the root convergence block; nothing else looks here.
 : "${LOCKED_LEGACY_ROOT:=/var/db/locked-snapshots}"
@@ -1058,7 +1060,7 @@ node_op() {
       log_action "$lv" "$p" refuse-identity
       ;;
     7)
-      say_err "${E_RED}${E_B}✗ refused:${E_OFF} a node is not one locked may act on (named above); nothing was changed" "$p"
+      say_err "${E_RED}${E_B}✗ refused:${E_OFF} the helper would not act, for the reason above; nothing was changed" "$p"
       log_action "$lv" "$p" refuse-gate
       ;;
     3)
@@ -1802,7 +1804,7 @@ atomic_replace() { # <src> <dst> <owner:group> <mode> <src owner> [<src id>]
   tmp="$(mktemp "${stage_dir}/replace.XXXXXX")" || return 1
   rm -f -- "$tmp" || return 1
   "$LOCKED_HELPER" copy --src "$src" --src-id "${src_id/./:}" \
-    --owner "$src_owner" --dest "$tmp" \
+    --owner "$src_owner" --as "$(reader_for "$src")" --dest "$tmp" \
     || { rm -f -- "$tmp" 2>/dev/null; return 1; }
   chown "$owner" "$tmp" || { rm -f -- "$tmp"; return 1; }
   chmod "$mode" "$tmp" || { rm -f -- "$tmp"; return 1; }
@@ -1866,7 +1868,7 @@ stage_copy() {
   tmp="$(mktemp "${stage_dir}/copy.XXXXXX")" || return 1
   rm -f -- "$tmp" || return 1
   "$LOCKED_HELPER" copy --src "$1" --src-id "${3/./:}" --owner "$2" \
-    --dest "$tmp" || { rm -f -- "$tmp" 2>/dev/null; return 1; }
+    --as "$(reader_for "$1")" --dest "$tmp" || { rm -f -- "$tmp" 2>/dev/null; return 1; }
   printf '%s\n' "$tmp"
 }
 
@@ -1884,9 +1886,36 @@ stage_tree() {
   verify_helper || return 1
   tmp="$(mktemp -d "${stage_dir}/tree.XXXXXX")" || return 1
   "$LOCKED_HELPER" copy-tree --src "$1" --src-id "${3/./:}" --owner "$2" \
-    --dest "$tmp/tree" --chown "$lock_user:$lock_user" \
+    --as "$(reader_for "$1")" --dest "$tmp/tree" --chown "$lock_user:$lock_user" \
     || { rm -rf -- "$tmp"; return 1; }
   printf '%s\n' "$tmp/tree"
+}
+
+# reader_for <path>: the account the helper reads <path> as (its --as).
+# A path in locked's own state is root's to read: nothing of yours is on
+# the way. Anything else is read as you wherever you own the path, so the
+# kernel checks your reach to it (the helper's open_parent).
+reader_for() {
+  case "$1" in
+    "$LOCKED_STATE_ROOT"/*) printf 'root\n' ;;
+    *) printf '%s\n' "$inv" ;;
+  esac
+}
+
+# node_count <dir>: the nodes of the tree at <dir>, itself included, as a
+# seal or an unseal of it with --recursive must reach them (the helper's
+# --count). Counted by find, not by the helper's own walk, so a walk that
+# strays reaches a number this did not, and the helper refuses before it
+# changes the node that would have been one too many.
+node_count() {
+  local n
+  n="$(find "$1" -print0 | LC_ALL=C tr -cd '\0' | wc -c)" || {
+    err_val "cannot count the nodes in the tree" "$1"
+    return 1
+  }
+  n="${n//[[:space:]]/}"
+  [ "$n" -gt 0 ] || { err_val "counted no nodes in the tree" "$1"; return 1; }
+  printf '%s\n' "$n"
 }
 
 # Directory snapshots: whole-tree copy under .snapdir, staged then swapped.
@@ -3375,11 +3404,14 @@ seal_content() {
   local -a how=(--path "$f" --id "${id/./:}" --owner "$inv"
     --chown "${lock_user}:${lock_user}" --flag uchg)
   if [ "$is_dir" -eq 1 ]; then
-    node_op lock "$f" seal "${how[@]}" --mode "$target_mode" --recursive || return 1
+    local count
+    count="$(node_count "$f")" || return 1
+    node_op lock "$f" seal "${how[@]}" --mode "$target_mode" \
+      --count "$count" --recursive || return 1
   elif [ "$is_link" -eq 1 ]; then
-    node_op lock "$f" seal "${how[@]}" || return 1
+    node_op lock "$f" seal "${how[@]}" --count 1 || return 1
   else
-    node_op lock "$f" seal "${how[@]}" --mode "$target_mode" || return 1
+    node_op lock "$f" seal "${how[@]}" --mode "$target_mode" --count 1 || return 1
   fi
 
   if [ "$OPT_DRY" -eq 0 ]; then
@@ -3518,7 +3550,7 @@ seal_anchor() {
     # the previous system flag before applying the new one. The plan named
     # the change as "reflag anchor" and the gate approved it.
     node_op lock "$f" unseal --path "$f" --id "${id/./:}" --owner "$inv" \
-      --flag "$prev_flag" || return 1
+      --count 1 --flag "$prev_flag" || return 1
   fi
 
   if [ "$is_file" -eq 1 ] && { [ "$live" -eq 0 ] || [ ! -f "$SNAP" ]; }; then
@@ -3526,7 +3558,7 @@ seal_anchor() {
   fi
 
   node_op lock "$f" seal --path "$f" --id "${id/./:}" --owner "$inv" \
-    --flag "$flagword" || return 1
+    --count 1 --flag "$flagword" || return 1
   if [ "$OPT_DRY" -eq 0 ]; then
     write_meta "$META" \
       "owner=$owner_now" \
@@ -3600,13 +3632,16 @@ release_node() {
       local -a how=(--path "$f" --id "$rid" --owner "$owners"
         --chown "${owner}:${group}" --flag "$flag")
       if [ "$recursive" = "1" ]; then
+        local count
         run snapshot_tree "$f" "$SNAPDIR" "$owners" "$rid" || return 1
-        node_op unlock "$f" unseal "${how[@]}" --mode "$mode" --recursive || return 1
+        count="$(node_count "$f")" || return 1
+        node_op unlock "$f" unseal "${how[@]}" --mode "$mode" \
+          --count "$count" --recursive || return 1
       elif [ "$is_link" -eq 1 ]; then
-        node_op unlock "$f" unseal "${how[@]}" || return 1
+        node_op unlock "$f" unseal "${how[@]}" --count 1 || return 1
       else
         run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 "$owners" "$rid" || return 1
-        node_op unlock "$f" unseal "${how[@]}" --mode "$mode" || return 1
+        node_op unlock "$f" unseal "${how[@]}" --mode "$mode" --count 1 || return 1
       fi
       ;;
     anchor)
@@ -3617,7 +3652,7 @@ release_node() {
         run atomic_replace "$f" "$SNAP" "${lock_user}:${lock_user}" 600 "$inv" "$rid" || return 1
       fi
       node_op unlock "$f" unseal --path "$f" --id "$rid" --owner "$inv" \
-        --flag "$flag" || return 1
+        --count 1 --flag "$flag" || return 1
       ;;
     placement)
       fclear "$flag" "$f" || return 1
@@ -4827,17 +4862,20 @@ unprotect_leaf() {
         local -a how=(--path "$f" --id "$rid" --owner "$owners"
           --chown "${owner}:${group}" --flag "$flag")
         if [ "$recursive" = "1" ]; then
-          node_op unprotect "$f" unseal "${how[@]}" --mode "$mode" --recursive || return 1
+          local count
+          count="$(node_count "$f")" || return 1
+          node_op unprotect "$f" unseal "${how[@]}" --mode "$mode" \
+            --count "$count" --recursive || return 1
         elif [ -L "$f" ]; then
           # No mode on a link: a link's own mode gates nothing.
-          node_op unprotect "$f" unseal "${how[@]}" || return 1
+          node_op unprotect "$f" unseal "${how[@]}" --count 1 || return 1
         else
-          node_op unprotect "$f" unseal "${how[@]}" --mode "$mode" || return 1
+          node_op unprotect "$f" unseal "${how[@]}" --mode "$mode" --count 1 || return 1
         fi
         ;;
       anchor)
         node_op unprotect "$f" unseal --path "$f" --id "$rid" --owner "$inv" \
-          --flag "$flag" || return 1
+          --count 1 --flag "$flag" || return 1
         ;;
       *)
         err_val "the record has tier '$tier'; only a leaf can be unprotected" "$f"
@@ -5216,7 +5254,7 @@ do_edit_one() {
   # candidate might have carried is trusted. A new file has none to keep.
   if [ "$is_new" -eq 0 ]; then
     "$LOCKED_HELPER" xattrs-from --src "$f" --src-id "$fid" \
-      --owner "$sealed_owner" --dest "$stage" || {
+      --owner "$sealed_owner" --as "$inv" --dest "$stage" || {
       rm -f -- "$stage"
       say_err "edit: cannot carry the file's extended attributes onto the candidate" "$f"
       log_action edit "$f" refuse-xattrs
@@ -5313,10 +5351,10 @@ do_edit_one() {
   local install_owner="${lock_user}:${lock_user}"
   [ "$tier" = "anchor" ] && install_owner="${owner}:${group}"
   node_op edit "$f" unseal --path "$f" --id "$fid" --owner "$sealed_owner" \
-    --flag "$flag" || { rm -f -- "$stage"; return 1; }
+    --count 1 --flag "$flag" || { rm -f -- "$stage"; return 1; }
   run atomic_replace "$stage" "$f" "$install_owner" "$mode" root || { rm -f -- "$stage"; return 1; }
   node_op edit "$f" seal --path "$f" --id "${AR_ID/./:}" \
-    --owner "${install_owner%%:*}" --flag "$flag" || { rm -f -- "$stage"; return 1; }
+    --owner "${install_owner%%:*}" --count 1 --flag "$flag" || { rm -f -- "$stage"; return 1; }
   what="$(check_install "$f" "$stage" "${install_owner%%:*}" "$mode" "$flag" "$dflags")" || true
   rm -f -- "$stage"
   # The record follows the installed node either way, so verify reports
@@ -5397,7 +5435,7 @@ do_revert_one() {
 
   if [ "$was_locked" -eq 1 ]; then
     node_op revert "$f" unseal --path "$f" --id "$cid" --owner "$cur_owner" \
-      --flag "$flag" || { rm -f -- "$cur"; return 1; }
+      --count 1 --flag "$flag" || { rm -f -- "$cur"; return 1; }
   fi
   run atomic_replace "$cur" "$ATTIC" "${lock_user}:${lock_user}" 600 root || { rm -f -- "$cur"; return 1; }
   rm -f -- "$cur"
@@ -5405,7 +5443,7 @@ do_revert_one() {
     run atomic_replace "$SNAP" "$f" "$restore_owner" "$mode" "$lock_user" || return 1
     # The flag goes back on the inode just installed, by its identity.
     node_op revert "$f" seal --path "$f" --id "${AR_ID/./:}" \
-      --owner "${restore_owner%%:*}" --flag "$flag" || return 1
+      --owner "${restore_owner%%:*}" --count 1 --flag "$flag" || return 1
     if [ "$OPT_DRY" -eq 0 ]; then
       write_meta "$META" \
         "owner=$owner" \

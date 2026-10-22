@@ -25,6 +25,18 @@
  * an inode someone else owns -- a hard link the user planted after the
  * plan was made -- is still owned by that someone else, so it is refused.
  *
+ * The copy verbs also read as the invoker (--as) wherever the invoker owns
+ * the path: the walk from "/" and the open of each node run under their
+ * identity, so the kernel checks every folder on the way and the node's own
+ * permission bits exactly as it would for them. Only a node owned by
+ * another account in --owner (the lock account, or root for its own
+ * staging) is opened by root, from that node down, through the owner gate.
+ *
+ * A seal or an unseal is held to the plan's node count (--count): a first
+ * pass counts, read-only, every node the verb would reach, and any other
+ * number refuses before the first change; the passes that change nodes
+ * stop at the first node past the count, before changing it.
+ *
  * Exit codes are interface; the bash caller dispatches on them:
  *   0  ok
  *   2  identity refusal -- nothing was touched
@@ -35,8 +47,9 @@
  *      unseal: the nodes a roll back could not restore, names escaped)
  *   6  operation completed but the parent's entry list changed in a way the
  *      operation does not account for; `anomaly` lines on stdout
- *   7  refused: a node is not a directory, file or symlink, or is not owned
- *      by an account the caller named -- nothing changed, and whatever a
+ *   7  refused: a node is not a directory, file or symlink, is not owned
+ *      by an account the caller named, cannot be reached as --as, or a
+ *      walk's count differs from --count -- nothing changed, and whatever a
  *      seal had already changed was rolled back
  *
  * Node identity (`--parent-id`, `--target-id`, `--src-id`, and what the `id`
@@ -137,12 +150,15 @@ usage(void)
 "                           --target-id <id|-> --uid <uid> --gid <gid>\n"
 "                           --home <dir>\n"
 "       locked-helper copy --src <path> --src-id <id|-> --owner <users>\n"
-"                          --dest <path>\n"
+"                          --as <user> --dest <path>\n"
 "       locked-helper copy-tree --src <dir> --src-id <id|-> --owner <users>\n"
-"                               --dest <dir> --chown <user>:<group>\n"
+"                               --as <user> --dest <dir>\n"
+"                               --chown <user>:<group>\n"
 "       locked-helper xattrs-from --src <path> --src-id <id|->\n"
-"                                 --owner <users> --dest <path>\n"
+"                                 --owner <users> --as <user>\n"
+"                                 --dest <path>\n"
 "       locked-helper seal|unseal --path <path> --id <id|-> --owner <users>\n"
+"                                 --count <n>\n"
 "                                 --flag <uchg|uappnd|schg|sappnd>\n"
 "                                 [--chown <user>:<group>] [--mode <octal>]\n"
 "                                 [--recursive]\n"
@@ -1239,6 +1255,8 @@ typedef struct {
 	const char	*flag;
 	const char	*chown;
 	const char	*mode;
+	const char	*as;
+	const char	*count;
 	int		 recursive;
 } opts_t;
 
@@ -1299,6 +1317,8 @@ parse_opts(int argc, char **argv, opts_t *o)
 		TRY("--flag", flag)
 		TRY("--chown", chown)
 		TRY("--mode", mode)
+		TRY("--as", as)
+		TRY("--count", count)
 #undef TRY
 		errf("unknown option %s", a);
 		return (-1);
@@ -1507,6 +1527,115 @@ user_name(uid_t u, char *buf, size_t n)
 		snprintf(buf, n, "uid %lu", (unsigned long)u);
 }
 
+/* --count: how many nodes the plan names, the top included. */
+static int
+parse_count(const char *s, size_t *out)
+{
+	char *end;
+	unsigned long long v;
+
+	if (s[0] == '\0' || strspn(s, "0123456789") != strlen(s))
+		return (-1);
+	errno = 0;
+	v = strtoull(s, &end, 10);
+	if (errno != 0 || *end != '\0' || v == 0)
+		return (-1);
+	*out = (size_t)v;
+	return (0);
+}
+
+/* ---- reading as the invoker --------------------------------------------- */
+
+/*
+ * The account a copy reads as. The owner gate is this binary checking one
+ * fact on one descriptor; reading as the invoker has the kernel check every
+ * folder on the way and the node's own permission bits, so a file of
+ * theirs inside a folder they cannot enter is refused rather than read by
+ * root. The lock account cannot stand in for itself the same way: it is a
+ * hidden account outside the invoker's groups, and their home is closed to
+ * it. So a node owned by another account in --owner is opened by root,
+ * from that node down, through the gate. Only the walk and the opens
+ * change identity; the copying runs as root, on descriptors already held.
+ */
+typedef struct {
+	int		 other;		/* --as is not this process's account */
+	uid_t		 uid;
+	gid_t		 gid;
+	char		 name[256];
+	const owners_t	*owners;
+} reader_t;
+
+static int	g_as_reader;	/* 1 while the process holds --as's identity */
+static uid_t	g_self_uid;
+static gid_t	g_self_gid;
+static char	g_self_name[256];
+
+/* --as: an account by name or number, with its primary group. */
+static int
+parse_reader(const char *s, const owners_t *owners, reader_t *r)
+{
+	struct passwd *pw;
+	uid_t u;
+
+	memset(r, 0, sizeof(*r));
+	if (parse_user(s, &u) != 0 || (pw = getpwuid(u)) == NULL ||
+	    strlcpy(r->name, pw->pw_name, sizeof(r->name)) >= sizeof(r->name))
+		return (-1);
+	r->uid = u;
+	r->gid = pw->pw_gid;
+	r->owners = owners;
+	r->other = u != g_self_uid;
+	if (!r->other)
+		return (0);
+	pw = getpwuid(g_self_uid);
+	if (pw == NULL || strlcpy(g_self_name, pw->pw_name,
+	    sizeof(g_self_name)) >= sizeof(g_self_name))
+		return (-1);
+	return (0);
+}
+
+/* A node owned by another account the caller named is root's to open. */
+static int
+owned_by_other(const reader_t *r, uid_t u)
+{
+	int i;
+
+	if (u == r->uid)
+		return (0);
+	for (i = 0; i < r->owners->n; i++)
+		if (u == r->owners->v[i])
+			return (1);
+	return (0);
+}
+
+/*
+ * Groups, then group, then user; back in the reverse order. The real and
+ * saved ids stay root's, so the invoker's own processes cannot signal this
+ * one meanwhile. A failure either way ends the process before anything
+ * else is opened, read or written.
+ */
+static void
+become_reader(const reader_t *r)
+{
+	if (r == NULL || !r->other || g_as_reader)
+		return;
+	if (initgroups(r->name, (int)r->gid) != 0 || setegid(r->gid) != 0 ||
+	    seteuid(r->uid) != 0)
+		fatal("cannot take on the identity a copy reads as");
+	g_as_reader = 1;
+}
+
+static void
+become_self(void)
+{
+	if (!g_as_reader)
+		return;
+	if (seteuid(g_self_uid) != 0 || setegid(g_self_gid) != 0 ||
+	    initgroups(g_self_name, (int)g_self_gid) != 0)
+		fatal("cannot take back this process's own identity");
+	g_as_reader = 0;
+}
+
 /* ---- reaching a node by descriptor -------------------------------------- */
 
 /*
@@ -1517,17 +1646,27 @@ user_name(uid_t u, char *buf, size_t n)
  * path changed after it was resolved, and that is a refusal: -2, where any
  * other failure is -1. On success *leaf points into `buf`.
  * O_SEARCH: a walk needs to pass through each directory, never to read one.
+ *
+ * With a reader and *inr set, the walk runs as the reader until it meets a
+ * directory another account in --owner owns, and as this process from that
+ * one on; *inr says which it ended as. A folder the reader cannot enter is
+ * a refusal. The callers take back their own identity afterwards.
  */
 static int
-open_parent(const char *path, char *buf, size_t bufsz, const char **leaf)
+open_parent(const char *path, char *buf, size_t bufsz, const char **leaf,
+    const reader_t *r, int *inr)
 {
+	struct stat st, got;
 	char *p, *slash;
-	int fd, nfd, e;
+	int fd, nfd, e, reading, handed;
 
 	if (strlcpy(buf, path, bufsz) >= bufsz) {
 		errf("path too long: %s", path);
 		return (-1);
 	}
+	reading = r != NULL && *inr;
+	if (reading)
+		become_reader(r);
 	fd = open("/", O_SEARCH | O_CLOEXEC);
 	if (fd < 0) {
 		errf("cannot open /: %s", strerror(errno));
@@ -1545,24 +1684,56 @@ open_parent(const char *path, char *buf, size_t bufsz, const char **leaf)
 		}
 		if (slash == NULL)
 			break;
+		handed = 0;
+		if (reading) {
+			if (fstatat(fd, p, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+				e = errno;
+				close(fd);
+				goto failed;
+			}
+			if (owned_by_other(r, st.st_uid)) {
+				become_self();
+				reading = 0;
+				handed = 1;
+			}
+		}
 		nfd = openat(fd, p, O_SEARCH | O_NOFOLLOW | O_CLOEXEC);
 		e = errno;
 		close(fd);
-		if (nfd < 0) {
-			if (e == ELOOP || e == ENOTDIR) {
-				errf("refusing, a directory on the path is a "
-				    "symlink or not a directory: %s", path);
-				return (-2);
-			}
-			errf("cannot open a directory on the path (%s): %s",
-			    strerror(e), path);
-			return (-1);
+		if (nfd < 0)
+			goto failed;
+		/* Root opens from here on what the stat said another account
+		 * owns, so it must still be that node. */
+		if (handed && (fstat(nfd, &got) != 0 ||
+		    got.st_ino != st.st_ino || got.st_dev != st.st_dev ||
+		    got.st_uid != st.st_uid)) {
+			errf("refusing, a directory on the path changed while it "
+			    "was reached: %s", path);
+			close(nfd);
+			return (-2);
 		}
 		fd = nfd;
 		p = slash + 1;
 	}
+	if (r != NULL)
+		*inr = reading;
 	*leaf = p;
 	return (fd);
+
+failed:
+	if (e == ELOOP || e == ENOTDIR) {
+		errf("refusing, a directory on the path is a symlink or not a "
+		    "directory: %s", path);
+		return (-2);
+	}
+	if (reading && e == EACCES) {
+		errf("refusing, %s cannot enter a directory on the path: %s",
+		    r->name, path);
+		return (-2);
+	}
+	errf("cannot open a directory on the path (%s): %s", strerror(e),
+	    path);
+	return (-1);
 }
 
 /* A node held by descriptor, with what fstat said of that descriptor. */
@@ -1592,15 +1763,27 @@ kind_of(mode_t m)
  * a socket, a device -- is refused before it is opened. The descriptor is
  * authoritative from here, so its own fstat must agree with the entry's: a
  * swap between the two calls is refused, never followed.
+ *
+ * With a reader and *inr set, the stat and the open run as the reader,
+ * unless the stat finds the node another account in --owner owns: then
+ * this process opens it, and *inr goes to 0 for everything below it.
  */
 static int
-node_at(int pfd, const char *name, const char *path, node_t *n)
+node_at_as(int pfd, const char *name, const char *path, node_t *n,
+    const reader_t *r, int *inr)
 {
 	struct stat st0;
 	int flags = O_RDONLY | O_NONBLOCK | O_CLOEXEC;
+	int reading = r != NULL && *inr;
 
 	n->fd = -1;
+	if (reading)
+		become_reader(r);
 	if (fstatat(pfd, name, &st0, AT_SYMLINK_NOFOLLOW) != 0) {
+		if (reading && errno == EACCES) {
+			errf("refusing, %s cannot reach it: %s", r->name, path);
+			return (EX_HELPER_REFUSED);
+		}
 		errf("cannot stat (%s): %s", strerror(errno), path);
 		return (EX_HELPER_OPFAIL);
 	}
@@ -1610,12 +1793,21 @@ node_at(int pfd, const char *name, const char *path, node_t *n)
 		    kind_of(st0.st_mode), path);
 		return (EX_HELPER_REFUSED);
 	}
+	if (reading && owned_by_other(r, st0.st_uid)) {
+		become_self();
+		reading = 0;
+		*inr = 0;
+	}
 	flags |= S_ISDIR(st0.st_mode) ? (O_DIRECTORY | O_NOFOLLOW) : O_SYMLINK;
 	n->fd = openat(pfd, name, flags);
 	if (n->fd < 0) {
 		if (errno == ELOOP || errno == ENOTDIR) {
 			errf("refusing, it changed type between stat and "
 			    "open: %s", path);
+			return (EX_HELPER_REFUSED);
+		}
+		if (reading && errno == EACCES) {
+			errf("refusing, %s may not open it: %s", r->name, path);
 			return (EX_HELPER_REFUSED);
 		}
 		errf("cannot open (%s): %s", strerror(errno), path);
@@ -1628,13 +1820,20 @@ node_at(int pfd, const char *name, const char *path, node_t *n)
 		return (EX_HELPER_OPFAIL);
 	}
 	if ((n->st.st_mode & S_IFMT) != (st0.st_mode & S_IFMT) ||
-	    n->st.st_ino != st0.st_ino || n->st.st_dev != st0.st_dev) {
+	    n->st.st_ino != st0.st_ino || n->st.st_dev != st0.st_dev ||
+	    n->st.st_uid != st0.st_uid) {
 		errf("refusing, it changed between stat and open: %s", path);
 		close(n->fd);
 		n->fd = -1;
 		return (EX_HELPER_REFUSED);
 	}
 	return (EX_HELPER_OK);
+}
+
+static int
+node_at(int pfd, const char *name, const char *path, node_t *n)
+{
+	return (node_at_as(pfd, name, path, n, NULL, NULL));
 }
 
 /*
@@ -1700,7 +1899,8 @@ rel_join(const char *rel, const char *name)
  * LOCKED_HELPER_TEST_PAUSE=<verb>:<fifo> makes that verb wait, before it
  * opens anything, until a byte arrives on the fifo: the moment between
  * locked's plan and the helper's apply, held open so a test can plant a
- * node there deterministically. A test build also skips the root gate, so
+ * node there deterministically. seal-walk and unseal-walk hold the moment
+ * after the count pass instead. A test build also skips the root gate, so
  * the gates below can be exercised as an ordinary user, with that user's
  * own rights.
  */
@@ -1752,6 +1952,8 @@ typedef struct {
 	int		 has_mode;
 	mode_t		 mode;
 	int		 recursive;
+	size_t		 plan;		/* --count */
+	size_t		 seen;		/* nodes this pass has reached */
 	dev_t		 dev;
 	int		 topfd;
 	const char	*top;
@@ -1759,6 +1961,39 @@ typedef struct {
 	size_t		 jn;
 	size_t		 jcap;
 } tree_t;
+
+static const char *
+nodes_word(size_t n)
+{
+	return (n == 1 ? "node" : "nodes");
+}
+
+/*
+ * The count guard, in the passes that change nodes. No pass reaches more
+ * nodes than the plan names: a walk that strays below a node it was not
+ * asked to walk stops at the first node past the count, before that node
+ * is changed, and the roll back puts back what the pass already changed.
+ */
+static int
+visit(tree_t *t, const char *path)
+{
+	if (++t->seen <= t->plan)
+		return (EX_HELPER_OK);
+	errf("refusing, the plan names %zu %s and the walk reached more: %s",
+	    t->plan, nodes_word(t->plan), path);
+	return (EX_HELPER_REFUSED);
+}
+
+/* At the end of a pass: it reached exactly the plan's nodes. */
+static int
+count_matches(const tree_t *t, const char *reached)
+{
+	if (t->seen == t->plan)
+		return (EX_HELPER_OK);
+	errf("refusing, the plan names %zu %s and %s %zu: %s", t->plan,
+	    nodes_word(t->plan), reached, t->seen, t->top);
+	return (EX_HELPER_REFUSED);
+}
 
 static void
 journal_push(tree_t *t, const char *rel, const struct stat *st)
@@ -2005,6 +2240,8 @@ seal_walk(tree_t *t, const node_t *n, const char *path, const char *rel,
 {
 	int rc;
 
+	if ((rc = visit(t, path)) != EX_HELPER_OK)
+		return (rc);
 	if (depth > 0) {
 		/* A second name for a file this walk already sealed: it is
 		 * the lock account's now because of this run, not a plant. */
@@ -2031,6 +2268,8 @@ static int
 check_walk(tree_t *t, const node_t *n, const char *path, const char *rel,
     int depth)
 {
+	if (visit(t, path) != EX_HELPER_OK)
+		return (EX_HELPER_REFUSED);
 	if (depth > 0 && gate(n, path, t->owners, 0) != EX_HELPER_OK)
 		return (EX_HELPER_REFUSED);
 	if (!S_ISDIR(n->st.st_mode))
@@ -2058,6 +2297,8 @@ unseal_walk(tree_t *t, const node_t *n, const char *path, const char *rel,
 {
 	int rc;
 
+	if ((rc = visit(t, path)) != EX_HELPER_OK)
+		return (rc);
 	if (depth > 0) {
 		if ((!t->chown || (n->st.st_uid == t->uid &&
 		    n->st.st_gid == t->gid)) && (n->st.st_flags & t->flag) == 0)
@@ -2072,6 +2313,21 @@ unseal_walk(tree_t *t, const node_t *n, const char *path, const char *rel,
 			return (rc);
 	}
 	return (node_apply(t, n, path, rel, depth == 0));
+}
+
+/*
+ * The read-only first pass: every node the verb would reach, counted and
+ * left as it is. A count other than the plan's refuses before the first
+ * change, naming the number found.
+ */
+static int
+count_walk(tree_t *t, const node_t *n, const char *path, const char *rel,
+    int depth)
+{
+	t->seen++;
+	if (!S_ISDIR(n->st.st_mode) || !t->recursive)
+		return (EX_HELPER_OK);
+	return (walk_children(t, n, path, rel, depth, count_walk));
 }
 
 /* ---- verb: rm ----------------------------------------------------------- */
@@ -2624,12 +2880,77 @@ cleanup:
 
 /* ---- verb: copy --------------------------------------------------------- */
 
+/*
+ * The source of copy and xattrs-from: a regular file, reached from "/" as
+ * --as wherever --as owns the path (open_parent, node_at_as), pinned by
+ * identity and gated by owner on the descriptor it returns in *sfd. Back in
+ * this process's own identity on return, whatever the outcome.
+ */
+static int
+open_source(const opts_t *o, const reader_t *r, const owners_t *owners,
+    const nodeid_t *sid, int *sfd, struct stat *st)
+{
+	char buf[PATH_MAX];
+	const char *leaf;
+	node_t n;
+	int pfd, inr = 1, rc;
+
+	*sfd = -1;
+	pfd = open_parent(o->src, buf, sizeof(buf), &leaf, r, &inr);
+	if (pfd < 0) {
+		become_self();
+		return (pfd == -2 ? EX_HELPER_REFUSED : EX_HELPER_OPFAIL);
+	}
+	rc = node_at_as(pfd, leaf, o->src, &n, r, &inr);
+	become_self();
+	close(pfd);
+	if (rc != EX_HELPER_OK)
+		return (rc);
+	*st = n.st;
+	if (!S_ISREG(st->st_mode)) {
+		errf("%s is not a regular file", o->src);
+		close(n.fd);
+		return (EX_HELPER_OPFAIL);
+	}
+	if (check_id("source", o->src, sid, st, at_fd(n.fd)) != 0) {
+		close(n.fd);
+		return (EX_HELPER_IDENT);
+	}
+	/* Root reads only what the owner gate lets through: a file the
+	 * invoker owns, or one sealed for them -- never a second name the
+	 * invoker planted for somebody else's file. */
+	if (gate_owner(st, o->src, owners) != EX_HELPER_OK) {
+		close(n.fd);
+		return (EX_HELPER_REFUSED);
+	}
+	*sfd = n.fd;
+	return (EX_HELPER_OK);
+}
+
+/* --owner and --as, shared by the copy verbs. */
+static int
+parse_source(const opts_t *o, owners_t *owners, reader_t *r)
+{
+	if (need(o->owner, "--owner") != 0 || need(o->as, "--as") != 0)
+		return (-1);
+	if (parse_owners(o->owner, owners) != 0) {
+		errf("--owner is not a list of accounts");
+		return (-1);
+	}
+	if (parse_reader(o->as, owners, r) != 0) {
+		errf("--as is not an account");
+		return (-1);
+	}
+	return (0);
+}
+
 static int
 cmd_copy(int argc, char **argv)
 {
 	opts_t o;
 	nodeid_t sid;
 	owners_t owners;
+	reader_t r;
 	struct stat st;
 	int sfd = -1, dfd = -1, status = EX_HELPER_OK;
 
@@ -2637,41 +2958,13 @@ cmd_copy(int argc, char **argv)
 		return (EX_HELPER_USAGE);
 	if (need_abs(o.src, "--src") != 0 || need_abs(o.dest, "--dest") != 0 ||
 	    parse_ids(o.src_id, &sid, "--src-id") != 0 ||
-	    need(o.owner, "--owner") != 0)
+	    parse_source(&o, &owners, &r) != 0)
 		return (EX_HELPER_USAGE);
-	if (parse_owners(o.owner, &owners) != 0) {
-		errf("--owner is not a list of accounts");
-		return (EX_HELPER_USAGE);
-	}
 	TEST_PAUSE("copy");
 
-	sfd = open(o.src, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
-	if (sfd < 0) {
-		errf("cannot open %s: %s", o.src, strerror(errno));
-		status = EX_HELPER_OPFAIL;
+	status = open_source(&o, &r, &owners, &sid, &sfd, &st);
+	if (status != EX_HELPER_OK)
 		goto cleanup;
-	}
-	if (fstat(sfd, &st) != 0) {
-		errf("cannot stat %s: %s", o.src, strerror(errno));
-		status = EX_HELPER_OPFAIL;
-		goto cleanup;
-	}
-	if (check_id("source", o.src, &sid, &st, at_fd(sfd)) != 0) {
-		status = EX_HELPER_IDENT;
-		goto cleanup;
-	}
-	if (!S_ISREG(st.st_mode)) {
-		errf("%s is not a regular file", o.src);
-		status = EX_HELPER_OPFAIL;
-		goto cleanup;
-	}
-	/* Root reads only what the owner gate lets through: a file the
-	 * invoker owns, or one sealed for them -- never a second name the
-	 * invoker planted for somebody else's file. */
-	if (gate_owner(&st, o.src, &owners) != EX_HELPER_OK) {
-		status = EX_HELPER_REFUSED;
-		goto cleanup;
-	}
 	/* The read from here on is from the verified fd, so a swap of the
 	 * source name after this point copies nothing: this closes the logged
 	 * source-side TOCTOU residual. */
@@ -2738,6 +3031,7 @@ cmd_xattrs_from(int argc, char **argv)
 	opts_t o;
 	nodeid_t sid;
 	owners_t owners;
+	reader_t r;
 	struct stat st;
 	int sfd = -1, dfd = -1, status = EX_HELPER_OK;
 
@@ -2745,38 +3039,14 @@ cmd_xattrs_from(int argc, char **argv)
 		return (EX_HELPER_USAGE);
 	if (need_abs(o.src, "--src") != 0 || need_abs(o.dest, "--dest") != 0 ||
 	    parse_ids(o.src_id, &sid, "--src-id") != 0 ||
-	    need(o.owner, "--owner") != 0)
+	    parse_source(&o, &owners, &r) != 0)
 		return (EX_HELPER_USAGE);
-	if (parse_owners(o.owner, &owners) != 0) {
-		errf("--owner is not a list of accounts");
-		return (EX_HELPER_USAGE);
-	}
 
-	sfd = open(o.src, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
-	if (sfd < 0) {
-		errf("cannot open %s: %s", o.src, strerror(errno));
-		status = EX_HELPER_OPFAIL;
+	/* Attributes are read like bytes: as --as where it owns the path,
+	 * and only through the owner gate. */
+	status = open_source(&o, &r, &owners, &sid, &sfd, &st);
+	if (status != EX_HELPER_OK)
 		goto cleanup;
-	}
-	if (fstat(sfd, &st) != 0) {
-		errf("cannot stat %s: %s", o.src, strerror(errno));
-		status = EX_HELPER_OPFAIL;
-		goto cleanup;
-	}
-	if (check_id("source", o.src, &sid, &st, at_fd(sfd)) != 0) {
-		status = EX_HELPER_IDENT;
-		goto cleanup;
-	}
-	if (!S_ISREG(st.st_mode)) {
-		errf("%s is not a regular file", o.src);
-		status = EX_HELPER_OPFAIL;
-		goto cleanup;
-	}
-	/* Attributes are read like bytes: only through the owner gate. */
-	if (gate_owner(&st, o.src, &owners) != EX_HELPER_OK) {
-		status = EX_HELPER_REFUSED;
-		goto cleanup;
-	}
 
 	dfd = open(o.dest, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
 	if (dfd < 0) {
@@ -2848,6 +3118,11 @@ block_signals(void)
  * before reading it and gates every node, changing nothing else, so a
  * refusal finds the tree as it was; the second hands the nodes back, bottom
  * up.
+ *
+ * Before either verb changes anything, a read-only pass counts the nodes it
+ * would reach: --count's 1 for a single node, the whole tree with
+ * --recursive. Any other number refuses, and every pass after it is held
+ * to the same count (visit).
  */
 static int
 cmd_tree(int argc, char **argv, int sealing)
@@ -2865,11 +3140,20 @@ cmd_tree(int argc, char **argv, int sealing)
 		return (EX_HELPER_USAGE);
 	if (need_abs(o.path, "--path") != 0 ||
 	    parse_ids(o.id, &want, "--id") != 0 ||
-	    need(o.owner, "--owner") != 0 || need(o.flag, "--flag") != 0)
+	    need(o.owner, "--owner") != 0 || need(o.flag, "--flag") != 0 ||
+	    need(o.count, "--count") != 0)
 		return (EX_HELPER_USAGE);
 	memset(&t, 0, sizeof(t));
 	if (parse_owners(o.owner, &owners) != 0) {
 		errf("--owner is not a list of accounts");
+		return (EX_HELPER_USAGE);
+	}
+	if (parse_count(o.count, &t.plan) != 0) {
+		errf("--count must be a number of nodes, 1 or more");
+		return (EX_HELPER_USAGE);
+	}
+	if (!o.recursive && t.plan != 1) {
+		errf("--count must be 1 without --recursive");
 		return (EX_HELPER_USAGE);
 	}
 	if (parse_flag(o.flag, &t.flag) != 0) {
@@ -2912,7 +3196,7 @@ cmd_tree(int argc, char **argv, int sealing)
 	TEST_PAUSE(sealing ? "seal" : "unseal");
 	block_signals();
 
-	pfd = open_parent(o.path, buf, sizeof(buf), &leaf);
+	pfd = open_parent(o.path, buf, sizeof(buf), &leaf, NULL, NULL);
 	if (pfd < 0)
 		return (pfd == -2 ? EX_HELPER_REFUSED : EX_HELPER_OPFAIL);
 	rc = node_at(pfd, leaf, o.path, &top);
@@ -2943,15 +3227,33 @@ cmd_tree(int argc, char **argv, int sealing)
 	t.dev = top.st.st_dev;
 	t.topfd = top.fd;
 
+	rc = count_walk(&t, &top, o.path, "", 0);
+	if (rc == EX_HELPER_OK)
+		rc = count_matches(&t, "the tree holds");
+	if (rc != EX_HELPER_OK) {
+		close(top.fd);
+		return (rc);
+	}
+	/* The moment between the count and the first change, held open in a
+	 * test build so a test can plant a node the count did not see. */
+	TEST_PAUSE(sealing ? "seal-walk" : "unseal-walk");
+
+	t.seen = 0;
 	if (sealing) {
 		rc = seal_walk(&t, &top, o.path, "", 0);
+		if (rc == EX_HELPER_OK)
+			rc = count_matches(&t, "the seal reached");
 	} else {
 		/* Only a tree has a first pass. A single node (a file, a link,
 		 * or a directory such as a chain anchor whose entries are not
 		 * part of the seal) was gated above, and nothing below it is
 		 * read, gated or frozen. */
-		if (t.recursive)
+		if (t.recursive) {
 			rc = check_walk(&t, &top, o.path, "", 0);
+			if (rc == EX_HELPER_OK)
+				rc = count_matches(&t, "the first pass reached");
+			t.seen = 0;
+		}
 		/* The first pass may have frozen the top; the second reads
 		 * its flag word as it now is. */
 		if (t.recursive && rc == EX_HELPER_OK &&
@@ -2961,6 +3263,8 @@ cmd_tree(int argc, char **argv, int sealing)
 		}
 		if (rc == EX_HELPER_OK)
 			rc = unseal_walk(&t, &top, o.path, "", 0);
+		if (rc == EX_HELPER_OK)
+			rc = count_matches(&t, "the unseal reached");
 	}
 	if (rc != EX_HELPER_OK && rollback(&t) != 0)
 		rc = EX_HELPER_WINOPEN;
@@ -2973,13 +3277,14 @@ cmd_tree(int argc, char **argv, int sealing)
 
 typedef struct {
 	const owners_t	*owners;
+	const reader_t	*reader;
 	uid_t		 uid;
 	gid_t		 gid;
 	dev_t		 dev;
 	const char	*top;
 } ctree_t;
 
-static int copy_dir(ctree_t *, int, const char *, int, int);
+static int copy_dir(ctree_t *, int, const char *, int, int, int);
 
 /*
  * A link's text is read by name: macOS refuses read(2) on a link's own
@@ -3015,20 +3320,22 @@ copy_link(const ctree_t *c, int sfd, const char *name, const char *path,
 }
 
 /*
- * One entry: gated like a seal's, then copied from its own descriptor.
- * Permission bits travel without the set-user-id, set-group-id and sticky
- * bits; the owner is --chown's; data, extended attributes and ACLs travel
- * for a file. Flags never do.
+ * One entry: opened as --as while `inr` holds (node_at_as), gated like a
+ * seal's, then copied from its own descriptor, as this process. Permission
+ * bits travel without the set-user-id, set-group-id and sticky bits; the
+ * owner is --chown's; data, extended attributes and ACLs travel for a
+ * file. Flags never do.
  */
 static int
 copy_entry(ctree_t *c, int sfd, const char *spath, int dfd, const char *name,
-    int depth)
+    int depth, int inr)
 {
 	char *path = join_path(spath, name);
 	node_t n;
 	int rc, ofd = -1;
 
-	rc = node_at(sfd, name, path, &n);
+	rc = node_at_as(sfd, name, path, &n, c->reader, &inr);
+	become_self();
 	if (rc == EX_HELPER_OK && n.st.st_dev != c->dev) {
 		errf("refusing, a mount point inside the tree: %s", path);
 		rc = EX_HELPER_REFUSED;
@@ -3046,7 +3353,7 @@ copy_entry(ctree_t *c, int sfd, const char *spath, int dfd, const char *name,
 			rc = EX_HELPER_OPFAIL;
 			goto out;
 		}
-		rc = copy_dir(c, n.fd, path, ofd, depth + 1);
+		rc = copy_dir(c, n.fd, path, ofd, depth + 1, inr);
 	} else if (S_ISREG(n.st.st_mode)) {
 		ofd = openat(dfd, name, O_WRONLY | O_CREAT | O_EXCL |
 		    O_NOFOLLOW | O_CLOEXEC, 0600);
@@ -3076,7 +3383,7 @@ out:
 }
 
 static int
-copy_dir(ctree_t *c, int sfd, const char *spath, int dfd, int depth)
+copy_dir(ctree_t *c, int sfd, const char *spath, int dfd, int depth, int inr)
 {
 	elist_t names;
 	size_t i;
@@ -3090,7 +3397,8 @@ copy_dir(ctree_t *c, int sfd, const char *spath, int dfd, int depth)
 	if (snapshot(sfd, spath, &names) != 0)
 		return (EX_HELPER_OPFAIL);
 	for (i = 0; i < names.n && rc == EX_HELPER_OK; i++)
-		rc = copy_entry(c, sfd, spath, dfd, names.v[i].name, depth);
+		rc = copy_entry(c, sfd, spath, dfd, names.v[i].name, depth,
+		    inr);
 	elist_free(&names);
 	return (rc);
 }
@@ -3113,36 +3421,38 @@ cmd_copy_tree(int argc, char **argv)
 	opts_t o;
 	nodeid_t sid;
 	owners_t owners;
+	reader_t r;
 	ctree_t c;
 	node_t top;
 	char buf[PATH_MAX];
 	const char *leaf;
-	int pfd, dfd = -1, rc;
+	int pfd, dfd = -1, inr = 1, rc;
 
 	if (parse_opts(argc, argv, &o) != 0)
 		return (EX_HELPER_USAGE);
 	if (need_abs(o.src, "--src") != 0 || need_abs(o.dest, "--dest") != 0 ||
 	    parse_ids(o.src_id, &sid, "--src-id") != 0 ||
-	    need(o.owner, "--owner") != 0 || need(o.chown, "--chown") != 0)
+	    need(o.chown, "--chown") != 0 ||
+	    parse_source(&o, &owners, &r) != 0)
 		return (EX_HELPER_USAGE);
 	memset(&c, 0, sizeof(c));
-	if (parse_owners(o.owner, &owners) != 0) {
-		errf("--owner is not a list of accounts");
-		return (EX_HELPER_USAGE);
-	}
 	if (parse_chown(o.chown, &c.uid, &c.gid) != 0) {
 		errf("--chown must be <user>:<group>");
 		return (EX_HELPER_USAGE);
 	}
 	c.owners = &owners;
+	c.reader = &r;
 	c.top = o.src;
 
 	TEST_PAUSE("copy-tree");
 
-	pfd = open_parent(o.src, buf, sizeof(buf), &leaf);
-	if (pfd < 0)
+	pfd = open_parent(o.src, buf, sizeof(buf), &leaf, &r, &inr);
+	if (pfd < 0) {
+		become_self();
 		return (pfd == -2 ? EX_HELPER_REFUSED : EX_HELPER_OPFAIL);
-	rc = node_at(pfd, leaf, o.src, &top);
+	}
+	rc = node_at_as(pfd, leaf, o.src, &top, &r, &inr);
+	become_self();
 	close(pfd);
 	if (rc != EX_HELPER_OK)
 		return (rc);
@@ -3168,7 +3478,7 @@ cmd_copy_tree(int argc, char **argv)
 		close(top.fd);
 		return (EX_HELPER_OPFAIL);
 	}
-	rc = copy_dir(&c, top.fd, o.src, dfd, 0);
+	rc = copy_dir(&c, top.fd, o.src, dfd, 0, inr);
 	if (rc == EX_HELPER_OK && (fchown(dfd, c.uid, c.gid) != 0 ||
 	    fchmod(dfd, top.st.st_mode & 0777) != 0)) {
 		errf("cannot set the owner and mode of the copy (%s): %s",
@@ -3228,6 +3538,10 @@ main(int argc, char **argv)
 	/* O_CREAT modes below are exact; an inherited umask must not narrow
 	 * them further or widen anything this process creates. */
 	umask(077);
+
+	/* What become_self() goes back to after a copy read as --as. */
+	g_self_uid = geteuid();
+	g_self_gid = getegid();
 
 	/* A closed stdout must fail a write, not kill the process while a seal
 	 * is lifted. */

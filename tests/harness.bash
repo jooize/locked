@@ -229,7 +229,87 @@ EOS
 }
 new_scratch
 
+# ---- the home guard --------------------------------------------------------
+#
+# locked must never change a node it was not asked about. Every locked run
+# in a job goes through guarded: it records each node of the home the run
+# acts in -- type, owner, group, mode, flags, inode, size and change time,
+# so any write, chown, chmod, chflags, xattr or ACL change shows -- except
+# the run's targets, what is below them and the folders above them (a
+# seal anchors its chain), before and after the run. Its targets are the
+# words of its command line that name a path in that home. Any difference
+# fails a point of its own, written to the job's log on fd 9 (the run
+# itself is usually inside an ok/deny capture), with the nodes that
+# changed. A run with no target in the home may change nothing in it.
+# A run whose plan also releases a folder elsewhere (one no protected file
+# needs any more) is told so by its case: GUARD_RELEASE names that folder.
+guard_snap() { # <home> <out> <target>...: the guarded nodes, one line each
+  local home="$1" out="$2" p t keep i
+  shift 2
+  local -a names=() attrs=()
+  while IFS= read -r -d '' p; do
+    keep=1
+    for t in "$@"; do
+      case "$p" in "$t" | "$t"/*) keep=0; break ;; esac
+      case "$t" in "$p"/*) keep=0; break ;; esac
+    done
+    if [ "$keep" -eq 1 ]; then names+=("$p"); fi
+  done < <(/usr/bin/find "$home" -print0 2>/dev/null)
+  : >"$out"
+  [ "${#names[@]}" -gt 0 ] || return 0
+  # One stat for all of them; its lines carry no name, so a node gone in
+  # between (fewer lines) falls back to one stat per node.
+  while IFS= read -r p; do attrs+=("$p"); done < <(/usr/bin/stat \
+    -f '%HT %u %g %p %f %i %z %Fc' -- "${names[@]}" 2>/dev/null || true)
+  if [ "${#attrs[@]}" -ne "${#names[@]}" ]; then
+    attrs=()
+    for p in "${names[@]}"; do
+      attrs+=("$(/usr/bin/stat -f '%HT %u %g %p %f %i %z %Fc' -- "$p" 2>/dev/null || echo gone)")
+    done
+  fi
+  i=0
+  while [ "$i" -lt "${#names[@]}" ]; do
+    printf '%s %q\n' "${attrs[$i]}" "${names[$i]#"$home"}" >>"$out"
+    i=$((i + 1))
+  done
+}
+guarded() { # <home> <cmd...>: run <cmd>, held to the home guard; its exit
+  local home="$1" w rc=0 b a d desc
+  shift
+  if [ "$TAP_WORKER" -ne 1 ] || [ ! -d "$home" ]; then
+    "$@" || rc=$?
+    return "$rc"
+  fi
+  local -a targets=()
+  for w in "$@"; do
+    case "$w" in "$home" | "$home"/*) targets+=("${w%/}") ;; esac
+  done
+  if [ -n "${GUARD_RELEASE:-}" ]; then targets+=("$GUARD_RELEASE"); fi
+  b="$(mktemp "$SCRATCH/guard.XXXXXX")"
+  a="$(mktemp "$SCRATCH/guard.XXXXXX")"
+  guard_snap "$home" "$b" ${targets[@]+"${targets[@]}"}
+  "$@" || rc=$?
+  guard_snap "$home" "$a" ${targets[@]+"${targets[@]}"}
+  desc="home guard: locked"
+  for w in "$@"; do
+    case "$w" in
+      lock | unlock | unprotect | edit | revert | rm | trash | mv | rekey | verify | status | list | setup)
+        desc="$desc $w"; break ;;
+    esac
+  done
+  for w in ${targets[@]+"${targets[@]}"}; do desc="$desc ${w#"$home"/}"; done
+  if d="$(/usr/bin/diff "$b" "$a")"; then
+    tap_pass "$desc changed nothing else" >&9
+  else
+    { tap_fail "$desc changed a node it was not asked about"
+      printf '%s\n' "$d" | tap_detail '  | '; } >&9
+  fi
+  rm -f -- "$b" "$a"
+  return "$rc"
+}
+
 locked() {
+  guarded "$FAKE_HOME" \
   env LOCKED_STATE_ROOT="$STATEROOT" \
       INSTALL_TARGET="$SCRATCH/not-installed" \
       LOCKED_HELPER="$HELPER" \
@@ -248,6 +328,7 @@ as_user() {
 # on <fifo> before it opens anything. Same env as locked() otherwise.
 locked_th() { # <pause spec> <args...>
   local pause="$1"; shift
+  guarded "$FAKE_HOME" \
   env LOCKED_STATE_ROOT="$STATEROOT" \
       INSTALL_TARGET="$SCRATCH/not-installed" \
       LOCKED_HELPER="$HELPER_TEST" \
@@ -325,6 +406,7 @@ locked_notty() {
 state_for_home() { printf '%s/states/%s' "$SCRATCH" "$(basename "$(dirname "$1")")"; }
 locked_home() { # <home> <args...>: locked with a different LOCKED_USER_HOME
   local h="$1"; shift
+  guarded "$h" \
   env LOCKED_STATE_ROOT="$(state_for_home "$h")" \
       INSTALL_TARGET="$SCRATCH/not-installed" \
       LOCKED_HELPER="$HELPER" \
@@ -1768,6 +1850,7 @@ locked_as() { # <user> <args...>: run locked unprivileged AS <user>.
   # variables. SUDO_USER is deliberately not passed: sudo sets it to root here, and the
   # non-root branch must ignore it and derive the invoker from the real uid.
   local u="$1"; shift
+  guarded "$FAKE_HOME" \
   sudo -u "$u" /usr/bin/env \
       LOCKED_STATE_ROOT="$STATEROOT" \
       INSTALL_TARGET="$SCRATCH/not-installed" \
@@ -1852,6 +1935,7 @@ chmod 755 "$ANC"
 
 locked_it() { # <install_target> <args...>: locked with a specific INSTALL_TARGET
   local it="$1"; shift
+  guarded "$FAKE_HOME" \
   env LOCKED_STATE_ROOT="$STATEROOT" \
       INSTALL_TARGET="$it" \
       LOCKED_HELPER="$HELPER" \
@@ -2216,6 +2300,7 @@ mkfake() { # <name> <sh line>...: install a stand-in helper, print its path
 }
 locked_fake() { # <helper> <args...>: locked with a stand-in LOCKED_HELPER
   local h="$1"; shift
+  guarded "$FAKE_HOME" \
   env LOCKED_STATE_ROOT="$STATEROOT" \
       INSTALL_TARGET="$SCRATCH/not-installed" \
       LOCKED_HELPER="$h" \
@@ -2948,7 +3033,7 @@ check "the unneeded dir is still sealed"       "uappnd" "$(flags_of "$ORD")"
 locked_home "$LPHOME" status >"$LPOUT" 2>&1 || true
 ok   "the pool listing notes it"               grep -qF "no protected file needs these any more:" "$LPOUT"
 ok   "by name"                                 grep -qF "      $ORD" "$LPOUT"
-locked_home "$LPHOME" lock --yes "$SH1" >"$LPOUT" 2>&1 || true
+GUARD_RELEASE="$ORD" locked_home "$LPHOME" lock --yes "$SH1" >"$LPOUT" 2>&1 || true
 ok   "an unrelated lock plans the release"     grep -q "^  release  *unused  $ORD\$" "$LPOUT"
 ok   "and applies it"                          grep -qxF "✓ released: $ORD" "$LPOUT"
 check "back to the invoker's identity"         "back to 777 $INV:staff" \
@@ -3003,6 +3088,7 @@ ok   "a move without --yes still moves"        test -f "$MFD/in/m.txt"
 ok   "and says the new chain is not settled"   grep -qF "the chain at its new place is not settled" "$LPOUT"
 ok   "with the command that settles it"        grep -qF "sudo locked lock $MFD/in/m.txt" "$LPOUT"
 check "the declined plan sealed nothing"       "" "$(flags_of "$MFD")"
+GUARD_RELEASE="$MTD" \
 ok   "the command does settle it"              locked_home "$LPHOME" lock --yes "$MFD/in/m.txt"
 check "the new grandparent is sealed"          "uappnd" "$(flags_of "$MFD")"
 check "the old one released"                   "" "$(flags_of "$MTD")"
@@ -3064,7 +3150,7 @@ locked_home "$LPHOME" lock --yes "$ZRC" >"$LPOUT" 2>&1 || true
 ok   "a plan says why it releases nothing"     grep -qF "no directory is released this run; this record has no role: $SH1" "$LPOUT"
 check "the unneeded dir stays sealed"          "uappnd" "$(flags_of "$ORD2")"
 printf 'role=leaf\n' >>"$SH1M"
-locked_home "$LPHOME" lock --yes "$ZRC" >"$LPOUT" 2>&1 || true
+GUARD_RELEASE="$ORD2" locked_home "$LPHOME" lock --yes "$ZRC" >"$LPOUT" 2>&1 || true
 ok   "with the role back, the plan releases it" grep -qF "✓ released: $ORD2" "$LPOUT"
 check "and the dir carries no flag"            "" "$(flags_of "$ORD2")"
 ok   "verify clean again"                      locked_home "$LPHOME" verify --quiet
@@ -3311,6 +3397,7 @@ note "conversion: legacy pools move into the new layout"
 CONV_STATE="$SCRATCH/conv-state"
 CONV_LEGACY="$SCRATCH/conv-legacy"
 locked_conv() { # <args...>: a root run as launchd makes it, no invoker
+  guarded "$FAKE_HOME" \
   env LOCKED_STATE_ROOT="$CONV_STATE" \
       LOCKED_LEGACY_ROOT="$CONV_LEGACY" \
       INSTALL_TARGET="$SCRATCH/not-installed" \
@@ -3445,7 +3532,7 @@ if as_user ln "$ROOTF" "$LINKD/sudoers-ish" 2>/dev/null; then
          locked lock --yes "$LINKD/sudoers-ish"
   check "the root file keeps its owner"          "root" "$(owner_of "$ROOTF")"
   check "and carries no flag"                    "" "$(flags_of "$ROOTF")"
-  deny  "no record was written for the link"     test -e "$(pool_meta "$LINKD/sudoers-ish")"
+  deny  "no record was written for the link"     test -e "$(meta_path "$LINKD/sudoers-ish")"
   as_user rm -f -- "$LINKD/sudoers-ish"
 else
   tap_skip "a hard link to a root file is refused" "the user may not hard-link here"
@@ -3477,37 +3564,102 @@ as_user rm -f -- "$FIT/pipe"
 
 note "owner gate: a node planted between plan and apply"
 # plan_node reads the tree and finds it all yours; then, in the window
-# before the helper seals it, a root-owned node appears deep inside. The
-# helper hands each directory over and freezes it before reading its
+# before the helper seals it, a root-owned node appears deep inside. Held
+# before the helper opens anything, the plant is met by its read-only count
+# pass: the tree holds one node more than the plan, so it refuses (exit 7)
+# before any change. Held after the count, the plant is met by the seal
+# itself: it hands each directory over and freezes it before reading its
 # entries, so the plant is on the final listing and meets the gate like any
-# other node. It refuses (exit 7) and rolls back every freeze it made, so
-# the tree is left exactly as the plan found it.
-RT="$OG/race-tree"
-install -d -o "$INV" -g staff -m 755 "$RT" "$RT/a" "$RT/a/b"
-as_user /bin/sh -c "echo one > '$RT/one.txt'; echo two > '$RT/a/two.txt'; echo three > '$RT/a/b/three.txt'"
-FIFO="$SCRATCH/s9-pause"
-as_user mkfifo "$FIFO" 2>/dev/null || mkfifo "$FIFO"
-RROUT="$SCRATCH/race-out.txt"
-RRC=0
-locked_th "seal:$FIFO" lock --yes "$RT" >"$RROUT" 2>&1 &
-RPID=$!
-# Opening the write end unblocks only once the helper has reached the pause
-# -- which is after it took the snapshot, so the plant lands in the seal
-# window exactly. Then plant, release, and let it finish.
-if exec 3>"$FIFO"; then
-  install -o root -g wheel -m 644 "$ROOTF" "$RT/a/b/planted.txt"
-  printf 'x' >&3
-  exec 3>&-
-fi
-wait "$RPID" || RRC=$?
-check "the planted lock exits 3 (a failed item)" "3" "$RRC"
-ok   "the helper refused the planted node"     \
-     grep -qE "not owned by you|not one locked may act on" "$RROUT"
-check "no node in the tree is frozen"          "" "$(find "$RT" -flags +uchg -print 2>/dev/null)"
-check "the top is still yours"                 "$INV" "$(owner_of "$RT")"
-check "a frozen directory was rolled back"     "$INV" "$(owner_of "$RT/a/b")"
-check "the planted node is still root's"       "root" "$(owner_of "$RT/a/b/planted.txt")"
-rm -f -- "$FIFO"
+# other node, and every freeze is rolled back. Either way the tree is left
+# exactly as the plan found it.
+race_case() { # <pause verb> <needle>
+  RT="$OG/race-tree-$1"
+  install -d -o "$INV" -g staff -m 755 "$RT" "$RT/a" "$RT/a/b"
+  as_user /bin/sh -c "echo one > '$RT/one.txt'; echo two > '$RT/a/two.txt'; echo three > '$RT/a/b/three.txt'"
+  FIFO="$SCRATCH/s9-pause"
+  as_user mkfifo "$FIFO" 2>/dev/null || mkfifo "$FIFO"
+  RROUT="$SCRATCH/race-out.txt"
+  RRC=0
+  locked_th "$1:$FIFO" lock --yes "$RT" >"$RROUT" 2>&1 &
+  RPID=$!
+  # Opening the write end unblocks only once the helper has reached the
+  # pause, so the plant lands in that moment exactly. Then plant, release,
+  # and let it finish.
+  if exec 3>"$FIFO"; then
+    install -o root -g wheel -m 644 "$ROOTF" "$RT/a/b/planted.txt"
+    printf 'x' >&3
+    exec 3>&-
+  fi
+  wait "$RPID" || RRC=$?
+  check "$1: the planted lock exits 3 (a failed item)" "3" "$RRC"
+  ok   "$1: the helper refused the planted node"   grep -qF -e "$2" "$RROUT"
+  check "$1: no node in the tree is frozen"        "" "$(find "$RT" -flags +uchg -print 2>/dev/null)"
+  check "$1: the top is still yours"               "$INV" "$(owner_of "$RT")"
+  check "$1: a frozen directory was rolled back"   "$INV" "$(owner_of "$RT/a/b")"
+  check "$1: the planted node is still root's"     "root" "$(owner_of "$RT/a/b/planted.txt")"
+  rm -f -- "$FIFO"
+}
+race_case seal "the plan names 6 nodes and the tree holds 7"
+race_case seal-walk "owned by root and not by $INV"
+
+note "reading as you: the copy verbs"
+# Root reads a source only through the owner gate, and walks to it as you:
+# the kernel checks every folder on the way, and the file's own bits when
+# it is yours. A node the lock account owns is opened by root, from that
+# node down, since the lock account cannot enter your home. Each case has
+# its control: the same copy as root alone, which the gate would let
+# through.
+RA="$OG/read-as"
+install -d -o "$INV" -g staff -m 755 "$RA"
+RADEST="$SCRATCH/read-as-dest"
+install -d -o root -g wheel -m 700 "$RADEST"
+ra_copy() { # <as> <owners> <src> <dest name>
+  "$HELPER" copy --src "$3" --src-id - --owner "$2" --as "$1" --dest "$RADEST/$4"
+}
+install -d -o root -g wheel -m 700 "$RA/closed"
+as_user /bin/sh -c "echo mine > '$RA/mine.txt'"
+mv -- "$RA/mine.txt" "$RA/closed/mine.txt"
+refuse "a file of yours in a folder closed to you is refused" \
+       "$INV cannot enter a directory on the path" \
+       ra_copy "$INV" "$INV" "$RA/closed/mine.txt" c1
+ok    "control: root alone would read it"      ra_copy root "$INV" "$RA/closed/mine.txt" c2
+as_user /bin/sh -c "echo mine > '$RA/unreadable.txt'; chmod 000 '$RA/unreadable.txt'"
+refuse "a file of yours you may not read is refused" "$INV may not open it" \
+       ra_copy "$INV" "$INV" "$RA/unreadable.txt" c3
+ok    "control: root alone would read it"      ra_copy root "$INV" "$RA/unreadable.txt" c4
+install -d -o "$INV" -g staff -m 700 "$RA/private"
+install -o "$LOCK_ACCT" -g "$LOCK_ACCT" -m 600 /dev/null "$RA/private/sealed.txt"
+printf 'sealed bytes\n' >"$RA/private/sealed.txt"
+ok    "a sealed file in your own folder is read" \
+      ra_copy "$INV" "$LOCK_ACCT" "$RA/private/sealed.txt" c5
+check "with its content"                       "sealed bytes" "$(cat "$RADEST/c5")"
+check "into root's own staging file"           "root" "$(owner_of "$RADEST/c5")"
+install -d -o "$LOCK_ACCT" -g "$LOCK_ACCT" -m 700 "$RA/sealed-dir"
+install -o "$LOCK_ACCT" -g "$LOCK_ACCT" -m 600 "$RA/private/sealed.txt" "$RA/sealed-dir/inner.txt"
+ok    "a sealed file in a sealed folder is read" \
+      ra_copy "$INV" "$LOCK_ACCT" "$RA/sealed-dir/inner.txt" c6
+ok    "and the sealed folder as a tree"        \
+      "$HELPER" copy-tree --src "$RA/sealed-dir" --src-id - --owner "$LOCK_ACCT" \
+      --as "$INV" --dest "$RADEST/t1" --chown root:wheel
+install -d -o "$INV" -g staff -m 755 "$RA/tree" "$RA/tree/closed"
+as_user /bin/sh -c "echo a > '$RA/tree/a.txt'; echo b > '$RA/tree/closed/b.txt'; chmod 000 '$RA/tree/closed'"
+refuse "a tree of yours with a folder you may not read is refused" "$INV may not open it" \
+       "$HELPER" copy-tree --src "$RA/tree" --src-id - --owner "$INV" --as "$INV" \
+       --dest "$RADEST/t2" --chown root:wheel
+ok    "control: root alone would read it"      \
+      "$HELPER" copy-tree --src "$RA/tree" --src-id - --owner "$INV" --as root \
+      --dest "$RADEST/t3" --chown root:wheel
+refuse "a closed folder refuses through locked too" "$INV cannot enter a directory on the path" \
+       locked lock --yes "$RA/closed/mine.txt"
+check "the file is still yours"                "$INV" "$(owner_of "$RA/closed/mine.txt")"
+check "and carries no flag"                    "" "$(flags_of "$RA/closed/mine.txt")"
+deny  "and no record was written for it"       test -e "$(meta_path "$RA/closed/mine.txt")"
+# The staging copies the helper reads live under the state root, and its
+# walk refuses a symlink on the way: the default must be spelled without
+# the /var link.
+SRDEF="$(sed -n 's|^: "${LOCKED_STATE_ROOT:=\(.*\)}"$|\1|p' "$LOCKED")"
+check "the default state root's parent has no symlink on its path" \
+      "$(dirname "$SRDEF")" "$(cd "$(dirname "$SRDEF")" && pwd -P)"
 
 note "owner gate: a relock after a swap for a root-owned link"
 # A node sealed and then unlocked sits at a path in your space. Swap it for
@@ -3516,6 +3668,8 @@ note "owner gate: a relock after a swap for a root-owned link"
 SWF="$OG/swapme.txt"
 as_user /bin/sh -c "echo mine > '$SWF'"
 ok   "seal the swap fixture"                   locked lock --yes "$SWF"
+# The absence checks above look here; this one shows the path is right.
+ok   "its record is where they look"           test -e "$(meta_path "$SWF")"
 ok   "unlock it"                               locked unlock "$SWF"
 as_user rm -f -- "$SWF"
 if as_user ln "$ROOTF" "$SWF" 2>/dev/null; then
@@ -3570,6 +3724,8 @@ run_job() { # <job>: run its sections, in the subshell the caller made for it
   # was. The counts come from the records themselves (finish_job).
   SCRATCH=""
   ANC=""
+  # The job's log, for the home guard's points (see guarded).
+  exec 9>&1
   trap 'printf "%s %s\n" "$JOB_DONE" "$((SECONDS - JOB_T0))" >"$RESULTS/$JOB_ID.done"; cleanup_scratch' EXIT
   TAP_WORKER=1
   new_scratch

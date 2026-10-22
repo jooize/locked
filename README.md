@@ -468,7 +468,7 @@ and does not guarantee is written out in
 ## Atomicity and TOCTOU
 
 Snapshot/attic/restore writes go through `atomic_replace`:
-1. The helper copies the source into `/var/db/locked/<user>/pool/.staging/replace.XXXXXX` (lock-account-owned, mode 700 -- invisible to user UID) from a file descriptor it opened `O_NOFOLLOW` and identity-checked against the volume uuid and inode `locked` expected -- a source swapped between resolution and open is refused, not copied.
+1. The helper copies the source into `/var/db/locked/<user>/pool/.staging/replace.XXXXXX` (lock-account-owned, mode 700 -- invisible to user UID) from a file descriptor it opened `O_NOFOLLOW`, after walking to it from `/` with no symlink allowed on the way, and identity-checked against the volume uuid and inode `locked` expected -- a source swapped between resolution and open is refused, not copied.
 2. `chown` and `chmod` the staged temp file.
 3. Verify staging and destination are on the same filesystem (`stat -f '%d'`).
 4. `mv -f` -- atomic same-filesystem rename.
@@ -477,7 +477,12 @@ This eliminates partial-write windows on the destination side, closes the old so
 
 **Owner gate.** Every change root makes to a node in your space (owner, mode, flag), and every read of one, goes through the helper. It opens each node `O_NOFOLLOW` from its held parent and checks it on that descriptor: a directory, a regular file or a symlink, owned by you before a lock and by the lock account (or already you) before an unlock. So root never does more to a file than you could do yourself. A hard link to a root-owned file, placed in a folder you lock, is still root's, so it is refused wherever it was linked. A folder is sealed top-down, each directory handed over and frozen before its entries are read, so nothing placed during the run escapes the check. A refusal rolls back every change the run made.
 
+**Reading as you.** The owner gate is the helper checking one fact. So the helper also reads as you wherever you own the path: it walks from `/` and opens each node under your identity, and the kernel checks every folder on the way and the file's own permission bits exactly as it would for you. A file of yours inside a folder you cannot enter is refused, not read by root. The lock account cannot do the same for its own nodes, since it is a hidden account and your home is closed to it. So a node it owns (a sealed file, or a sealed folder and everything in it) is opened by root, through the owner gate. locked's own state (snapshots and staging under `/var/db/locked`) holds nothing of yours, so root reads it as root. Only the walk and the opens change identity; root does the copying itself.
+
+**Count guard.** A lock or unlock tells the helper how many nodes it will act on: one for a single node, or the whole tree for a folder, counted with `find`. The helper first counts the nodes it would reach, read-only, and refuses before any change when the numbers differ. While it changes nodes, it stops at the first one past the count, before changing it, and rolls back. So a walk that strays below a node it was not asked about touches nothing there.
+
 **Honest residuals:**
+- From a node the lock account owns down, root reads through the owner gate alone. The lock account cannot enter your home, so no account can stand in for the kernel's check there.
 - Inside a mediated window there is a nanosecond gap between the helper's identity check of the named entry and the syscall on its name (macOS has no unlink-by-fd). The cross-window entry diff catches every shape that leaves the parent changed; a race that wins that gap *and* has somewhere unsealed to hide the original is the remaining theoretical escape.
 
 ## Audit log

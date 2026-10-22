@@ -113,8 +113,30 @@ if [ "$(id -u)" -ne 0 ]; then
     "$REL" seal --path "$SCRATCH" --id - --owner "$ME" --flag uchg
 fi
 
-seal() { "$TST" seal "$@"; }
-unseal() { "$TST" unseal "$@"; }
+# count <dir>: the nodes of a tree, itself included, as locked's node_count
+# counts them for --count.
+count() { /usr/bin/find "$1" -print0 | LC_ALL=C /usr/bin/tr -cd '\0' | /usr/bin/wc -c | /usr/bin/tr -d ' '; }
+
+# seal / unseal <args...>: the test helper's verb, with the --count the plan
+# would pass when the args name none: the tree's count with --recursive,
+# 1 without.
+with_count() {
+  local verb="$1" a prev="" path="" rec=0 has=0 n=1
+  shift
+  for a in "$@"; do
+    case "$a" in --recursive) rec=1 ;; --count) has=1 ;; esac
+    [ "$prev" = "--path" ] && path="$a"
+    prev="$a"
+  done
+  if [ "$has" -eq 1 ]; then
+    "$TST" "$verb" "$@"
+    return
+  fi
+  [ "$rec" -eq 1 ] && n="$(count "$path")"
+  "$TST" "$verb" "$@" --count "$n"
+}
+seal() { with_count seal "$@"; }
+unseal() { with_count unseal "$@"; }
 OWN=(--owner "$ME" --chown "$ME:$MYGROUP")
 
 # tree <dir>: a small tree of the caller's own, two levels deep.
@@ -210,52 +232,152 @@ else
 fi
 /bin/rm -f -- "$SU"
 
+# paused <pause> <plant fn> <helper args...>: run the test helper held at
+# the pause hook, run <plant fn> while it waits there, then let it go. RC is
+# its exit, OUT what it printed. Opening the fifo's write end returns only
+# once the helper holds the read end, so the plant lands at the pause.
+paused() {
+  local spec="$1" plant="$2" fifo="$SCRATCH/pause.$N" pid
+  shift 2
+  /usr/bin/mkfifo "$fifo"
+  env LOCKED_HELPER_TEST_PAUSE="$spec:$fifo" "$TST" "$@" >"$SCRATCH/paused.out" 2>&1 &
+  pid=$!
+  exec 3>"$fifo"
+  "$plant"
+  printf 'g' >&3
+  exec 3>&-
+  RC=0
+  wait "$pid" || RC=$?
+  OUT="$(cat "$SCRATCH/paused.out")"
+}
+said() { # <desc> <needle>: the last paused run printed <needle>
+  if printf '%s\n' "$OUT" | grep -qF -e "$2"; then
+    pass "$1"
+  else
+    fail "$1"; detail "no '$2' in:"; detail "$OUT"
+  fi
+}
+
 note "a plant between plan and apply"
+# The helper is held before it opens anything; the plan it was called on
+# is already stale. The count pass meets the plant first and refuses it
+# before any change.
 T="$SCRATCH/t3"
 tree "$T"
-FIFO="$SCRATCH/pause"
-/usr/bin/mkfifo "$FIFO"
-env LOCKED_HELPER_TEST_PAUSE="seal:$FIFO" "$TST" seal --path "$T" --id - \
-  "${OWN[@]}" --flag uchg --recursive >"$SCRATCH/plant.out" 2>&1 &
-PID=$!
-# The helper is held at the fifo; the plan it was called on is already
-# stale. Plant a node the gate must refuse, deep enough that the walk has
-# frozen directories by the time it meets it, then let the helper go.
-/usr/bin/mkfifo "$T/a/b/zz-planted"
-printf 'g' >"$FIFO"
-RC=0
-wait "$PID" || RC=$?
-check "the planted node is refused" "7" "$RC"
-if grep -qF "a fifo is not a file" "$SCRATCH/plant.out"; then
-  pass "named as the node that was planted"
-else
-  fail "named as the node that was planted"; detail "$(cat "$SCRATCH/plant.out")"
-fi
-check "the directories it froze were rolled back" "" "$(flagged_under "$T")"
+plant_fifo() { /usr/bin/mkfifo "$T/a/b/zz-planted"; }
+paused seal plant_fifo seal --path "$T" --id - "${OWN[@]}" --flag uchg \
+  --recursive --count "$(count "$T")"
+check "a planted fifo is refused" "7" "$RC"
+said "named as the node that was planted" "a fifo is not a file"
+check "and nothing was frozen" "" "$(flagged_under "$T")"
+/bin/rm -f -- "$T/a/b/zz-planted"
+
+note "the count guard"
+plant_file() { printf 'new\n' >"$T/a/b/added.txt"; }
+paused seal plant_file seal --path "$T" --id - "${OWN[@]}" --flag uchg \
+  --recursive --count "$(count "$T")"
+check "a node added before the count is refused" "7" "$RC"
+said "with the plan's count and the tree's" "the plan names 7 nodes and the tree holds 8"
+check "before anything was frozen" "" "$(flagged_under "$T")"
+/bin/rm -f -- "$T/a/b/added.txt"
+# After the count: the seal has frozen the folders above the plant by the
+# time it reaches it, and stops at the first node past the plan.
+paused seal-walk plant_file seal --path "$T" --id - "${OWN[@]}" --flag uchg \
+  --recursive --count "$(count "$T")"
+check "a node added after the count is refused" "7" "$RC"
+said "at the first node past the plan" "the plan names 7 nodes and the walk reached more"
+check "and every freeze was rolled back" "" "$(flagged_under "$T")"
+/bin/rm -f -- "$T/a/b/added.txt"
+paused seal-walk plant_fifo seal --path "$T" --id - "${OWN[@]}" --flag uchg \
+  --recursive --count "$(count "$T")"
+check "a fifo planted after the count is refused by the gate" "7" "$RC"
+said "named as the node that was planted" "a fifo is not a file"
+check "and the folders the seal froze were rolled back" "" "$(flagged_under "$T")"
+/bin/rm -f -- "$T/a/b/zz-planted"
+expect "a stale count refuses before any change" 7 "the plan names 6 nodes and the tree holds 7" \
+  seal --path "$T" --id - "${OWN[@]}" --flag uchg --recursive --count 6
+check "and nothing was frozen" "" "$(flagged_under "$T")"
+expect "--count other than 1 without --recursive is a usage error" 4 \
+  "--count must be 1 without --recursive" \
+  seal --path "$T/one.txt" --id - "${OWN[@]}" --flag uchg --count 2
+expect "a seal without --count is a usage error" 4 "--count is required" \
+  "$TST" seal --path "$T/one.txt" --id - "${OWN[@]}" --flag uchg
+expect "--count 0 is a usage error" 4 "--count must be a number of nodes" \
+  seal --path "$T/one.txt" --id - "${OWN[@]}" --flag uchg --count 0
+# The unseal: the tree is frozen, so the plant needs its folder thawed
+# first, as only the owner the test runs as can. The first pass stops at
+# the node past the plan, and the tree stays sealed as it was.
+expect "seal the tree for the unseal cases" 0 - \
+  seal --path "$T" --id - "${OWN[@]}" --flag uchg --recursive
+plant_sealed() {
+  /usr/bin/chflags nouchg "$T/a/b"
+  printf 'new\n' >"$T/a/b/added.txt"
+  /usr/bin/chflags uchg "$T/a/b"
+}
+paused unseal-walk plant_sealed unseal --path "$T" --id - "${OWN[@]}" \
+  --flag uchg --recursive --count 7
+check "an unseal that reaches past the plan is refused" "7" "$RC"
+said "at the first node past the plan" "the plan names 7 nodes and the walk reached more"
+check "and the tree is still sealed" "7" "$(flagged_under "$T" | wc -l | tr -d ' ')"
+/usr/bin/chflags nouchg "$T/a/b"
+/bin/rm -f -- "$T/a/b/added.txt"
+/usr/bin/chflags uchg "$T/a/b"
+expect "the unseal with the tree's count succeeds" 0 - \
+  unseal --path "$T" --id - "${OWN[@]}" --flag uchg --recursive
+check "and nothing is left frozen" "" "$(flagged_under "$T")"
 
 note "copy-tree"
 T="$SCRATCH/t4"
 tree "$T"
+AS=(--as "$ME")
 expect "copy-tree copies the caller's tree" 0 - \
-  "$TST" copy-tree --src "$T" --src-id - --owner "$ME" --dest "$SCRATCH/copy1" \
-  --chown "$ME:$MYGROUP"
+  "$TST" copy-tree --src "$T" --src-id - --owner "$ME" "${AS[@]}" \
+  --dest "$SCRATCH/copy1" --chown "$ME:$MYGROUP"
 check "file content travels" "three" "$(cat "$SCRATCH/copy1/a/b/three.txt")"
 check "a link travels as a link" "one.txt" "$(/usr/bin/readlink "$SCRATCH/copy1/link")"
 expect "copy-tree refuses a tree its --owner does not own" 7 "and not by root" \
-  "$TST" copy-tree --src "$T" --src-id - --owner root --dest "$SCRATCH/copy2" \
-  --chown "$ME:$MYGROUP"
+  "$TST" copy-tree --src "$T" --src-id - --owner root "${AS[@]}" \
+  --dest "$SCRATCH/copy2" --chown "$ME:$MYGROUP"
+/bin/chmod 000 "$T/a/b"
+expect "copy-tree refuses a folder --as cannot read" 7 "$ME may not open it" \
+  "$TST" copy-tree --src "$T" --src-id - --owner "$ME" "${AS[@]}" \
+  --dest "$SCRATCH/copy7" --chown "$ME:$MYGROUP"
+/bin/chmod 755 "$T/a/b"
 /usr/bin/mkfifo "$T/a/zz-fifo"
 expect "copy-tree refuses a fifo" 7 "a fifo is not a file" \
-  "$TST" copy-tree --src "$T" --src-id - --owner "$ME" --dest "$SCRATCH/copy3" \
-  --chown "$ME:$MYGROUP"
+  "$TST" copy-tree --src "$T" --src-id - --owner "$ME" "${AS[@]}" \
+  --dest "$SCRATCH/copy3" --chown "$ME:$MYGROUP"
 
 note "copy and xattrs-from"
 expect "copy refuses a source its --owner does not own" 7 "and not by root" \
-  "$TST" copy --src "$T/one.txt" --src-id - --owner root --dest "$SCRATCH/copy4"
+  "$TST" copy --src "$T/one.txt" --src-id - --owner root "${AS[@]}" \
+  --dest "$SCRATCH/copy4"
 expect "copy takes a source its --owner owns" 0 - \
-  "$TST" copy --src "$T/one.txt" --src-id - --owner "$ME" --dest "$SCRATCH/copy5"
+  "$TST" copy --src "$T/one.txt" --src-id - --owner "$ME" "${AS[@]}" \
+  --dest "$SCRATCH/copy5"
 expect "copy without --owner is a usage error" 4 "--owner is required" \
-  "$TST" copy --src "$T/one.txt" --src-id - --dest "$SCRATCH/copy6"
+  "$TST" copy --src "$T/one.txt" --src-id - "${AS[@]}" --dest "$SCRATCH/copy6"
+expect "copy without --as is a usage error" 4 "--as is required" \
+  "$TST" copy --src "$T/one.txt" --src-id - --owner "$ME" --dest "$SCRATCH/copy8"
+expect "copy refuses a source reached through a symlink" 7 "a symlink or not a directory" \
+  "$TST" copy --src "$SCRATCH/t2-link/one.txt" --src-id - --owner "$ME" "${AS[@]}" \
+  --dest "$SCRATCH/copy9"
+# --as is the caller here, so a folder they cannot enter is one the kernel
+# closes to the read, not one the owner gate opens.
+/bin/chmod 000 "$T/a"
+expect "copy refuses a file inside a folder --as cannot enter" 7 \
+  "$ME cannot enter a directory on the path" \
+  "$TST" copy --src "$T/a/two.txt" --src-id - --owner "$ME" "${AS[@]}" \
+  --dest "$SCRATCH/copy10"
+/bin/chmod 755 "$T/a"
+/bin/chmod 000 "$T/one.txt"
+expect "copy refuses a file --as may not read" 7 "$ME may not open it" \
+  "$TST" copy --src "$T/one.txt" --src-id - --owner "$ME" "${AS[@]}" \
+  --dest "$SCRATCH/copy11"
+expect "xattrs-from refuses it too" 7 "$ME may not open it" \
+  "$TST" xattrs-from --src "$T/one.txt" --src-id - --owner "$ME" "${AS[@]}" \
+  --dest "$SCRATCH/copy5"
+/bin/chmod 644 "$T/one.txt"
 
 echo "1..$N"
 note "$((N - FAIL)) of $N passed"
