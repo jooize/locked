@@ -1033,17 +1033,19 @@ fclear() { # fclear <flagword> <path>
 }
 
 # node_op <log verb> <path> <seal|unseal> <helper options>...: change a
-# node you protect -- its owner, mode and flag, and with --recursive every
-# node under it -- through the window helper, on each node's own
-# descriptor. This is how root acts on anything in the invoker's space
-# that a same-UID process could have swapped or linked into place after the
-# plan was made: the helper takes only a directory, a file or a symlink,
-# owned by the account its --owner names, and the node its --id names, and
-# it rolls back what it had already changed when it refuses. Root never
-# does more to an inode than the invoker could do themselves; a hard link to
-# a root-owned file is still root's, so it is refused, whatever folder it
-# was linked into. fset and fclear above stay for nodes no other process
-# can reach: chain directories, and files inside a sealed folder.
+# node you protect -- its owner, mode and flag, a placement directory's
+# ACL entry, and with --recursive every node under it -- through the
+# window helper, on each node's own descriptor. This is how root acts on
+# anything in the invoker's space that a same-UID process could have
+# swapped or linked into place after the plan was made, chain directories
+# included: they are sealed leaf first, so the folders above one are still
+# yours while it is sealed. The helper takes only a directory, a file or a
+# symlink, owned by the account its --owner names, and the node its --id
+# names, and it rolls back what it had already changed when it refuses.
+# Root never does more to an inode than the invoker could do themselves; a
+# hard link to a root-owned file is still root's, so it is refused,
+# whatever folder it was linked into. fset and fclear above stay for nodes
+# no other process can reach: files inside a sealed folder.
 #
 # The helper names the node it refused and why, on its own line; the line
 # here says what that means for the run. Returns 0 only when the change was
@@ -3432,9 +3434,12 @@ seal_content() {
   log_action lock "$f" ok
 }
 
-# seal_placement <dir>: apply a decided placement-tier seal to a parent dir.
+# seal_placement <dir> <id>: apply a decided placement-tier seal to a
+# parent dir. <id> pins the node the plan saw; the helper holds the seal to
+# it and asks its owner again on the descriptor it changes (node_op): you
+# before the first seal, the lock account for a reseal.
 seal_placement() {
-  local d="$1"
+  local d="$1" id="${2:--}"
   snap_paths "$d"
 
   local owner_now group_now mode_now
@@ -3450,7 +3455,8 @@ seal_placement() {
     check_reseal_identity "$d" "$META" || {
       echo "${E_YEL}aborted; node not re-sealed${E_OFF}" >&2; return 2
     }
-    fset uappnd "$d" || return 1
+    node_op lock "$d" seal --path "$d" --id "${id/./:}" --owner "$lock_user" \
+      --count 1 --flag uappnd || return 1
     if [ "$OPT_DRY" -eq 0 ]; then
       write_meta "$META" \
         "owner=$(meta_field "$META" owner)" \
@@ -3472,24 +3478,29 @@ seal_placement() {
   fi
 
   # The invoker's way back in as one ACL entry (see placement_entry), then
-  # ownership to the lock account, group and mode as they were. The entry
-  # goes on first, so the invoker never loses access to a 700 directory
-  # like ~/Library, even for an instant. Any ACL entries already there
-  # stay: ~/Library carries Apple's own. Flag last.
-  local entry
+  # ownership to the lock account, group and mode as they were, in one
+  # helper call on the directory's own descriptor. The entry goes on first,
+  # so the invoker never loses access to a 700 directory like ~/Library,
+  # even for an instant. Any ACL entries already there stay: ~/Library
+  # carries Apple's own. Flag last.
+  local entry rights
   entry="$(placement_entry "$inv" "$mode_now")"
-  run chmod +a "$entry" "$d" || return 1
+  rights="${entry##* }"
+  node_op lock "$d" seal --path "$d" --id "${id/./:}" --owner "$inv" \
+    --chown "${lock_user}:${group_now}" --count 1 --flag uappnd \
+    --acl-add "${inv}:${rights}" || return 1
   # The recorded line is what verify looks for, so it has to be what the
   # kernel now holds, spelled as ls prints it. A mismatch here is a
-  # spelling bug in placement_entry: fail on it now, not as drift later.
+  # spelling bug in placement_entry: fail on it now, not as drift later,
+  # and hand the directory back as it was found.
   if [ "$OPT_DRY" -eq 0 ] && ! acl_has "$d" "$entry"; then
     err_val "does not read back the ACL entry just added" "$d"
     echo "    entry: $entry" >&2
-    run chmod -a "$entry" "$d" || true
+    node_op lock "$d" unseal --path "$d" --id "${id/./:}" --owner "$lock_user" \
+      --chown "${owner_now}:${group_now}" --count 1 --flag uappnd \
+      --acl-remove "${inv}:${rights}" || true
     return 1
   fi
-  run chown "$lock_user" "$d" || return 1
-  fset uappnd "$d" || return 1
   if [ "$OPT_DRY" -eq 0 ]; then
     write_meta "$META" \
       "owner=$owner_now" \
@@ -3655,7 +3666,10 @@ release_node() {
         --count 1 --flag "$flag" || return 1
       ;;
     placement)
-      fclear "$flag" "$f" || return 1
+      # The flag alone, through the helper like every other tier: the
+      # recorded node, while the lock account owns it.
+      node_op unlock "$f" unseal --path "$f" --id "$rid" --owner "$lock_user" \
+        --count 1 --flag "$flag" || return 1
       # Placement keeps lock-account ownership and its ACL entry through
       # the unlock, deliberately: that IS the seal's structure, not drift.
       # The owner must stay the lock account because `uappnd` is a user
@@ -3738,25 +3752,39 @@ release_chain_node() { # <dir>
     say_out "dry run: release" "$d"
     return 0
   fi
-  # Flag first: it blocks chown and chmod.
-  if [ "$state" = "locked" ]; then
-    fclear "$flag" "$d" || return 1
-  fi
+  # Through the helper, on the directory's own descriptor, like every other
+  # change to a node in your space: the recorded node only, and only while
+  # the lock account owns it (or you already do again, so a release cut
+  # short can run again). The flag comes off first, since it blocks the
+  # rest; then owner, group and mode; then the entry, once the owner bits
+  # are your way in again.
+  local rid
+  rid="$(helper_id_for "$d")"
   if [ "$tier" = "placement" ]; then
-    run chown "${owner}:${group}" "$d" || return 1
-    run chmod "$mode" "$d" || return 1
-    # The entry comes off last, once the owner bits are the user's way in
-    # again. -a takes exactly these rights out of the entry naming the
-    # user, and drops the entry once it is empty; plan_node refused to seal
-    # a directory where the user already had one, so the entry is the
-    # seal's. It fails when no such entry exists, so only an entry that is
-    # there as recorded is taken off. Anything else naming the user is not
-    # locked's to guess at: it stays, and the release says so.
-    if [ -n "$acl" ] && acl_has "$d" "$acl"; then
-      run chmod -a "$acl" "$d" || return 1
-    elif acl_names_user "$d" "$owner"; then
-      say_out "  ${C_YEL}note:${C_OFF} an ACL entry for $owner is not the one recorded; left in place" "$d"
+    local owners="$lock_user" who
+    [ "$owner" = "$inv" ] && owners="$lock_user,$inv"
+    local -a how=(--path "$d" --id "$rid" --owner "$owners" --count 1
+      --flag "$flag" --chown "${owner}:${group}" --mode "$mode")
+    # Exactly the recorded entry comes off: an allow naming that account,
+    # with those rights and no inherit flag. plan_node refused to seal a
+    # directory where the user already had one, so that entry is the
+    # seal's. Anything else naming the user is not locked's to guess at:
+    # it stays (the helper says so on an acl-absent line), and the release
+    # says so too.
+    if [ -n "$acl" ]; then
+      who="${acl#user:}"
+      how+=(--acl-remove "${who%% *}:${acl##* }")
     fi
+    node_op release "$d" unseal "${how[@]}" || return 1
+    if [ -z "$acl" ] || [ -n "$(helper_line_value acl-absent)" ]; then
+      if acl_names_user "$d" "$owner"; then
+        say_out "  ${C_YEL}note:${C_OFF} an ACL entry for $owner is not the one recorded; left in place" "$d"
+      fi
+    fi
+  elif [ "$state" = "locked" ]; then
+    # An anchor stays yours, so the helper takes it only while it is.
+    node_op release "$d" unseal --path "$d" --id "$rid" --owner "$inv" \
+      --count 1 --flag "$flag" || return 1
   fi
   retire_record "$d" unneeded quiet || return 1
   if [ "$tier" = "placement" ]; then
@@ -4494,8 +4522,8 @@ do_lock_one() {
   # Collected leaf first, then ancestors nearest-first: that is the order
   # the seals run in below, and the display reverses it. Any refusal here
   # ends the ceremony with nothing touched.
-  local -a plan_paths plan_tiers plan_flags plan_actions
-  plan_paths=(); plan_tiers=(); plan_flags=(); plan_actions=()
+  local -a plan_paths plan_tiers plan_flags plan_actions plan_ids
+  plan_paths=(); plan_tiers=(); plan_flags=(); plan_actions=(); plan_ids=()
   local act
   # The leaf is pinned by identity before it is planned: the witness reads
   # this node and the seal acts on this node, by descriptor, so a node
@@ -4513,21 +4541,32 @@ do_lock_one() {
   plan_tiers+=("$leaf_tier")
   plan_flags+=("$leaf_flag")
   plan_actions+=("$act")
+  plan_ids+=("$leaf_id")
 
   # The chain feeds fd 3, not stdin: this loop spawns the window helper (for
   # node identity) once per ancestor, every child inherits this process's
   # stdin, and a plain `done <<EOF` would leave chain text sitting in front
   # of the gate that follows.
-  local a t
+  #
+  # A placement ancestor is pinned by identity too, like the leaf: its seal
+  # hands it to the lock account, and the folders above it are still yours
+  # until the chain reaches them, so the node the plan saw is the only one
+  # the seal takes.
+  local a t nid
   while IFS= read -r a <&3; do
     [ -n "$a" ] || continue
     [ "$a" = "$f" ] && continue
     t="$(tier_for_ancestor "$a")"
+    nid=-
+    if [ "$t" = "placement" ]; then
+      nid="$(node_id "$a")" || return 1
+    fi
     act="$(plan_node "$a" "$t" sappnd)" || return 1
     plan_paths+=("$a")
     plan_tiers+=("$t")
     plan_flags+=(sappnd)
     plan_actions+=("$act")
+    plan_ids+=("$nid")
   done 3<<EOF
 $chain
 EOF
@@ -4658,7 +4697,7 @@ EOF
       *)
         case "${plan_tiers[$i]}" in
           content)   seal_content "${plan_paths[$i]}" "$leaf_id" || return $? ;;
-          placement) seal_placement "${plan_paths[$i]}" || return $? ;;
+          placement) seal_placement "${plan_paths[$i]}" "${plan_ids[$i]}" || return $? ;;
           anchor)
             # The named node is a leaf. An ancestor keeps a leaf role it
             # already has -- a node you named stays yours when some other

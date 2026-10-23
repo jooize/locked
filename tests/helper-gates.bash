@@ -81,7 +81,9 @@ SCRATCH="$(cd "$SCRATCH" && pwd -P)"
 # node to the group it already has: a roll back can then always restore it.
 MYGROUP="$(/usr/bin/stat -f '%Sg' "$SCRATCH")"
 cleanup() {
-  /usr/bin/chflags -R nouchg "$SCRATCH" 2>/dev/null || true
+  /usr/bin/chflags -R nouchg,nouappnd "$SCRATCH" 2>/dev/null || true
+  # The ACL cases leave deny entries that refuse a removal.
+  /bin/chmod -R -N "$SCRATCH" 2>/dev/null || true
   /bin/rm -rf -- "$SCRATCH"
 }
 trap cleanup EXIT
@@ -325,6 +327,127 @@ check "and the tree is still sealed" "7" "$(flagged_under "$T" | wc -l | tr -d '
 expect "the unseal with the tree's count succeeds" 0 - \
   unseal --path "$T" --id - "${OWN[@]}" --flag uchg --recursive
 check "and nothing is left frozen" "" "$(flagged_under "$T")"
+
+note "the placement ACL entry"
+# A placement seal gives the invoker one ACL entry on the directory's own
+# descriptor, and its release takes exactly that entry off. An ordinary
+# user may change the ACL of a directory they own, so the entry, the
+# refusals and the roll back all show here; the change of owner around
+# them is the root harness's (section 9).
+acl_of() { /bin/ls -ledq -- "$1" | /usr/bin/sed -e 1d -e 's/^ *[0-9][0-9]*: //'; }
+R=list,add_file,search,add_subdirectory,readattr,readextattr,readsecurity
+ENT="user:$ME allow $R"
+DENY="group:everyone deny delete"
+PL=(--owner "$ME" --chown "$ME:$MYGROUP" --count 1)
+P="$SCRATCH/p1"
+/bin/mkdir -m 755 "$P"
+/bin/chmod +a "$DENY" "$P"
+expect "seal --acl-add adds the entry" 0 - \
+  "$TST" seal --path "$P" --id "$("$TST" id "$P")" "${PL[@]}" --flag uappnd \
+  --acl-add "$ME:$R"
+check "spelled as ls -le prints it, after the deny entry already there" \
+  "$DENY"$'\n'"$ENT" "$(acl_of "$P")"
+check "and the flag is on" "uappnd" "$(flags_of "$P")"
+expect "a directory with an entry naming the account is refused" 7 \
+  "already carries an ACL entry for $ME" \
+  "$TST" seal --path "$P" --id - "${PL[@]}" --flag uappnd --acl-add "$ME:$R"
+check "and its ACL is as it was" "$DENY"$'\n'"$ENT" "$(acl_of "$P")"
+expect "unseal --acl-remove takes the entry off" 0 - \
+  "$TST" unseal --path "$P" --id - "${PL[@]}" --mode 755 --flag uappnd \
+  --acl-remove "$ME:$R"
+check "and only that entry" "$DENY" "$(acl_of "$P")"
+check "with the flag off" "" "$(flags_of "$P")"
+check "and no acl-absent line" "0" "$(printf '%s\n' "$OUT" | grep -c '^acl-absent' || true)"
+expect "an unseal with no such entry succeeds" 0 - \
+  "$TST" unseal --path "$P" --id - "${PL[@]}" --flag uappnd --acl-remove "$ME:$R"
+check "and says so on an acl-absent line" "acl-absent"$'\t'"$P" \
+  "$(printf '%s\n' "$OUT" | grep '^acl-absent' || true)"
+/bin/chmod +a "user:$ME deny add_file" "$P"
+expect "a deny entry naming the account refuses the seal too" 7 \
+  "already carries an ACL entry for $ME" \
+  "$TST" seal --path "$P" --id - "${PL[@]}" --flag uappnd --acl-add "$ME:$R"
+/bin/chmod -a "user:$ME deny add_file" "$P"
+/bin/chmod +a "$ENT,file_inherit" "$P"
+expect "an entry with an inherit flag is not the seal's" 0 "acl-absent" \
+  "$TST" unseal --path "$P" --id - "${PL[@]}" --flag uappnd --acl-remove "$ME:$R"
+check "and is left in place" "$DENY"$'\n'"$ENT,file_inherit" "$(acl_of "$P")"
+/bin/chmod -a "$ENT,file_inherit" "$P"
+/bin/chmod +a "user:$ME allow list" "$P"
+expect "nor is one with other rights" 0 "acl-absent" \
+  "$TST" unseal --path "$P" --id - "${PL[@]}" --flag uappnd --acl-remove "$ME:$R"
+check "which stays too" "$DENY"$'\n'"user:$ME allow list" "$(acl_of "$P")"
+/bin/chmod -a "user:$ME allow list" "$P"
+if [ "$(id -u)" -ne 0 ]; then
+  # Only root may set a system flag, so a seal with schg fails at its last
+  # step, after the entry went on: the roll back must take it off again.
+  expect "a seal that fails after adding the entry is refused" 3 "cannot set the flags" \
+    "$TST" seal --path "$P" --id - "${PL[@]}" --flag schg --acl-add "$ME:$R"
+  check "and the roll back takes the entry off" "$DENY" "$(acl_of "$P")"
+  P2="$SCRATCH/p2"
+  /bin/mkdir -m 755 "$P2"
+  expect "the same on a directory with no ACL" 3 "cannot set the flags" \
+    "$TST" seal --path "$P2" --id - "${PL[@]}" --flag schg --acl-add "$ME:$R"
+  check "leaves it with no ACL" "" "$(acl_of "$P2")"
+else
+  skip "a seal that fails after adding the entry is refused" "runs as root, which may set schg"
+  skip "and the roll back takes the entry off" "runs as root"
+  skip "the same on a directory with no ACL" "runs as root"
+  skip "leaves it with no ACL" "runs as root"
+fi
+expect "a right the seal does not grant is a usage error" 4 \
+  "names a right a placement seal does not grant: 'delete_child'" \
+  "$TST" seal --path "$P" --id - "${PL[@]}" --flag uappnd --acl-add "$ME:list,delete_child"
+expect "an empty right is one too" 4 "names a right a placement seal does not grant: ''" \
+  "$TST" seal --path "$P" --id - "${PL[@]}" --flag uappnd --acl-add "$ME:list,,search"
+expect "--acl-add without rights is a usage error" 4 "--acl-add must be <user>:<right>" \
+  "$TST" seal --path "$P" --id - "${PL[@]}" --flag uappnd --acl-add "$ME:"
+expect "--acl-add without a user is one too" 4 "--acl-add must be <user>:<right>" \
+  "$TST" seal --path "$P" --id - "${PL[@]}" --flag uappnd --acl-add "$ME"
+expect "--acl-add naming no account is a usage error" 4 "--acl-add names no account" \
+  "$TST" seal --path "$P" --id - "${PL[@]}" --flag uappnd --acl-add "no-such-user-zz:list"
+expect "--acl-remove on a seal is a usage error" 4 "--acl-remove is for unseal" \
+  "$TST" seal --path "$P" --id - "${PL[@]}" --flag uappnd --acl-remove "$ME:$R"
+expect "--acl-add on an unseal is a usage error" 4 "--acl-add is for seal" \
+  "$TST" unseal --path "$P" --id - "${PL[@]}" --flag uappnd --acl-add "$ME:$R"
+expect "--acl-add with --recursive is a usage error" 4 "never --recursive" \
+  "$TST" seal --path "$P" --id - "${PL[@]}" --flag uchg --recursive --acl-add "$ME:$R"
+printf 'f\n' >"$P/f.txt"
+expect "an entry on a file is refused" 7 "an ACL entry goes on a directory only" \
+  "$TST" seal --path "$P/f.txt" --id - "${PL[@]}" --flag uappnd --acl-add "$ME:$R"
+check "and the file has no ACL" "" "$(acl_of "$P/f.txt")"
+check "and the directory's ACL is as it was" "$DENY" "$(acl_of "$P")"
+check "with no flag on it" "" "$(flags_of "$P")"
+# A swap between the plan and the seal: the directory the plan pinned is
+# moved away, and another of the caller's own, or a symlink, takes its name.
+# The deny entry above refuses that rename, as it does on ~/Library, so it
+# comes off here, and the swaps run on a directory of their own.
+/bin/chmod -a "$DENY" "$P"
+P="$SCRATCH/p4"
+/bin/mkdir -m 755 "$P"
+PID="$("$TST" id "$P")"
+P3="$SCRATCH/p3"
+/bin/mkdir -m 755 "$P3"
+swap_dir() { /bin/mv -- "$P" "$P.away"; /bin/mkdir -m 755 "$P"; }
+paused seal swap_dir seal --path "$P" --id "$PID" "${PL[@]}" --flag uappnd \
+  --acl-add "$ME:$R"
+check "a directory swapped in after the plan is refused" "2" "$RC"
+said "by the identity pin" "changed identity"
+check "and gets no entry" "" "$(acl_of "$P")"
+check "nor any flag" "" "$(flags_of "$P")"
+check "and the one the plan pinned gets none either" "" "$(acl_of "$P.away")"
+/bin/rmdir -- "$P"
+swap_link() { /bin/ln -s "$P3" "$P"; }
+paused seal swap_link seal --path "$P" --id "$PID" "${PL[@]}" --flag uappnd \
+  --acl-add "$ME:$R"
+check "a symlink swapped in after the plan is refused" "2" "$RC"
+check "and what it points at gets no entry" "" "$(acl_of "$P3")"
+check "nor any flag" "" "$(flags_of "$P3")"
+/bin/rm -f -- "$P"
+paused seal swap_link seal --path "$P" --id - "${PL[@]}" --flag uappnd \
+  --acl-add "$ME:$R"
+check "with no pin, the symlink is refused as not a directory" "7" "$RC"
+said "by the type of node an entry goes on" "an ACL entry goes on a directory only"
+check "and what it points at still has no entry" "" "$(acl_of "$P3")"
 
 note "copy-tree"
 T="$SCRATCH/t4"

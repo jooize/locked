@@ -3682,6 +3682,121 @@ else
   tap_skip "a relock over a root-owned link is refused" "the user may not hard-link here"
 fi
 
+note "owner gate: a placement directory swapped between plan and apply"
+# A placement seal hands a chain directory to the lock account and adds an
+# ACL entry for you. The chain is sealed leaf first, so while the leaf is
+# sealed the directory above it, and the home above that, are still yours:
+# a process of yours can move the directory away and put a symlink to a
+# root-owned directory, or another directory of yours, at its name. Root
+# acting on that name would chown the root-owned directory to the lock
+# account and give you an entry on it. The helper takes only the directory
+# the plan pinned, by its identity, on its own descriptor, so either swap
+# is refused and nothing changes.
+#
+# Every seal in the run pauses (the test helper). The fifo is held open
+# read and write here, so a pause waits for a byte and this side never
+# blocks: one byte lets the leaf's seal go; the swap waits until the leaf's
+# record is written, so it lands after the leaf's last read of its own
+# path; then the bytes for the placement seal, and for the anchor's should
+# the run get that far.
+s9_acl() { /bin/ls -ledq -- "$1" | sed -e 1d -e 's/^ *[0-9][0-9]*: //'; }
+s9_shape() { printf '%s|%s' "$(stat -f '%Su %Sg %OLp %Sf' "$1")" "$(s9_acl "$1" | tr '\n' ';')"; }
+s9_leaf_locked() { [ "$(meta_get "$1" state)" = "locked" ]; }
+s9_until() { # <cmd...>: poll until it succeeds, 30 s at most
+  local i=0
+  until "$@"; do
+    i=$((i + 1))
+    [ "$i" -lt 300 ] || return 1
+    sleep 0.1
+  done
+}
+PLROOT="$SCRATCH/root-dir"
+install -d -o root -g wheel -m 755 "$PLROOT"
+chmod +a "group:everyone deny delete" "$PLROOT"
+PLROOT_SHAPE="$(s9_shape "$PLROOT")"
+pl_swap_case() { # <name> <swap fn>
+  local name="$1" swap="$2" rc=0 pid fifo="$SCRATCH/s9-pl-pause"
+  PLD="$FAKE_HOME/pl-$name"
+  PLLEAF="$PLD/in/f.txt"
+  PLOUT="$SCRATCH/pl-swap-$name.txt"
+  install -d -o "$INV" -g staff -m 755 "$PLD" "$PLD/in"
+  as_user /bin/sh -c "echo f > '$PLLEAF'"
+  PLD_SHAPE="$(s9_shape "$PLD")"
+  mkfifo "$fifo"
+  exec 4<>"$fifo"
+  GUARD_RELEASE="$PLD.away" locked_th "seal:$fifo" lock --yes "$PLLEAF" >"$PLOUT" 2>&1 &
+  pid=$!
+  printf 'x' >&4
+  if s9_until s9_leaf_locked "$PLLEAF"; then
+    tap_pass "$name: the leaf is sealed first"
+    "$swap"
+  else
+    tap_fail "$name: the leaf is sealed first" "its record never said locked; no swap made"
+  fi
+  printf 'xx' >&4
+  wait "$pid" || rc=$?
+  exec 4>&-
+  rm -f -- "$fifo"
+  check "$name: the lock exits 3 (a failed item)" "3" "$rc"
+  if ! grep -qF "changed identity" "$PLOUT"; then
+    tap_fail "$name: the helper refused the swapped node by its identity"
+    tap_output "$(cat "$PLOUT")"
+  else
+    tap_pass "$name: the helper refused the swapped node by its identity"
+  fi
+  deny  "$name: no record was written for the directory" test -e "$(meta_path "$PLD")"
+  check "$name: the directory the plan pinned is as it was" "$PLD_SHAPE" "$(s9_shape "$PLD.away")"
+}
+pl_swap_link() {
+  as_user mv -- "$PLD" "$PLD.away"
+  as_user ln -s "$PLROOT" "$PLD"
+}
+pl_swap_case link pl_swap_link
+check "link: the root-owned directory keeps owner, group, mode, flags and ACL" \
+      "$PLROOT_SHAPE" "$(s9_shape "$PLROOT")"
+check "link: the link itself carries no flag"  "" "$(flags_of "$PLD")"
+rm -f -- "$PLD"
+mv -- "$PLD.away" "$PLD"
+ok   "link: the leaf can be unprotected again" locked unprotect --yes "$PLLEAF"
+pl_swap_dir() {
+  as_user mv -- "$PLD" "$PLD.away"
+  as_user mkdir -m 755 -- "$PLD"
+}
+pl_swap_case dir pl_swap_dir
+check "dir: the directory swapped in is still yours, with no entry and no flag" \
+      "$INV staff 755 -|" "$(s9_shape "$PLD")"
+rmdir -- "$PLD"
+mv -- "$PLD.away" "$PLD"
+ok   "dir: the leaf can be unprotected again"  locked unprotect --yes "$PLLEAF"
+
+note "owner gate: a placement seal and its release, through the helper"
+# The same seal with nothing swapped: the directory goes to the lock
+# account with your entry beside the ACL it had, and the release puts back
+# exactly what the record captured -- owner, group, mode, flags and ACL.
+RTD="$FAKE_HOME/pl-roundtrip"
+install -d -o "$INV" -g staff -m 750 "$RTD" "$RTD/in"
+chmod +a "group:everyone deny delete" "$RTD"
+as_user /bin/sh -c "echo r > '$RTD/in/r.txt'"
+RTD_SHAPE="$(s9_shape "$RTD")"
+RTE="user:$INV allow list,add_file,search,add_subdirectory,readattr,readextattr,readsecurity"
+ok   "round trip: lock a leaf below it"        locked lock --yes "$RTD/in/r.txt"
+check "round trip: sealed to the lock account, group and mode kept" \
+      "$LOCK_ACCT staff 750 uappnd" "$(stat -f '%Su %Sg %OLp %Sf' "$RTD")"
+check "round trip: your entry after the deny entry it had" \
+      "group:everyone deny delete"$'\n'"$RTE" "$(s9_acl "$RTD")"
+check "round trip: the record carries the entry" "$RTE" "$(meta_get "$RTD" acl)"
+ok   "round trip: unlock the directory"        locked unlock "$RTD"
+check "round trip: the unlock lifts the flag and nothing else" \
+      "$LOCK_ACCT staff 750 -" "$(stat -f '%Su %Sg %OLp %Sf' "$RTD")"
+ok   "round trip: lock again"                  locked lock --yes "$RTD/in/r.txt"
+check "round trip: the relock puts the flag back" "uappnd" "$(flags_of "$RTD")"
+locked unprotect --yes "$RTD/in/r.txt" >"$OGOUT" 2>&1 || true
+ok   "round trip: unprotect releases it"       grep -qF "released: $RTD" "$OGOUT"
+check "round trip: owner, group, mode, flags and ACL as before" \
+      "$RTD_SHAPE" "$(s9_shape "$RTD")"
+deny "round trip: and the release says nothing about a stray entry" \
+     grep -qF "is not the one recorded" "$OGOUT"
+
 }
 
 # ---- run the sections ------------------------------------------------------

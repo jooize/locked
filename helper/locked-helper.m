@@ -17,7 +17,8 @@
  * service). Every other operation is an *at() call against a held fd.
  *
  * The same discipline carries the seal itself. `seal` and `unseal` change a
- * node's owner, mode and flag word, and `copy-tree` copies a folder, each
+ * node's owner, mode and flag word (and a placement directory's one ACL
+ * entry for the invoker), and `copy-tree` copies a folder, each
  * from a descriptor opened O_NOFOLLOW (O_SYMLINK for a link) and checked on
  * that descriptor: only a directory, a regular file or a symlink, and only
  * one owned by an account the caller names. Root never does more to an
@@ -62,8 +63,10 @@
  * output always uses `:`.
  *
  * stdout carries only tab-separated machine lines (binurl, anomaly,
- * window-open), plus the one bare `<id>` line the `id` verb prints. stderr
- * carries one lowercase prose line per error.
+ * window-open, and acl-absent: an unseal found no ACL entry as
+ * --acl-remove names it, and left the ACL as it was), plus the one bare
+ * `<id>` line the `id` verb prints. stderr carries one lowercase prose line
+ * per error.
  *
  * Entry names on `anomaly` lines are backslash-escaped (\\, \t, \n, \r, \xNN
  * for other control bytes) so a hostile filename cannot forge or split a
@@ -77,6 +80,7 @@
 #import <Foundation/Foundation.h>
 
 #include <sys/types.h>
+#include <sys/acl.h>
 #include <sys/attr.h>
 #include <sys/stat.h>
 #include <sys/stdio.h>
@@ -88,6 +92,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <limits.h>
+#include <membership.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -162,6 +167,8 @@ usage(void)
 "                                 --flag <uchg|uappnd|schg|sappnd>\n"
 "                                 [--chown <user>:<group>] [--mode <octal>]\n"
 "                                 [--recursive]\n"
+"                                 [--acl-add <user>:<rights>]     (seal)\n"
+"                                 [--acl-remove <user>:<rights>]  (unseal)\n"
 "       locked-helper id <path>\n",
 	    stderr);
 }
@@ -1257,6 +1264,8 @@ typedef struct {
 	const char	*mode;
 	const char	*as;
 	const char	*count;
+	const char	*acl_add;
+	const char	*acl_remove;
 	int		 recursive;
 } opts_t;
 
@@ -1319,6 +1328,8 @@ parse_opts(int argc, char **argv, opts_t *o)
 		TRY("--mode", mode)
 		TRY("--as", as)
 		TRY("--count", count)
+		TRY("--acl-add", acl_add)
+		TRY("--acl-remove", acl_remove)
 #undef TRY
 		errf("unknown option %s", a);
 		return (-1);
@@ -1541,6 +1552,81 @@ parse_count(const char *s, size_t *out)
 	if (errno != 0 || *end != '\0' || v == 0)
 		return (-1);
 	*out = (size_t)v;
+	return (0);
+}
+
+/*
+ * The one ACL entry a placement seal gives the invoker, and its release
+ * takes off again: an allow naming one account by its uuid, with exactly
+ * the listed rights and no inherit flag, so nothing created inside picks
+ * it up. The rights are the ones locked's placement_entry grants, by the
+ * names ls -le prints them under; any other right is refused, so no call
+ * can hand the invoker a right over the directory's entries or its own
+ * metadata.
+ */
+typedef struct {
+	int			 op;	/* 0 none, 1 add (seal), -1 remove (unseal) */
+	uid_t			 uid;
+	uuid_t			 who;
+	acl_permset_mask_t	 rights;
+	int			 absent; /* unseal: no such entry was there */
+} aclspec_t;
+
+static const struct {
+	const char	*name;
+	acl_perm_t	 perm;
+} acl_rights[] = {
+	{ "list",		ACL_LIST_DIRECTORY },
+	{ "add_file",		ACL_ADD_FILE },
+	{ "search",		ACL_SEARCH },
+	{ "add_subdirectory",	ACL_ADD_SUBDIRECTORY },
+	{ "readattr",		ACL_READ_ATTRIBUTES },
+	{ "readextattr",	ACL_READ_EXTATTRIBUTES },
+	{ "readsecurity",	ACL_READ_SECURITY },
+};
+
+/* The inherit flags an entry of ours never carries. */
+static const acl_flag_t acl_inherit[] = {
+	ACL_ENTRY_INHERITED, ACL_ENTRY_FILE_INHERIT, ACL_ENTRY_DIRECTORY_INHERIT,
+	ACL_ENTRY_LIMIT_INHERIT, ACL_ENTRY_ONLY_INHERIT,
+};
+
+#define NITEMS(a) (sizeof(a) / sizeof((a)[0]))
+
+/* --acl-add, --acl-remove: <user>:<right>[,<right>...]. */
+static int
+parse_acl(const char *s, const char *what, aclspec_t *a)
+{
+	char buf[512], *colon, *p, *tok;
+	size_t i;
+
+	a->rights = 0;
+	if (strlcpy(buf, s, sizeof(buf)) >= sizeof(buf) ||
+	    (colon = strchr(buf, ':')) == NULL || colon[1] == '\0') {
+		errf("%s must be <user>:<right>[,<right>...]", what);
+		return (-1);
+	}
+	*colon = '\0';
+	if (parse_user(buf, &a->uid) != 0) {
+		errf("%s names no account: %s", what, buf);
+		return (-1);
+	}
+	if (mbr_uid_to_uuid(a->uid, a->who) != 0) {
+		errf("%s names an account with no uuid: %s", what, buf);
+		return (-1);
+	}
+	p = colon + 1;
+	while ((tok = strsep(&p, ",")) != NULL) {
+		for (i = 0; i < NITEMS(acl_rights); i++)
+			if (strcmp(tok, acl_rights[i].name) == 0)
+				break;
+		if (i == NITEMS(acl_rights)) {
+			errf("%s names a right a placement seal does not grant: "
+			    "'%s'", what, tok);
+			return (-1);
+		}
+		a->rights |= (acl_permset_mask_t)acl_rights[i].perm;
+	}
 	return (0);
 }
 
@@ -1940,6 +2026,8 @@ typedef struct {
 	gid_t		 gid;
 	mode_t		 mode;	/* permission bits */
 	uint32_t	 flags;
+	int		 acl_kept;	/* this run changed the node's ACL */
+	acl_t		 acl;	/* what it held then; NULL for none */
 } jent_t;
 
 typedef struct {
@@ -1952,6 +2040,7 @@ typedef struct {
 	int		 has_mode;
 	mode_t		 mode;
 	int		 recursive;
+	aclspec_t	 acl;		/* --acl-add, --acl-remove */
 	size_t		 plan;		/* --count */
 	size_t		 seen;		/* nodes this pass has reached */
 	dev_t		 dev;
@@ -2017,6 +2106,8 @@ journal_push(tree_t *t, const char *rel, const struct stat *st)
 	e->gid = st->st_gid;
 	e->mode = st->st_mode & 07777;
 	e->flags = st->st_flags;
+	e->acl_kept = 0;
+	e->acl = NULL;
 }
 
 /* True when this run already changed that inode: a second name inside the
@@ -2037,21 +2128,154 @@ journal_free(tree_t *t)
 {
 	size_t i;
 
-	for (i = 0; i < t->jn; i++)
+	for (i = 0; i < t->jn; i++) {
 		free(t->jv[i].rel);
+		if (t->jv[i].acl != NULL)
+			acl_free(t->jv[i].acl);
+	}
 	free(t->jv);
 	t->jv = NULL;
 	t->jn = 0;
 	t->jcap = 0;
 }
 
+/* The ACL a held node carries, or NULL for none. */
+static int
+acl_read(int fd, const char *path, acl_t *out)
+{
+	*out = acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
+	if (*out != NULL || errno == ENOENT)
+		return (0);
+	errf("cannot read the ACL of it (%s): %s", strerror(errno), path);
+	return (-1);
+}
+
+/* Some entry, allow or deny, inherited or not, names the account. */
+static int
+acl_names(acl_t acl, const aclspec_t *a)
+{
+	acl_entry_t e;
+	void *q;
+	int id, hit = 0;
+
+	for (id = ACL_FIRST_ENTRY; !hit && acl_get_entry(acl, id, &e) == 0;
+	    id = ACL_NEXT_ENTRY) {
+		if ((q = acl_get_qualifier(e)) == NULL)
+			continue;
+		hit = memcmp(q, a->who, sizeof(uuid_t)) == 0;
+		acl_free(q);
+	}
+	return (hit);
+}
+
+/* The entry is the one the spec names: an allow for that account, with
+ * exactly those rights and no inherit flag. */
+static int
+acl_is_ours(acl_entry_t e, const aclspec_t *a)
+{
+	acl_tag_t tag;
+	acl_permset_mask_t m;
+	acl_flagset_t fs;
+	void *q;
+	size_t i;
+	int same;
+
+	if (acl_get_tag_type(e, &tag) != 0 || tag != ACL_EXTENDED_ALLOW)
+		return (0);
+	if ((q = acl_get_qualifier(e)) == NULL)
+		return (0);
+	same = memcmp(q, a->who, sizeof(uuid_t)) == 0;
+	acl_free(q);
+	if (!same || acl_get_permset_mask_np(e, &m) != 0 || m != a->rights ||
+	    acl_get_flagset_np(e, &fs) != 0)
+		return (0);
+	for (i = 0; i < NITEMS(acl_inherit); i++)
+		if (acl_get_flag_np(fs, acl_inherit[i]) == 1)
+			return (0);
+	return (1);
+}
+
+/*
+ * The ACL node_apply sets: the node's own with the seal's entry added
+ * where chmod +a puts an allow (after the explicit deny entries, ahead of
+ * every other: probed 2026-10-23), or with the entry the unseal names
+ * taken out and every other entry left where it is (~/Library carries
+ * Apple's). *prev is what the node held, for the journal. *next stays
+ * NULL when there is nothing to change: an unseal that finds no such
+ * entry marks it absent, for the caller to report.
+ */
+static int
+acl_next(tree_t *t, const node_t *n, const char *path, acl_t *prev,
+    acl_t *next)
+{
+	aclspec_t *a = &t->acl;
+	acl_entry_t e;
+	acl_tag_t tag;
+	acl_flagset_t fs;
+	int id, at = 0, found = 0, err;
+
+	*next = NULL;
+	if (acl_read(n->fd, path, prev) != 0)
+		return (EX_HELPER_OPFAIL);
+	if (!t->sealing) {
+		if (*prev == NULL) {
+			a->absent = 1;
+			return (EX_HELPER_OK);
+		}
+		if ((*next = acl_dup(*prev)) == NULL)
+			fatal("out of memory");
+		for (id = ACL_FIRST_ENTRY; !found &&
+		    acl_get_entry(*next, id, &e) == 0; id = ACL_NEXT_ENTRY)
+			found = acl_is_ours(e, a);
+		if (found && acl_delete_entry(*next, e) == 0)
+			return (EX_HELPER_OK);
+		err = errno;
+		acl_free(*next);
+		*next = NULL;
+		if (found) {
+			errf("cannot take the ACL entry out (%s): %s",
+			    strerror(err), path);
+			return (EX_HELPER_OPFAIL);
+		}
+		a->absent = 1;
+		return (EX_HELPER_OK);
+	}
+	*next = *prev != NULL ? acl_dup(*prev) : acl_init(1);
+	if (*next == NULL)
+		fatal("out of memory");
+	for (id = ACL_FIRST_ENTRY; acl_get_entry(*next, id, &e) == 0;
+	    id = ACL_NEXT_ENTRY) {
+		if (acl_get_tag_type(e, &tag) != 0 ||
+		    tag != ACL_EXTENDED_DENY || acl_get_flagset_np(e, &fs) != 0 ||
+		    acl_get_flag_np(fs, ACL_ENTRY_INHERITED) == 1)
+			break;
+		at++;
+	}
+	if (acl_create_entry_np(next, &e, at) != 0 ||
+	    acl_set_tag_type(e, ACL_EXTENDED_ALLOW) != 0 ||
+	    acl_set_qualifier(e, a->who) != 0 ||
+	    acl_set_permset_mask_np(e, a->rights) != 0 ||
+	    acl_get_flagset_np(e, &fs) != 0 || acl_clear_flags_np(fs) != 0 ||
+	    acl_set_flagset_np(e, fs) != 0) {
+		errf("cannot build the ACL entry (%s): %s", strerror(errno),
+		    path);
+		acl_free(*next);
+		*next = NULL;
+		return (EX_HELPER_OPFAIL);
+	}
+	return (EX_HELPER_OK);
+}
+
 /*
  * One node's change, on its own descriptor. The blocking bits come off first
- * when the owner or the mode has to change, since both are refused on an
- * immutable or append-only node, root included; then the owner; then the
- * mode (the top node only, and never a link: a link's mode gates nothing on
- * macOS); then the flag word, as found with the seal's flag added or the
- * unseal's taken away. Journaled before anything moves.
+ * when the owner, the mode or the ACL has to change, since each is refused
+ * on an immutable or append-only node, root included; then a seal's ACL
+ * entry, so the invoker never loses their way in, not even for an instant;
+ * then the owner; then the mode (the top node only, and never a link: a
+ * link's mode gates nothing on macOS); then an unseal's ACL entry comes
+ * off, once the owner bits are the invoker's way in again; then the flag
+ * word, as found with the seal's flag added or the unseal's taken away.
+ * Journaled before anything moves, the ACL as it was included.
  */
 static int
 node_apply(tree_t *t, const node_t *n, const char *path, const char *rel,
@@ -2060,34 +2284,81 @@ node_apply(tree_t *t, const node_t *n, const char *path, const char *rel,
 	const struct stat *st = &n->st;
 	uint32_t cur = st->st_flags, want;
 	const char *what;
-	int own, mod;
+	acl_t prev = NULL, next = NULL;
+	int own, mod, rc;
 
 	want = t->sealing ? (cur | t->flag) : (cur & ~t->flag);
 	own = t->chown && (st->st_uid != t->uid || st->st_gid != t->gid);
 	mod = t->has_mode && is_top && !S_ISLNK(st->st_mode) &&
 	    (st->st_mode & 07777) != t->mode;
-	if (!own && !mod && want == cur)
+	if (t->acl.op != 0 && is_top &&
+	    (rc = acl_next(t, n, path, &prev, &next)) != EX_HELPER_OK) {
+		if (prev != NULL)
+			acl_free(prev);
+		return (rc);
+	}
+	if (next == NULL && prev != NULL) {
+		acl_free(prev);
+		prev = NULL;
+	}
+	if (!own && !mod && next == NULL && want == cur)
 		return (EX_HELPER_OK);
 	journal_push(t, rel, st);
-	if ((own || mod) && (cur & BLOCKING_FLAGS) != 0) {
+	if (next != NULL) {
+		t->jv[t->jn - 1].acl_kept = 1;
+		t->jv[t->jn - 1].acl = prev;
+	}
+	if ((own || mod || next != NULL) && (cur & BLOCKING_FLAGS) != 0) {
 		cur &= ~(uint32_t)BLOCKING_FLAGS;
 		what = "lift the flags on";
 		if (fchflags(n->fd, cur) != 0)
 			goto fail;
 	}
+	what = "add the ACL entry to";
+	if (next != NULL && t->sealing &&
+	    acl_set_fd_np(n->fd, next, ACL_TYPE_EXTENDED) != 0)
+		goto fail;
 	what = "change the owner of";
 	if (own && fchown(n->fd, t->uid, t->gid) != 0)
 		goto fail;
 	what = "change the mode of";
 	if (mod && fchmod(n->fd, t->mode) != 0)
 		goto fail;
+	what = "take the ACL entry off";
+	if (next != NULL && !t->sealing &&
+	    acl_set_fd_np(n->fd, next, ACL_TYPE_EXTENDED) != 0)
+		goto fail;
 	what = "set the flags on";
 	if (want != cur && fchflags(n->fd, want) != 0)
 		goto fail;
+	if (next != NULL)
+		acl_free(next);
 	return (EX_HELPER_OK);
 fail:
 	errf("cannot %s it (%s): %s", what, strerror(errno), path);
+	if (next != NULL)
+		acl_free(next);
 	return (EX_HELPER_OPFAIL);
+}
+
+/*
+ * A journaled ACL back as it was. An empty ACL is how the kernel is told
+ * a node carries none (probed 2026-10-23: the node then reads back with
+ * no ACL at all, as after chmod -a of its last entry).
+ */
+static int
+acl_put_back(int fd, const jent_t *e)
+{
+	acl_t none = NULL;
+	int rc;
+
+	if (e->acl == NULL && (none = acl_init(1)) == NULL)
+		return (-1);
+	rc = acl_set_fd_np(fd, e->acl != NULL ? e->acl : none,
+	    ACL_TYPE_EXTENDED);
+	if (none != NULL)
+		acl_free(none);
+	return (rc);
 }
 
 /*
@@ -2133,14 +2404,21 @@ restore_one(const tree_t *t, const jent_t *e)
 	cur = st.st_flags;
 	own = st.st_uid != e->uid || st.st_gid != e->gid;
 	mod = e->type != S_IFLNK && (st.st_mode & 07777) != e->mode;
-	if ((own || mod) && (cur & BLOCKING_FLAGS) != 0) {
+	if ((own || mod || e->acl_kept) && (cur & BLOCKING_FLAGS) != 0) {
 		cur &= ~(uint32_t)BLOCKING_FLAGS;
 		if (fchflags(fd, cur) != 0)
 			goto out;
 	}
+	/* The ACL goes back on the side of the owner that keeps the invoker
+	 * in: an unseal's entry before the lock account owns the node again,
+	 * a seal's off only once the invoker does. */
+	if (e->acl_kept && !t->sealing && acl_put_back(fd, e) != 0)
+		goto out;
 	if (own && fchown(fd, e->uid, e->gid) != 0)
 		goto out;
 	if (mod && fchmod(fd, e->mode) != 0)
+		goto out;
+	if (e->acl_kept && t->sealing && acl_put_back(fd, e) != 0)
 		goto out;
 	if (cur != e->flags && fchflags(fd, e->flags) != 0)
 		goto out;
@@ -3123,6 +3401,14 @@ block_signals(void)
  * would reach: --count's 1 for a single node, the whole tree with
  * --recursive. Any other number refuses, and every pass after it is held
  * to the same count (visit).
+ *
+ * A placement directory also carries one ACL entry for the invoker (see
+ * aclspec_t): seal --acl-add puts it on before the owner changes, and
+ * refuses a directory that already has an entry naming that account,
+ * since a release could not tell the two apart; unseal --acl-remove takes
+ * exactly that entry off after the owner and mode are back, and an entry
+ * that is not there as named is left to the caller, on an acl-absent line.
+ * Both take a single directory, never a tree.
  */
 static int
 cmd_tree(int argc, char **argv, int sealing)
@@ -3187,6 +3473,28 @@ cmd_tree(int argc, char **argv, int sealing)
 		errf("--recursive takes --flag uchg");
 		return (EX_HELPER_USAGE);
 	}
+	if (o.acl_add != NULL && !sealing) {
+		errf("--acl-add is for seal; unseal takes --acl-remove");
+		return (EX_HELPER_USAGE);
+	}
+	if (o.acl_remove != NULL && sealing) {
+		errf("--acl-remove is for unseal; seal takes --acl-add");
+		return (EX_HELPER_USAGE);
+	}
+	if (o.acl_add != NULL || o.acl_remove != NULL) {
+		const char *what = sealing ? "--acl-add" : "--acl-remove";
+
+		/* One entry on one directory: nothing below it is the
+		 * placement seal's. */
+		if (o.recursive) {
+			errf("%s takes a single node, never --recursive", what);
+			return (EX_HELPER_USAGE);
+		}
+		if (parse_acl(sealing ? o.acl_add : o.acl_remove, what,
+		    &t.acl) != 0)
+			return (EX_HELPER_USAGE);
+		t.acl.op = sealing ? 1 : -1;
+	}
 	t.sealing = sealing;
 	t.owners = &owners;
 	t.recursive = o.recursive;
@@ -3219,6 +3527,30 @@ cmd_tree(int argc, char **argv, int sealing)
 		errf("refusing, a set-user-id or set-group-id mode would run "
 		    "as the file's new owner once sealed: %s", o.path);
 		rc = EX_HELPER_REFUSED;
+	}
+	if (rc == EX_HELPER_OK && t.acl.op != 0 &&
+	    !S_ISDIR(top.st.st_mode)) {
+		errf("refusing, an ACL entry goes on a directory only: %s",
+		    o.path);
+		rc = EX_HELPER_REFUSED;
+	}
+	if (rc == EX_HELPER_OK && t.acl.op > 0) {
+		acl_t had;
+
+		if (acl_read(top.fd, o.path, &had) != 0) {
+			rc = EX_HELPER_OPFAIL;
+		} else if (had != NULL) {
+			if (acl_names(had, &t.acl)) {
+				char who[64];
+
+				user_name(t.acl.uid, who, sizeof(who));
+				errf("refusing, it already carries an ACL entry "
+				    "for %s, which a release could not tell "
+				    "from the seal's own: %s", who, o.path);
+				rc = EX_HELPER_REFUSED;
+			}
+			acl_free(had);
+		}
 	}
 	if (rc != EX_HELPER_OK) {
 		close(top.fd);
@@ -3268,6 +3600,11 @@ cmd_tree(int argc, char **argv, int sealing)
 	}
 	if (rc != EX_HELPER_OK && rollback(&t) != 0)
 		rc = EX_HELPER_WINOPEN;
+	if (rc == EX_HELPER_OK && t.acl.absent) {
+		fputs("acl-absent\t", stdout);
+		print_escaped(o.path);
+		fputc('\n', stdout);
+	}
 	journal_free(&t);
 	close(top.fd);
 	return (rc);
