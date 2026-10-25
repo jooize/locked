@@ -5090,6 +5090,12 @@ report_mismatch() {
   do_verify >/dev/null 2>&1 || true
 }
 
+# drop_editdir <dir>: remove an edit folder once it is the invoker's, as
+# the invoker (see do_edit_one). 9>&-: rm must not hold the run lock.
+drop_editdir() {
+  sudo -u "$inv" -- /bin/rm -rf -- "$1" 9>&- || true
+}
+
 # sudoedit-style edit: the locked file never spends time unlocked. The
 # editor runs AS THE INVOKER on a user-owned temp copy; the candidate is
 # then pulled into lock-account staging (out of user reach) BEFORE the
@@ -5242,31 +5248,38 @@ do_edit_one() {
       cp -- "$held" "$copy" || { rm -f -- "$held"; rm -rf -- "$editdir"; return 1; }
       rm -f -- "$held"
     fi
-    chown -R "$inv" "$editdir" || { rm -rf -- "$editdir"; return 1; }
-    chmod 700 "$editdir" || { rm -rf -- "$editdir"; return 1; }
-    chmod 600 "$copy" || { rm -rf -- "$editdir"; return 1; }
+    # From the chown on, the folder is yours, and anything running as you
+    # can change what is in it or put another folder at its name. So it is
+    # removed as you: root never deletes in a tree another account can
+    # change, and a swap only ever costs you what you could delete
+    # yourself. chown -R takes the folder first, so even a chown cut short
+    # leaves it yours to remove; if it did not get that far, the root-owned
+    # 700 folder stays in /tmp rather than root deleting by name.
+    chown -R "$inv" "$editdir" || { drop_editdir "$editdir"; return 1; }
+    chmod 700 "$editdir" || { drop_editdir "$editdir"; return 1; }
+    chmod 600 "$copy" || { drop_editdir "$editdir"; return 1; }
 
     local editor
     editor="${OPT_EDITOR:-${SUDO_EDITOR:-${VISUAL:-${EDITOR:-vi}}}}"
     # 9>&-: the editor must not inherit the run lock (see run_lock_take).
     if ! sudo -u "$inv" -- "$editor" "$copy" 9>&-; then
       say_err "editor exited nonzero; nothing installed" "$f"
-      rm -rf -- "$editdir"
+      drop_editdir "$editdir"
       return 1
     fi
 
     # Pull the candidate out of user reach BEFORE showing the diff.
-    stage="$(stage_new)" || { rm -rf -- "$editdir"; return 1; }
+    stage="$(stage_new)" || { drop_editdir "$editdir"; return 1; }
     # Root-side redirect, invoker-side read -- see the --from branch.
     # shellcheck disable=SC2024
     sudo -u "$inv" -- /bin/cat -- "$copy" >"$stage" || {
       rm -f -- "$stage"
-      rm -rf -- "$editdir"
+      drop_editdir "$editdir"
       say_err "edit: cannot read the edited copy as $inv" "$copy"
       log_action edit "$f" refuse-unreadable-copy
       return 1
     }
-    rm -rf -- "$editdir"
+    drop_editdir "$editdir"
   fi
 
   # Decided on the frozen bytes, not on the candidate: the no-change check

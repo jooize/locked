@@ -807,6 +807,22 @@ check "owner still lock account"         "$LOCK_ACCT" "$(owner_of "$CFG")"
 ok   "verify clean after edit"           locked verify
 ok   "revert undoes the edit"            locked revert "$CFG"
 check "revert restored pre-edit"         "version 4" "$(head -1 "$CFG")"
+# The edit folder is yours once the editor runs, so locked removes it as
+# you. This editor notes its folder, so the check can look there.
+EDREC="$SCRATCH/edscript-rec"
+EDDIR="$SCRATCH/edscript-rec.dir"
+cat >"$EDREC" <<EOS
+#!/bin/sh
+dirname "\$1" > '$EDDIR'
+printf 'edited by script\n' > "\$1"
+EOS
+chmod 755 "$EDREC"
+install -o "$INV" -m 644 /dev/null "$EDDIR"
+ok   "an edit with a noting editor"      locked edit --yes --editor "$EDREC" "$CFG"
+check "the editor ran in an edit folder" "1" "$(grep -c '^/tmp/locked-edit\.' "$EDDIR")"
+deny "and it is gone afterwards"         test -e "$(cat "$EDDIR")"
+ok   "revert that edit too"              locked revert "$CFG"
+check "and it is back to version 4"      "version 4" "$(head -1 "$CFG")"
 
 note "cli: locked edit --from -- a proposal instead of an editor"
 # A tool (or the user) writes the whole proposed file somewhere they own;
