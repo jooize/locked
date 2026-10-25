@@ -80,7 +80,13 @@ SCRATCH="$(cd "$SCRATCH" && pwd -P)"
 # not give one back to a group they are not in, so every chown here hands a
 # node to the group it already has: a roll back can then always restore it.
 MYGROUP="$(/usr/bin/stat -f '%Sg' "$SCRATCH")"
+# A second scratch dir under /private/tmp, for the walk through /tmp.
+TMPLINKED=""
 cleanup() {
+  if [ -n "$TMPLINKED" ]; then
+    /usr/bin/chflags -R nouchg "$TMPLINKED" 2>/dev/null || true
+    /bin/rm -rf -- "$TMPLINKED"
+  fi
   /usr/bin/chflags -R nouchg,nouappnd "$SCRATCH" 2>/dev/null || true
   # The ACL cases leave deny entries that refuse a removal.
   /bin/chmod -R -N "$SCRATCH" 2>/dev/null || true
@@ -196,6 +202,27 @@ note "the path walk"
 /bin/ln -s "$T" "$SCRATCH/t2-link"
 expect "a symlink on the path is refused" 7 "a symlink or not a directory" \
   seal --path "$SCRATCH/t2-link/one.txt" --id - "${OWN[@]}" --flag uchg
+# A symlink only root controls is followed: /tmp is root's link in "/",
+# which only root may change, so the walk puts private/tmp in its place.
+# The caller's own link above is refused all the same.
+TMPLINKED="$(/usr/bin/mktemp -d /private/tmp/locked-helper-gates.XXXXXX)"
+printf 'x\n' >"$TMPLINKED/f.txt"
+TL="/tmp/${TMPLINKED#/private/tmp/}"
+expect "a path through root's /tmp link is followed" 0 - \
+  seal --path "$TL/f.txt" --id - --owner "$ME" --flag uchg
+check "and the node it reaches carries the flag" "uchg" "$(flags_of "$TMPLINKED/f.txt")"
+expect "the unseal goes the same way" 0 - \
+  unseal --path "$TL/f.txt" --id - --owner "$ME" --flag uchg
+check "and the flag is off again" "" "$(flags_of "$TMPLINKED/f.txt")"
+expect "copy reads through it too, as the caller" 0 - \
+  "$TST" copy --src "$TL/f.txt" --src-id - --owner "$ME" --as "$ME" \
+  --dest "$SCRATCH/copy-tmp"
+check "the copy holds the bytes" "x" "$(cat "$SCRATCH/copy-tmp")"
+# Below /private/tmp, which anyone may write, no link is followed, not even
+# one that points back into the same folder.
+/bin/ln -s "$TMPLINKED" "$TMPLINKED/self"
+expect "a link below a folder others can write is refused" 7 "a symlink or not a directory" \
+  seal --path "$TL/self/f.txt" --id - --owner "$ME" --flag uchg
 expect "a dot-dot component is refused" 7 "not canonical" \
   seal --path "$T/a/../one.txt" --id - "${OWN[@]}" --flag uchg
 expect "a symlink as the node is sealed as itself" 0 - \

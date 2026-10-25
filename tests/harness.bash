@@ -183,6 +183,7 @@ cleanup_scratch() {
     rm -rf -- "$SCRATCH"
   fi
   if [ -n "${ANC:-}" ]; then rm -rf -- "$ANC"; fi
+  if [ -n "${LW:-}" ]; then rm -rf -- "$LW"; fi
 }
 cleanup() {
   cleanup_scratch
@@ -3654,12 +3655,52 @@ refuse "a closed folder refuses through locked too" "$INV cannot enter a directo
 check "the file is still yours"                "$INV" "$(owner_of "$RA/closed/mine.txt")"
 check "and carries no flag"                    "" "$(flags_of "$RA/closed/mine.txt")"
 deny  "and no record was written for it"       test -e "$(meta_path "$RA/closed/mine.txt")"
-# The staging copies the helper reads live under the state root, and its
-# walk refuses a symlink on the way: the default must be spelled without
-# the /var link.
+note "the path walk: which symlinks it follows"
+# The helper walks every path from "/" and follows a symlink only where
+# root alone decides what it points at: a link root owns, with every folder
+# from "/" down to it root's and closed to its group and others. /var is
+# one, and the default state root, where the staging copies live, goes
+# through it. Every other link on a path is refused, as a path that changed
+# after it was resolved. The fixtures sit in LW under /var/db, a chain only
+# root can change.
 SRDEF="$(sed -n 's|^: "${LOCKED_STATE_ROOT:=\(.*\)}"$|\1|p' "$LOCKED")"
-check "the default state root's parent has no symlink on its path" \
-      "$(dirname "$SRDEF")" "$(cd "$(dirname "$SRDEF")" && pwd -P)"
+check "the default state root is spelled through /var" "/var/db/locked" "$SRDEF"
+LW="$(mktemp -d /private/var/db/locked-harness-links.XXXXXX)"
+chmod 755 "$LW"
+install -d -o root -g wheel -m 755 "$LW/real"
+printf 'walked\n' >"$LW/real/f.txt"
+lw_copy() { # <src> <dest name>
+  "$HELPER" copy --src "$1" --src-id - --owner root --as root --dest "$RADEST/$2"
+}
+ok    "a path through /var is followed"        lw_copy "/var/db/${LW#/private/var/db/}/real/f.txt" w1
+check "to the file at the end"                 "walked" "$(cat "$RADEST/w1")"
+ln -s real "$LW/rel"
+ok    "root's relative link in root-only folders is followed" lw_copy "$LW/rel/f.txt" w2
+ln -s "$LW/real" "$LW/abs"
+ok    "and its absolute one"                   lw_copy "$LW/abs/f.txt" w3
+ln -s "$LW/real" "$LW/yours"
+chown -h "$INV" "$LW/yours"
+refuse "a link of yours in root's folder is refused" "a symlink or not a directory" \
+       lw_copy "$LW/yours/f.txt" w4
+install -d -o root -g wheel -m 775 "$LW/group-writable"
+ln -s "$LW/real" "$LW/group-writable/l"
+refuse "root's link in a folder its group may write is refused" "a symlink or not a directory" \
+       lw_copy "$LW/group-writable/l/f.txt" w5
+install -d -o "$INV" -g staff -m 755 "$LW/mine"
+install -d -o root -g wheel -m 755 "$LW/mine/roots"
+ln -s "$LW/real" "$LW/mine/roots/l"
+refuse "root's link below a folder of yours is refused" "a symlink or not a directory" \
+       lw_copy "$LW/mine/roots/l/f.txt" w6
+ln -s "../${LW##*/}/real" "$LW/dotdot"
+refuse "a link whose target climbs with .. is refused" "does not point at a plain path" \
+       lw_copy "$LW/dotdot/f.txt" w7
+# A chain: c0 -> c1 -> ... -> c9 -> real. From c2 that is 8 links, the
+# most one walk follows; from c1 it is 9.
+ln -s real "$LW/c9"
+for i in 8 7 6 5 4 3 2 1 0; do ln -s "c$((i + 1))" "$LW/c$i"; done
+ok    "a chain of 8 links is followed"         lw_copy "$LW/c2/f.txt" w8
+refuse "a chain of 9 is refused"               "more than 8 symlinks" \
+       lw_copy "$LW/c1/f.txt" w9
 
 note "owner gate: a relock after a swap for a root-owned link"
 # A node sealed and then unlocked sits at a path in your space. Swap it for

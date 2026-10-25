@@ -88,10 +88,10 @@ VERSION=0.16.0
 readonly LOCKED_GIT=/Library/Developer/CommandLineTools/usr/bin/git
 # Everything locked keeps: one root-owned dir per user under it, holding
 # that user's pool and the result of the last verify run (see the root
-# convergence block below for the shape). Spelled without the /var symlink:
-# the helper walks every path it reads from "/" and refuses a symlink on
-# the way, and the staging copies it reads live under here.
-: "${LOCKED_STATE_ROOT:=/private/var/db/locked}"
+# convergence block below for the shape). The helper walks every path it
+# reads from "/", and follows a symlink only where root alone controls it,
+# as root controls /var; the staging copies it reads live under here.
+: "${LOCKED_STATE_ROOT:=/var/db/locked}"
 # Where 0.14.0 and earlier kept the pools. Read once, by the one-shot
 # conversion in the root convergence block; nothing else looks here.
 : "${LOCKED_LEGACY_ROOT:=/var/db/locked-snapshots}"

@@ -1724,13 +1724,85 @@ become_self(void)
 
 /* ---- reaching a node by descriptor -------------------------------------- */
 
+/* How many symlinks one walk may follow. /var, /tmp and /etc take one each;
+ * a longer chain is refused. */
+#define MAX_LINK_HOPS 8
+
+/* A directory only root can change: root's, and writable by neither its
+ * group nor others. */
+static int
+root_only(int fd)
+{
+	struct stat st;
+
+	return (fstat(fd, &st) == 0 && st.st_uid == 0 &&
+	    (st.st_mode & (S_IWGRP | S_IWOTH)) == 0);
+}
+
+/*
+ * The walk met a symlink, `name` in the directory `fd`. It follows it only
+ * where root alone decides what it points at: the link is root's, and every
+ * directory from "/" down to it is root_only (`trusted`), so no other
+ * account could have placed the link, changed it, or moved the folder that
+ * holds it onto the path. That is how /var, /tmp and /etc reach /private.
+ * Any other link is the refusal it always was. The target must be a plain
+ * path, with no empty, "." or ".." component. 0 with the target in `out`,
+ * -2 for a refusal, -1 for any other failure.
+ */
+static int
+link_target(int fd, const char *name, int trusted, const char *path,
+    char *out, size_t outsz)
+{
+	struct stat st;
+	ssize_t n;
+	const char *c, *end;
+	size_t len;
+
+	if (fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+		errf("cannot read a symlink on the path (%s): %s",
+		    strerror(errno), path);
+		return (-1);
+	}
+	if (!S_ISLNK(st.st_mode) || st.st_uid != 0 || !trusted) {
+		errf("refusing, a directory on the path is a symlink or not a "
+		    "directory: %s", path);
+		return (-2);
+	}
+	n = readlinkat(fd, name, out, outsz);
+	if (n < 0) {
+		errf("cannot read a symlink on the path (%s): %s",
+		    strerror(errno), path);
+		return (-1);
+	}
+	if ((size_t)n >= outsz) {
+		errf("path too long: %s", path);
+		return (-1);
+	}
+	out[n] = '\0';
+	c = out[0] == '/' ? out + 1 : out;
+	for (;;) {
+		end = strchr(c, '/');
+		len = end != NULL ? (size_t)(end - c) : strlen(c);
+		if (len == 0 || (len == 1 && c[0] == '.') ||
+		    (len == 2 && c[0] == '.' && c[1] == '.')) {
+			errf("refusing, a symlink on the path does not point at "
+			    "a plain path: %s", path);
+			return (-2);
+		}
+		if (end == NULL)
+			return (0);
+		c = end + 1;
+	}
+}
+
 /*
  * The directory that holds the last component of an absolute path, reached
  * one component at a time from "/" with O_NOFOLLOW, so no symlink anywhere on
- * the way can redirect the walk. The callers pass canonical paths (the bash
- * side resolves the parent with readlink -f), so a symlink met here means the
- * path changed after it was resolved, and that is a refusal: -2, where any
- * other failure is -1. On success *leaf points into `buf`.
+ * the way can redirect the walk unless root alone controls it (link_target:
+ * /var and its kind). The callers pass canonical paths (the bash side
+ * resolves the parent with readlink -f), so any other symlink met here means
+ * the path changed after it was resolved, and that is a refusal: -2, where
+ * any other failure is -1. On success *leaf points into `buf`.
  * O_SEARCH: a walk needs to pass through each directory, never to read one.
  *
  * With a reader and *inr set, the walk runs as the reader until it meets a
@@ -1743,8 +1815,8 @@ open_parent(const char *path, char *buf, size_t bufsz, const char **leaf,
     const reader_t *r, int *inr)
 {
 	struct stat st, got;
-	char *p, *slash;
-	int fd, nfd, e, reading, handed;
+	char *p, *slash, tgt[PATH_MAX], tmp[PATH_MAX];
+	int fd, nfd, e, reading, handed, trusted, hops = 0, rc;
 
 	if (strlcpy(buf, path, bufsz) >= bufsz) {
 		errf("path too long: %s", path);
@@ -1758,6 +1830,7 @@ open_parent(const char *path, char *buf, size_t bufsz, const char **leaf,
 		errf("cannot open /: %s", strerror(errno));
 		return (-1);
 	}
+	trusted = root_only(fd);
 	p = buf + 1;
 	for (;;) {
 		slash = strchr(p, '/');
@@ -1785,9 +1858,45 @@ open_parent(const char *path, char *buf, size_t bufsz, const char **leaf,
 		}
 		nfd = openat(fd, p, O_SEARCH | O_NOFOLLOW | O_CLOEXEC);
 		e = errno;
+		if (nfd < 0 && (e == ELOOP || e == ENOTDIR)) {
+			/* A symlink (O_SEARCH reports one as ENOTDIR as often
+			 * as ELOOP; link_target asks the node itself): followed
+			 * only as link_target allows, by putting its target in
+			 * its place and walking on. */
+			if (++hops > MAX_LINK_HOPS) {
+				errf("refusing, the path goes through more than "
+				    "%d symlinks: %s", MAX_LINK_HOPS, path);
+				close(fd);
+				return (-2);
+			}
+			rc = link_target(fd, p, trusted, path, tgt, sizeof(tgt));
+			if (rc == 0 && ((size_t)snprintf(tmp, sizeof(tmp), "%s/%s",
+			    tgt, slash + 1) >= sizeof(tmp) ||
+			    strlcpy(buf, tmp, bufsz) >= bufsz)) {
+				errf("path too long: %s", path);
+				rc = -1;
+			}
+			if (rc != 0) {
+				close(fd);
+				return (rc);
+			}
+			p = buf;
+			if (buf[0] == '/') {
+				close(fd);
+				fd = open("/", O_SEARCH | O_CLOEXEC);
+				if (fd < 0) {
+					errf("cannot open /: %s", strerror(errno));
+					return (-1);
+				}
+				trusted = root_only(fd);
+				p = buf + 1;
+			}
+			continue;
+		}
 		close(fd);
 		if (nfd < 0)
 			goto failed;
+		trusted = trusted && root_only(nfd);
 		/* Root opens from here on what the stat said another account
 		 * owns, so it must still be that node. */
 		if (handed && (fstat(nfd, &got) != 0 ||

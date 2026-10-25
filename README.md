@@ -468,7 +468,7 @@ and does not guarantee is written out in
 ## Atomicity and TOCTOU
 
 Snapshot/attic/restore writes go through `atomic_replace`:
-1. The helper copies the source into `/var/db/locked/<user>/pool/.staging/replace.XXXXXX` (lock-account-owned, mode 700 -- invisible to user UID) from a file descriptor it opened `O_NOFOLLOW`, after walking to it from `/` with no symlink allowed on the way, and identity-checked against the volume uuid and inode `locked` expected -- a source swapped between resolution and open is refused, not copied.
+1. The helper copies the source into `/var/db/locked/<user>/pool/.staging/replace.XXXXXX` (lock-account-owned, mode 700 -- invisible to user UID) from a file descriptor it opened `O_NOFOLLOW`, after walking to it from `/` with no symlink allowed on the way but one only root controls (a root-owned link in root-owned folders no one else may write, as `/var` is), and identity-checked against the volume uuid and inode `locked` expected -- a source swapped between resolution and open is refused, not copied.
 2. `chown` and `chmod` the staged temp file.
 3. Verify staging and destination are on the same filesystem (`stat -f '%d'`).
 4. `mv -f` -- atomic same-filesystem rename.
