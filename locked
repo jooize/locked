@@ -88,21 +88,16 @@ VERSION=0.16.1
 # the shim's own path would vouch for a program it does not run.
 readonly LOCKED_GIT=/Library/Developer/CommandLineTools/usr/bin/git
 # Everything locked keeps: one root-owned dir per user under it, holding
-# that user's pool and the result of the last verify run (see the root
-# convergence block below for the shape). The helper walks every path it
-# reads from "/", and follows a symlink only where root alone controls it,
-# as root controls /var; the staging copies it reads live under here.
+# that user's pool (see the root convergence block below for the shape).
+# The helper walks every path it reads from "/", and follows a symlink only
+# where root alone controls it, as root controls /var; the staging copies
+# it reads live under here.
 : "${LOCKED_STATE_ROOT:=/var/db/locked}"
 # The account 0.16 and earlier gave every sealed node to, by default
 # _<user>-lock. Read only by the one-shot conversion to system flags (see
 # convert_pool). TODO(0.18.0): remove with it.
 : "${LOCKED_LOCK_ACCOUNT:=}"
 : "${LOCKED_USER_HOME:=}"
-: "${LOCKED_VERIFY_PLIST:=/Library/LaunchDaemons/locked.verify.plist}"
-# The verify timer's period. The nix module rewrites this default to its
-# verifyInterval option (keep the exact `: "${VAR:=...}"` shape), so a manual
-# `sudo locked verify` records the same interval the timer runs at.
-: "${LOCKED_VERIFY_INTERVAL:=900}"
 
 # ---- palette ---------------------------------------------------------------
 #
@@ -195,8 +190,8 @@ set_pal   # initialize for set -u; callers on a redirected fd re-run it
 # own and read in the value's color, or the diff line's. Under no color
 # the escape text alone carries the fact.
 #
-# Display only: records, logs and the verify status keep the raw bytes
-# (verify_escape writes its own form for its machine-read file).
+# Display only: records and logs keep the raw bytes (path_escape writes
+# its own form for a record's mismatch line).
 #
 # Perl, in bytes from end to end: it reads no locale, which it has to,
 # because sudo's env_reset strips LANG before locked ever runs. Every perl
@@ -599,11 +594,9 @@ usage: sudo locked <action> [options] [args]
       Re-check every locked node against its meta: owner, group, mode,
       flags, identity, the volume it is on, and the content of every
       sealed file against the fingerprint taken when it was sealed. Exit
-      0 clean, 5 on drift. Records the result per user in
-      $LOCKED_STATE_ROOT/<user>/verify, which status shows and other
-      tools may read.
+      0 clean, 5 on drift. Nothing runs it on a schedule.
   setup
-      Digest-pinned sudoers, verify timer; self-install to
+      Digest-pinned sudoers; self-install to
       \$INSTALL_TARGET. Refused on nix-managed installs (the nix module
       declares all of this; rebuild instead).
 
@@ -704,9 +697,10 @@ if [ "$EUID" -ne 0 ] && [ "$action" != "status" ] && [ "$action" != "why" ]; the
   exit 1
 fi
 
-# Root derives the invoking user from sudo; verify can run from launchd with
-# no SUDO_USER at all. Unprivileged status has no sudo hop, so the invoker is
-# whoever we are running as -- SUDO_USER is ignored there on purpose, or
+# Root derives the invoking user from sudo; verify can run from a root
+# shell with no SUDO_USER at all. Unprivileged status has no sudo hop, so
+# the invoker is whoever we are running as -- SUDO_USER is ignored there on
+# purpose, or
 # `sudo -u other locked status` would name a pool the caller's own
 # credentials do not entitle them to.
 if [ "$EUID" -eq 0 ]; then
@@ -736,7 +730,7 @@ fi
 log_action() {
   # ASCII only; visible via:
   #   log show --predicate 'eventMessage CONTAINS "locked: user="' --last 1h
-  logger -t locked "user=${inv:-launchd} action=$1 file=${2:-} result=${3:-ok}"
+  logger -t locked "user=${inv:-root} action=$1 file=${2:-} result=${3:-ok}"
 }
 
 run() {
@@ -1109,9 +1103,9 @@ node_op() {
 #
 # Everything locked keeps is root's: the state root, each user's dir and
 # pool, records, fingerprints, snapshots and staging. The invoker reads
-# their own records and the verify status without sudo through ONE ACL
-# entry naming them -- on their dir, their pool, each record and the
-# status file -- never through a group, and never on fingerprints,
+# their own records without sudo through ONE ACL entry naming them -- on
+# their dir, their pool and each record -- never through a group, and
+# never on fingerprints,
 # snapshots or staging, which only root reads. Only the owner or root may
 # change an ACL, so the entry is root's to give; it carries no inherit
 # flags, so nothing created beside it picks it up.
@@ -1244,14 +1238,14 @@ sum_put() {
 # mismatch_kv <metafile> [<path>]: the record's mismatch lines, one per
 # file whose edit did not install as approved (see check_install), joined
 # for a rewrite to carry through, less any line that names <path>:
-#   mismatch=<at> <what differed> <path, written as verify_escape writes it>
+#   mismatch=<at> <what differed> <path, written as path_escape writes it>
 # The path goes last because an escaped path may still hold a space. The
 # name to drop travels through the environment, not awk -v, which would
 # read the escapes in it as awk's own.
 mismatch_kv() {
   local drop=""
   if [ -n "${2:-}" ]; then
-    drop="$(verify_escape "$2")"
+    drop="$(path_escape "$2")"
   fi
   DROP="$drop" awk '
     index($0, "mismatch=") != 1 { next }
@@ -1370,40 +1364,11 @@ nix_managed() {
   return 1
 }
 
-install_verify_timer() {
-  local tmp
-  tmp="$(mktemp)"
-  cat >"$tmp" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>locked.verify</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>${INSTALL_TARGET}</string>
-    <string>verify</string>
-    <string>--quiet</string>
-  </array>
-  <key>StartInterval</key><integer>${LOCKED_VERIFY_INTERVAL}</integer>
-  <key>RunAtLoad</key><true/>
-  <key>StandardErrorPath</key><string>/var/log/locked-verify.log</string>
-</dict>
-</plist>
-EOF
-  install -m 644 -o root -g wheel "$tmp" "$LOCKED_VERIFY_PLIST"
-  rm -f -- "$tmp"
-  # Idempotent (re)load.
-  launchctl bootout system "$LOCKED_VERIFY_PLIST" 2>/dev/null || true
-  launchctl bootstrap system "$LOCKED_VERIFY_PLIST"
-  say_out "verify timer installed (every ${LOCKED_VERIFY_INTERVAL}s)" "$LOCKED_VERIFY_PLIST"
-}
-
 do_setup() {
   # Under the nix deployment every step below is declared by the nix
-  # module (security.locked): binary in the system profile, digest-pinned
-  # sudoers, verify daemon. Refuse rather than
-  # fight the declarative config; a rebuild is the whole setup there.
+  # module (security.locked): binary in the system profile and
+  # digest-pinned sudoers. Refuse rather than fight the declarative
+  # config; a rebuild is the whole setup there.
   if nix_managed; then
     echo "${E_RED}${E_B}✗ error:${E_OFF} this locked is nix-managed; setup here is declarative." >&2
     echo "         Change the nix module config (security.locked) and rebuild" >&2
@@ -1460,9 +1425,6 @@ do_setup() {
     fi
     rm -f -- "$tmp"
   fi
-
-  # 3. Verify timer.
-  install_verify_timer
 
   log_action setup "" ok
   echo
@@ -1591,8 +1553,8 @@ verify_helper_now() {
   fi
 }
 
-# The per-user state dir, the pool inside it, and the verify status beside
-# the pool. Layout (root converges it below):
+# The per-user state dir and the pool inside it. Layout (root converges it
+# below):
 #
 #   $LOCKED_STATE_ROOT/      root:wheel 711
 #     run.lock               root:wheel 600 (one root run at a time; see run_lock_take)
@@ -1602,10 +1564,9 @@ verify_helper_now() {
 #         *.sum              root:wheel 600 (fingerprints; root's alone)
 #         *.snap, *.snapdir, *.attic, .staging/
 #                            root:wheel 600/700 (root's alone)
-#       verify               root:wheel 600 + <user>'s read entry (the last verify run)
 #
 # The read entry is pool_grant's: <user> lists and reads, and nobody else
-# gets in, so another user's pool and status are refused by the kernel,
+# gets in, so another user's pool is refused by the kernel,
 # not by our checks.
 USER_DIR=""
 USER_POOL=""
@@ -1614,14 +1575,13 @@ if [ -n "$inv" ]; then
   USER_POOL="$USER_DIR/pool"
 fi
 
-# One root run at a time. Every root invocation -- a ceremony, the timer's
-# verify, a verify by hand -- holds this lock from the convergence below
-# until it exits. Without it, verify could read a record or a node halfway
-# through a ceremony and report drift that is not there; two ceremonies
-# could plan against one pool at once, so one releases a chain node the
-# other's new leaf needs; and an older verify that finished last would
-# overwrite a newer run's status. A run that finds the lock held says whose
-# it is and waits.
+# One root run at a time. Every root invocation -- a ceremony, a verify, a
+# status under sudo -- holds this lock from the convergence below until it
+# exits. Without it, verify could read a record or a node halfway through
+# a ceremony and report drift that is not there, and two ceremonies could
+# plan against one pool at once, so one releases a chain node the other's
+# new leaf needs. A run that finds the lock held says whose it is and
+# waits.
 #
 # flock(2), not a lock dir: the kernel drops the lock when its last
 # descriptor closes, so a killed run never leaves one behind. bash cannot
@@ -1680,8 +1640,8 @@ if [ "$EUID" -eq 0 ]; then
   # one dir whose name they already know and cannot enumerate who else has
   # one. The per-user dir and the pool are root's 700, and their user gets
   # in through the read entry alone (pool_grant). Only root adds, renames
-  # or removes an entry in either, so the verify status is exactly as
-  # trustworthy as the root job that writes it.
+  # or removes an entry in either, so a record the user reads is exactly
+  # what root wrote.
   install -d -m 711 -o root -g wheel "$LOCKED_STATE_ROOT"
   run_lock_take || exit 1
   if [ -n "$USER_DIR" ]; then
@@ -1896,10 +1856,22 @@ vfind() {
 vline() { vfind "$1" fact "$2"; }
 vctx() { vfind "$1" context "$2"; }
 
-# verify_unescape <text>: the bytes verify_escape wrote as \xHH, back as
+# path_escape <path>: the form a record's mismatch line keeps a path in.
+# Paths come from the user's own file names, so every byte outside
+# printable ASCII, and the backslash itself, is written as \xHH: the line
+# stays printable ASCII, and no file name can end it early and add a key
+# of its own.
+path_escape() {
+  # Bytes, not characters: without -C perl reads its argument as octets, so
+  # a multi-byte character becomes one \xHH per byte (env -i: no
+  # PERL_UNICODE or PERL5OPT can add a -C).
+  env -i /usr/bin/perl -e '$_ = $ARGV[0]; s/([^\x20-\x5b\x5d-\x7e])/sprintf("\\x%02x", ord($1))/ge; print' -- "$1"
+}
+
+# path_unescape <text>: the bytes path_escape wrote as \xHH, back as
 # bytes (either case), so a path from a record can be escaped for display
 # like any other.
-verify_unescape() {
+path_unescape() {
   env -i /usr/bin/perl -e '$_ = $ARGV[0]; s/\\x([0-9A-Fa-f]{2})/chr(hex($1))/ge; print' -- "$1"
 }
 
@@ -1973,8 +1945,8 @@ upgrade_identity_record() { # <path> <metafile> <live id>
 # path, or over a folder above it, is named here), and for a sealed file
 # or folder, as root, its content against the fingerprints taken when it
 # was sealed. Without root the fingerprints are not readable -- they are
-# root's alone (write_sum) -- so status shows the content as the last
-# verify found it (verify_summary).
+# root's alone (write_sum) -- so status without sudo leaves the content
+# out and says so (status_unpriv_note).
 verify_node() {
   local f="$1" meta="$2"
   local state flag flagsym mode owner group id recursive bin mnt
@@ -2054,7 +2026,7 @@ verify_node() {
   # An edit whose install check failed left a line on the record, and it
   # stays drift -- unlocked or not -- until an edit of that file installs
   # cleanly, or the record is sealed afresh (a relock or a revert). The
-  # record holds the file's path as verify_escape wrote it; it is shown
+  # record holds the file's path as path_escape wrote it; it is shown
   # as the characters it names.
   local mbad=0 mall mline mrest mat mwhat
   mall="$(mismatch_kv "$meta")"
@@ -2066,9 +2038,9 @@ verify_node() {
     mrest="${mrest#* }"
     mwhat="${mrest%% *}"
     if [ "$mwhat" = conversion ]; then
-      vline drift "the content changed while its seal was converted at $mat: $(verify_unescape "${mrest#* }")"
+      vline drift "the content changed while its seal was converted at $mat: $(path_unescape "${mrest#* }")"
     else
-      vline drift "an edit at $mat did not install as approved ($mwhat): $(verify_unescape "${mrest#* }")"
+      vline drift "an edit at $mat did not install as approved ($mwhat): $(path_unescape "${mrest#* }")"
     fi
     mbad=1
   done
@@ -4602,7 +4574,7 @@ stage_sum() {
 # check_install, or nothing when it passed.
 mismatch_line() {
   if [ -n "$2" ]; then
-    printf 'mismatch=%s %s %s' "$(now_utc)" "$2" "$(verify_escape "$1")"
+    printf 'mismatch=%s %s %s' "$(now_utc)" "$2" "$(path_escape "$1")"
   fi
 }
 
@@ -4622,17 +4594,14 @@ mismatch_join() {
 }
 
 # report_mismatch <path> <what differed> <record path>: the loud half of a
-# failed check_install. The record already carries the line; a verify run
-# now puts it in the status file, so a statusline shows it at once rather
-# than at the next timer run. Its output is not repeated here: the lines
-# above say what drifted, and `locked verify` prints the rest.
+# failed check_install. The record already carries the line, so status
+# and verify show it as drift from now on; the lines above say what
+# drifted, and `locked verify` prints the rest.
 report_mismatch() {
   local f="$1" what="$2" rec="$3"
   err_val "installed, but it is not what you approved ($what)" "$f"
   say_err "  recorded as drift until you edit the file again, or unlock and relock this record" "$rec"
   log_action edit "$f" "mismatch-${what//,/-}"
-  local OPT_QUIET=1
-  do_verify >/dev/null 2>&1 || true
 }
 
 # drop_editdir <dir>: remove an edit folder once it is the invoker's, as
@@ -5789,20 +5758,20 @@ do_status_one() {
   return "$rc"
 }
 
-# Without root, verify_node's recursive stray-scan silently sees nothing
-# inside a tree whose captured modes deny the caller read, so a drifted
+# Without root, verify_node cannot read the fingerprints (they are root's
+# alone), and its recursive stray-scan silently sees nothing inside a tree
+# whose captured modes deny the caller read, so a changed file or a drifted
 # recursive dir can render clean. Say so once rather than letting the
 # checkmark overclaim; root output stays untouched.
 status_unpriv_note() {
   [ "$EUID" -eq 0 ] && return 0
-  echo "${E_YEL}note:${E_OFF} without sudo, recursive trees get leaf checks only; sudo locked status is authoritative" >&2
+  echo "${E_YEL}note:${E_OFF} without sudo, content is not compared and recursive trees get leaf checks only; sudo locked status is authoritative" >&2
 }
 
 # status with no path: list every node in the invoking user's pool, so the
-# whole locked surface is visible at a glance, then what the last verify
-# run found. Reporting only -- unlike verify it never writes the status
-# file and drift does not change the exit code, so looking never turns
-# into an enforcement action.
+# whole locked surface is visible at a glance. Reporting only -- drift
+# does not change the exit code, so looking never turns into an
+# enforcement action.
 do_status_pool() {
   local listing meta n
   # Sorted by DECODED path, so the listing reads in filesystem order rather
@@ -5815,8 +5784,6 @@ do_status_pool() {
   set_pal
   if [ -z "$listing" ]; then
     echo "pool for $inv is empty"
-    echo
-    verify_summary "$USER_DIR"
     return 0
   fi
   echo "${P_B}pool for $inv:${P_OFF}"
@@ -5842,170 +5809,33 @@ EOF
     done
     echo "      The next sudo locked lock, unprotect or rm releases them."
   fi
-  echo
-  verify_summary "$USER_DIR"
   return 0
 }
 
-# ---- verify status -----------------------------------------------------------
-#
-# Each verify run leaves one file per user, <state root>/<user>/verify, for
-# anything that wants the result without root: status below, a statusline,
-# a login check. locked names no consumer; a reader knows this path.
-#
-#   at=2026-09-15T20:15:00Z    when the run started (UTC)
-#   interval=900               seconds between timer runs; older than a few
-#                              intervals means the timer has stopped
-#   records=26                 pool records the run walked
-#   drifted=2                  of those, how many drifted
-#   drift=/Users/you/...       one line per drifted path, at most
-#                              VERIFY_PATHS_MAX; drifted= is the count
-#
-# One file, replaced whole by a rename, so a reader always gets a single
-# run's answer and never half of one. Only root writes it: the file and the
-# dir it sits in are root's, and the user reads both through their read
-# entry (pool_grant) and can change neither. Paths come from the user's own file names, so
-# every byte outside printable ASCII, and the backslash itself, is written
-# as \xHH: each line is printable ASCII, and no file name can end a line
-# early and add a key of its own.
-VERIFY_PATHS_MAX=20
-
-verify_escape() { # <path>: printable ASCII, \xHH for every other byte
-  # Bytes, not characters: without -C perl reads its argument as octets, so
-  # a multi-byte character becomes one \xHH per byte (env -i: no
-  # PERL_UNICODE or PERL5OPT can add a -C).
-  env -i /usr/bin/perl -e '$_ = $ARGV[0]; s/([^\x20-\x5b\x5d-\x7e])/sprintf("\\x%02x", ord($1))/ge; print' -- "$1"
-}
-
-write_verify_status() { # <userdir> <user> <at> <records> [drifted path...]
-  local dir="$1" user="$2" at="$3" records="$4"
-  shift 4
-  local tmp p n=0
-  tmp="$(mktemp "$dir/.verify.XXXXXX")" || return 1
-  {
-    printf 'at=%s\n' "$at"
-    printf 'interval=%s\n' "$LOCKED_VERIFY_INTERVAL"
-    printf 'records=%s\n' "$records"
-    printf 'drifted=%s\n' "$#"
-    for p in "$@"; do
-      n=$((n + 1))
-      [ "$n" -le "$VERIFY_PATHS_MAX" ] || break
-      printf 'drift=%s\n' "$(verify_escape "$p")"
-    done
-  } >"$tmp" || { rm -f -- "$tmp"; return 1; }
-  chown root:wheel "$tmp" || { rm -f -- "$tmp"; return 1; }
-  chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
-  pool_grant "$tmp" "$user" file || { rm -f -- "$tmp"; return 1; }
-  mv -f -- "$tmp" "$dir/verify" || { rm -f -- "$tmp"; return 1; }
-}
-
-fmt_age() { # <seconds>: how long ago, in the largest whole unit
-  local s="$1"
-  if [ "$s" -lt 60 ]; then echo "just now"
-  elif [ "$s" -lt 3600 ]; then echo "$((s / 60)) min ago"
-  elif [ "$s" -lt 172800 ]; then echo "$((s / 3600)) h ago"
-  else echo "$((s / 86400)) days ago"
-  fi
-}
-
-# One block for status: what the last verify run found, from the file above.
-# A run older than three intervals is stale -- the timer has stopped or the
-# machine has not been awake to run it -- and says so, because a clean
-# answer from yesterday is not a clean answer now. The status file is a
-# path, so it ends whichever line names it; the drifted paths come back as
-# the bytes verify_escape wrote and are shown as any other path is.
-verify_summary() { # <userdir>
-  local f="$1/verify" line at="" interval="" drifted="" epoch now age when ef
-  local paths=()
-  set_pal
-  esc_into ef "$f" "$P_RV"
-  if [ ! -e "$f" ]; then
-    echo "${P_B}last verify:${P_OFF} ${P_DIM}-${P_OFF}  none recorded"
-    echo "      ${P_DIM}the timer writes it at: $ef${P_OFF}"
-    return 0
-  fi
-  if [ -L "$f" ] || [ ! -f "$f" ] || [ ! -r "$f" ]; then
-    echo "${P_B}last verify:${P_OFF} ${P_RED}✗${P_OFF}  cannot read: $ef"
-    return 0
-  fi
-  while IFS= read -r line; do
-    case "$line" in
-      at=*)       at="${line#at=}" ;;
-      interval=*) interval="${line#interval=}" ;;
-      drifted=*)  drifted="${line#drifted=}" ;;
-      drift=*)    paths+=("${line#drift=}") ;;
-    esac
-  done <"$f"
-  case "$interval" in ''|*[!0-9]*) interval="" ;; esac
-  case "$drifted" in ''|*[!0-9]*) drifted="" ;; esac
-  if [ -z "$interval" ] || [ -z "$drifted" ]; then
-    echo "${P_B}last verify:${P_OFF} ${P_RED}✗${P_OFF}  malformed: $ef"
-    return 0
-  fi
-  epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$at" +%s 2>/dev/null)" || {
-    echo "${P_B}last verify:${P_OFF} ${P_RED}✗${P_OFF}  malformed: $ef"
-    return 0
-  }
-  now="$(date +%s)"
-  age=$((now - epoch))
-  [ "$age" -ge 0 ] || age=0
-  if [ "$age" -lt 72000 ]; then
-    when="$(date -r "$epoch" +%H:%M)"
-  else
-    when="$(date -r "$epoch" '+%Y-%m-%d %H:%M')"
-  fi
-  if [ "$drifted" -eq 0 ]; then
-    echo "${P_B}last verify:${P_OFF} ${P_GRN}✓${P_OFF}  clean ${P_DIM}($when, $(fmt_age "$age"))${P_OFF}"
-  else
-    echo "${P_B}last verify:${P_OFF} ${P_RED}✗${P_OFF}  $drifted drifted ${P_DIM}($when, $(fmt_age "$age"))${P_OFF}"
-    for line in ${paths[@]+"${paths[@]}"}; do
-      path_lines "      " "$(verify_unescape "$line")"
-    done
-    [ "$drifted" -le "${#paths[@]}" ] || echo "      and $((drifted - ${#paths[@]})) more"
-    echo "      details: ${P_CYN}sudo locked verify${P_OFF}"
-  fi
-  if [ "$age" -gt $((3 * interval)) ]; then
-    echo "${P_YEL}note:${P_OFF} that run is stale; the timer runs every ${interval}s"
-  fi
-  return 0
-}
-
+# verify: every user's pool, as root, fingerprints included. It reports
+# and exits; it keeps no result. Nothing schedules it: the seals hold
+# whether or not anyone looks, and a look is `locked status`, or this verb
+# for the content as well.
 do_verify() {
-  local total_drift=0 status_failed=0 udir uname records at
-  local meta fpath out
-  local drifted=()
-  # One start time for every user's status: the moment the answer is as of.
-  at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  local total_drift=0 udir uname meta fpath out
   for udir in "$LOCKED_STATE_ROOT"/*/; do
     udir="${udir%/}"
     uname="$(basename "$udir")"
     case "$uname" in .*) continue ;; esac
-    records=0
-    drifted=()
     for meta in "$udir"/pool/*.meta; do
-      records=$((records + 1))
       fpath="$(decode "$(basename "$meta" .meta)")"
       if out="$(verify_node "$fpath" "$meta")"; then
         [ "$OPT_QUIET" -eq 1 ] || [ -z "$out" ] || printf '%s\n' "$out" | verify_rows "  " "$fpath"
       else
         printf '%s\n' "$out" | verify_rows "  " "$fpath"
-        drifted+=("$fpath")
+        total_drift=$((total_drift + 1))
       fi
     done
-    if ! write_verify_status "$udir" "$uname" "$at" "$records" ${drifted[@]+"${drifted[@]}"}; then
-      err_val "could not write the verify status" "$udir/verify"
-      status_failed=1
-    fi
-    total_drift=$((total_drift + ${#drifted[@]}))
   done
   if [ "$total_drift" -gt 0 ]; then
     echo "${E_RED}${E_B}✗ verify: $total_drift node(s) drifted${E_OFF}" >&2
     log_action verify "" "drift-$total_drift"
     return 5
-  fi
-  if [ "$status_failed" -eq 1 ]; then
-    log_action verify "" status-write-failed
-    return 1
   fi
   [ "$OPT_QUIET" -eq 1 ] || echo "${C_GRN}verify: all locked nodes clean${C_OFF}"
   log_action verify "" ok
@@ -6019,8 +5849,8 @@ do_verify() {
 # folder the account's with uappnd and one ACL entry for the invoker, and
 # only ~ and ~/.ssh (the anchor tier) kept their owner, with a system flag.
 # 0.17.0 seals every node with a system flag and changes nothing else about
-# it. The first root run after a deploy -- the verify timer's own RunAtLoad
-# run included -- converts every pool, record by record, leaves first: a
+# it. The first root run after a deploy converts every pool, record by
+# record, leaves first: a
 # node the account holds goes back to its recorded owner, group and mode,
 # its old flag (and a placement entry) off, through the helper, and takes
 # the new seal; a file and a tree by copy-and-swap, the fingerprints taken
@@ -6155,7 +5985,7 @@ convert_record() {
   fi
 
   if [ -n "$pre" ] && [ "$pre" != "$(conv_sums "$post")" ]; then
-    mm="${mm:+$mm$'\n'}mismatch=$(now_utc) conversion $(verify_escape "$f")"
+    mm="${mm:+$mm$'\n'}mismatch=$(now_utc) conversion $(path_escape "$f")"
     err_val "its content changed while its seal was converted; recorded as drift" "$f"
   fi
   id="$(node_id "$f")" || return 1
@@ -6180,12 +6010,14 @@ convert_record() {
 # convert_pool <user dir>: every record of one pool still in the 0.16
 # shape, leaves first, then chain folders deepest first. The pool's own
 # files become root's first: the account owned the pool and its
-# snapshots.
+# snapshots. The last verify result 0.16's timer left beside the pool has
+# no reader any more and goes first.
 convert_pool() {
   local udir="$1" u pool la meta n=0 bad=0
   local -a leaves=() chains=()
   u="$(basename "$udir")"
   pool="$udir/pool"
+  rm -f -- "$udir/verify" || return 1
   for meta in "$pool"/*.meta; do
     record_converted "$meta" && continue
     if [ "$(meta_field "$meta" role)" = leaf ]; then

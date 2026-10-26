@@ -1,16 +1,15 @@
 # Declarative locked install for nix-darwin.
 #
 # Declares everything `sudo locked setup` does imperatively: the binary in
-# the system profile, a digest-pinned /etc/sudoers.d/locked entry, and the
-# verify LaunchDaemon. The sudoers
-# digest and the installed binary derive from ONE string at eval time
+# the system profile and a digest-pinned /etc/sudoers.d/locked entry. The
+# sudoers digest and the installed binary derive from ONE string at eval time
 # (scriptText below), so they can never disagree -- the drift window that
 # manual setup closes by re-running is structurally absent here. The
 # script itself detects the nix deployment and refuses its imperative
 # setup path.
 #
-# Darwin-only on purpose: locked is built on BSD file flags, dscl and
-# launchd; there is nothing portable to declare.
+# Darwin-only on purpose: locked is built on BSD file flags and dscl;
+# there is nothing portable to declare.
 { config, lib, pkgs, ... }:
 
 let
@@ -39,10 +38,8 @@ let
   # changes shape in the script: INSTALL_TARGET's default becomes the
   # system-profile path (stable across generations, always resolving to
   # the current build), LOCKED_HELPER's default becomes the store path of
-  # the helper built above, LOCKED_VERIFY_INTERVAL's default becomes
-  # verifyInterval, so every verify run -- the timer's or a manual one --
-  # records the period readers judge its age against, and LOCKED_GIT, the
-  # git that draws every diff, becomes pkgs.git's store path. LOCKED_GIT
+  # the helper built above, and LOCKED_GIT, the git that draws every diff,
+  # becomes pkgs.git's store path. LOCKED_GIT
   # is a plain readonly assignment, not a `:=` default: root runs that git
   # on bytes the invoker wrote, so no environment may name another, and
   # like the helper's path it puts the git in the closure and under the
@@ -70,10 +67,6 @@ let
     {
       from = '': "''${LOCKED_HELPER:=/usr/local/sbin/locked-helper}"'';
       to = '': "''${LOCKED_HELPER:=${helper}/bin/locked-helper}"'';
-    }
-    {
-      from = '': "''${LOCKED_VERIFY_INTERVAL:=900}"'';
-      to = '': "''${LOCKED_VERIFY_INTERVAL:=${toString cfg.verifyInterval}}"'';
     }
     {
       from = "readonly LOCKED_GIT=/Library/Developer/CommandLineTools/usr/bin/git";
@@ -107,8 +100,8 @@ in
       type = lib.types.str;
       description = ''
         The human operator: granted sudo for the locked binary
-        (digest-pinned, no NOPASSWD). Their pool and verify status are
-        readable to them through an ACL entry the script itself gives.
+        (digest-pinned, no NOPASSWD). Their pool is readable to them
+        through an ACL entry the script itself gives.
       '';
     };
 
@@ -121,16 +114,6 @@ in
         is stable across generations and always resolves to the current
         build. (Manual, non-nix installs are unaffected: they use the
         script's own default, /usr/local/sbin/locked.)
-      '';
-    };
-
-    verifyInterval = lib.mkOption {
-      type = lib.types.int;
-      default = 900;
-      description = ''
-        Seconds between verify daemon runs. Every verify run records it in
-        the user's status file (/var/db/locked/<user>/verify), and readers
-        treat a result older than three intervals as stale.
       '';
     };
 
@@ -148,47 +131,20 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable (lib.mkMerge ([
-    {
-      assertions = [
-        {
-          assertion = validUser cfg.user;
-          message = "security.locked.user must match [A-Za-z_][A-Za-z0-9_-]* (it is spliced into sudoers)";
-        }
-        {
-          assertion = pkgs.stdenv.hostPlatform.isDarwin;
-          message = "security.locked is Darwin-only (BSD file flags)";
-        }
-      ];
+  config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = validUser cfg.user;
+        message = "security.locked.user must match [A-Za-z_][A-Za-z0-9_-]* (it is spliced into sudoers)";
+      }
+      {
+        assertion = pkgs.stdenv.hostPlatform.isDarwin;
+        message = "security.locked is Darwin-only (BSD file flags)";
+      }
+    ];
 
-      environment.systemPackages = [ package ];
+    environment.systemPackages = [ package ];
 
-      environment.etc."sudoers.d/locked".source = sudoersFile;
-    }
-
-    {
-      # Declarative replacement for install_verify_timer. The daemon runs
-      # the store path, not a digest-gated copy: launchd needs no gate (it
-      # is root already), and the plist changing per build makes
-      # nix-darwin reload it with each generation. Label is set explicitly so the
-      # plist keeps the documented path
-      # /Library/LaunchDaemons/locked.verify.plist.
-      #
-      # `command`, not ProgramArguments: nix-darwin then starts it through
-      # `/bin/wait4path /nix/store`. At boot launchd can load the plist
-      # before the Nix store volume is mounted; given the store path
-      # directly, it logs "Missing executable detected" and never starts
-      # the job again (seen on macOS 27.0.1, 2026-09-29), so verify went
-      # stale until the next reload.
-      launchd.daemons.locked-verify = {
-        command = "${package}/bin/locked verify --quiet";
-        serviceConfig = {
-          Label = "locked.verify";
-          StartInterval = cfg.verifyInterval;
-          RunAtLoad = true;
-          StandardErrorPath = "/var/log/locked-verify.log";
-        };
-      };
-    }
-  ]));
+    environment.etc."sudoers.d/locked".source = sudoersFile;
+  };
 }

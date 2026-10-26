@@ -763,28 +763,12 @@ else
   rc=$?
   check "verify exit code 5 on drift"    "5" "$rc"
 fi
-VSTAT="$STATEROOT/$INV/verify"
-vstat() { sed -n "s/^$1=//p" "$VSTAT" | head -1; }
-check "status file is root's 600"       "root wheel 600" \
-      "$(stat -f '%Su %Sg %OLp' "$VSTAT")"
-check "with your read entry"             " 0: user:$INV allow read,readattr,readextattr,readsecurity" \
-      "$(ls -le "$VSTAT" | sed 1d)"
-check "status counts both drifted nodes" "2" "$(vstat drifted)"
-ok   "status names the drifted path"     grep -qxF "drift=$CFG" "$VSTAT"
-ok   "a non-ASCII name and a backslash are escaped" \
-     grep -qxF "drift=$FAKE_HOME/caf\\xc3\\xa9\\x5cx.txt" "$VSTAT"
-check "every status line is printable ASCII" "" "$(LC_ALL=C grep -n '[^ -~]' "$VSTAT")"
-check "status records the timer interval" "900" "$(vstat interval)"
-ok   "status time is UTC ISO 8601"       grep -qE '^at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$VSTAT"
-VTMP=("$STATEROOT/$INV"/.verify.*)
-check "no temp file is left beside it"   "0" "${#VTMP[@]}"
+deny "verify keeps no result file"       test -e "$STATEROOT/$INV/verify"
 deny "nothing is written under the user's home" test -e "$FAKE_HOME/.local/state"
 ok   "repair: unlock drifted nodes"      locked unlock "$CFG" "$ESCF"
 ok   "repair: relock"                    locked lock --yes "$CFG" "$ESCF"
 ok   "unprotect the escaped one"         locked unprotect --yes "$ESCF"
 ok   "verify clean after repair"         locked verify
-check "status says clean after repair"   "0" "$(vstat drifted)"
-deny "and names no path"                 grep -q '^drift=' "$VSTAT"
 
 note "cli: a folder sealed whole"
 CD="$FAKE_HOME/cfgdir"
@@ -1122,8 +1106,6 @@ refuse "a folder edit that installs other bytes fails" "not what you approved (c
 check "the mismatched file is frozen"          "schg" "$(flags_of "$FM")"
 check "its directory is frozen again"          "schg" "$(flags_of "$CD/nested")"
 ok   "the folder record carries the mismatch"  has_mismatch "$(pool_meta "$CD")" "content $FM"
-check "the edit refreshed the verify status"   "drifted=1" \
-      "$(grep '^drifted=' "$STATEROOT/$INV/verify")"
 refuse "verify reports the mismatch"           "did not install as approved (content): $FM" locked verify
 
 refuse "a second file in the folder mismatches" "not what you approved (content)" \
@@ -1176,6 +1158,19 @@ ok   "revert the mismatch fixture"             locked revert "$MCFG"
 check "the reverted content"                   "version 1" "$(cat "$MCFG")"
 deny "the revert clears it"                    grep -q '^mismatch=' "$(pool_meta "$MCFG")"
 ok   "verify clean after the revert"           locked verify
+
+# The mismatch line keeps its path escaped: a non-ASCII byte and the
+# backslash itself as \xHH, so the record stays printable ASCII.
+MESC="$FAKE_HOME/sub/caf"$'\303\251'"\\x.txt"
+as_user /bin/sh -c 'printf "version 1\n" > "$1"' sh "$MESC"
+ok   "lock a file whose name needs escaping"   locked lock --yes "$MESC"
+refuse "its edit installs other bytes"         "not what you approved (content)" \
+       locked_tamper edit --yes --from "$PROPM" "$MESC"
+ok   "the record escapes its path"             grep -qF "content $FAKE_HOME/sub/caf\\xc3\\xa9\\x5cx.txt" "$(pool_meta "$MESC")"
+check "every record line is printable ASCII"   "" "$(LC_ALL=C grep -n '[^ -~]' "$(pool_meta "$MESC")")"
+refuse "verify names it as the characters"     "did not install as approved (content): $MESC" locked verify
+ok   "revert the escaped fixture"              locked revert "$MESC"
+ok   "unprotect it"                            locked unprotect --yes "$MESC"
 
 note "cli: ~/.ssh -- schg on files, sappnd on the folder"
 as_user mkdir -m 700 -- "$FAKE_HOME/.ssh"
@@ -1835,12 +1830,12 @@ locked status >"$POOL" 2>&1
 ok   "listing marks the unlocked node"   grep -qF "$(srow '!' unlocked leaf '' "$CD")" "$POOL"
 ok   "relock dir after the listing"      locked lock --yes "$CD"
 
-check "the listing ends with the last verify" "last verify: ✓  clean" "$(tail -1 "$POOL" | sed 's/ (.*//')"
+deny "the listing has no last-verify line" grep -qF "last verify" "$POOL"
 
 note "cli: pool permissions"
 # Root re-applies these on every invocation. They are what makes
 # unprivileged status possible without exposing either the user list or
-# any file content, and what keeps the verify status root's alone.
+# any file content.
 check "state root is root's, traverse-only" "root wheel 711" "$(stat -f '%Su %Sg %OLp' "$STATEROOT")"
 DIRENT=" 0: user:$INV allow list,search,readattr,readextattr,readsecurity"
 FILEENT=" 0: user:$INV allow read,readattr,readextattr,readsecurity"
@@ -1911,49 +1906,10 @@ chmod +a "user:$INV allow list,search,readattr,readextattr,readsecurity" "$STATE
 ok   "unprivileged status as another account"  locked_as "$OTHER" status
 locked_as "$OTHER" status >"$POOL" 2>&1
 ok   "it lists that account's OWN pool"         grep -qF "pool for $OTHER is empty" "$POOL"
-ok   "with no verify run recorded for it"       grep -qF "last verify: -  none recorded" "$POOL"
+ok   "and says the content is not compared"     grep -qF "without sudo, content is not compared" "$POOL"
 
 check "unprivileged status wrote nothing"       "" \
       "$(/usr/bin/find "$STATEROOT" -newer "$MARKER" -print)"
-
-note "cli: unprivileged status reads the verify status"
-# Another account stands in for a user reading their own status through
-# their read entry. Its per-user dir is a fixture in the shape root
-# converges to; the files are what a verify run would write.
-VFX="$STATEROOT/$OTHER"
-install -d -m 700 -o root -g wheel "$VFX"
-chmod +a "user:$OTHER allow list,search,readattr,readextattr,readsecurity" "$VFX"
-vfixture() { # <line>...: the fixture status file, root's, with the entry
-  printf '%s\n' "$@" >"$VFX/verify"
-  chown root:wheel "$VFX/verify"
-  chmod 600 "$VFX/verify"
-  chmod +a "user:$OTHER allow read,readattr,readextattr,readsecurity" "$VFX/verify"
-}
-NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-vfixture "at=$NOW_ISO" "interval=900" "records=3" "drifted=0"
-locked_as "$OTHER" status >"$POOL" 2>&1
-ok   "a clean run reads as clean"               grep -qF "last verify: ✓  clean" "$POOL"
-deny "and not as stale"                         grep -qF "stale" "$POOL"
-
-vfixture "at=$NOW_ISO" "interval=900" "records=3" "drifted=3" \
-         "drift=/a/one" "drift=/a/caf\\xc3\\xa9"
-locked_as "$OTHER" status >"$POOL" 2>&1
-ok   "drift reads as drift, with its count"     grep -qF "last verify: ✗  3 drifted" "$POOL"
-ok   "the recorded paths are shown as the characters they name" \
-     grep -qxF "      /a/caf$(printf '%b' '\xc3\xa9')" "$POOL"
-ok   "the uncapped remainder is counted"        grep -qF "and 1 more" "$POOL"
-
-vfixture "at=2026-01-01T00:00:00Z" "interval=900" "records=3" "drifted=0"
-locked_as "$OTHER" status >"$POOL" 2>&1
-ok   "an old clean run still says what it found" grep -qF "last verify: ✓  clean" "$POOL"
-ok   "and that it is stale"                     grep -qF "note: that run is stale; the timer runs every 900s" "$POOL"
-
-vfixture "at=$NOW_ISO" "interval=soon" "drifted=0"
-locked_as "$OTHER" status >"$POOL" 2>&1
-ok   "a malformed status says so"               grep -qF "last verify: ✗  malformed: $VFX/verify" "$POOL"
-
-rm -f -- "$VFX/verify"
-rmdir -- "$VFX"
 
 }
 
@@ -3460,7 +3416,7 @@ section_7() {
 # record: each node goes back to its recorded owner, group and mode and
 # takes a system flag, a file and a tree by copy-and-swap. Fixtures are
 # built here in the 0.16 shape, by hand, in a home and state root of their
-# own; the run is a launchd verify, with no invoker.
+# own; the run is a root verify with no invoker.
 
 note "conversion: 0.16 lock-account seals become system flags"
 CVSTOP="$SCRATCH/cvusers"
@@ -3472,7 +3428,7 @@ CVPOOL="$CONV_STATE/$INV/pool"
 install -d -m 711 -o root -g wheel "$CONV_STATE"
 install -d -m 750 -o root -g "$LOCK_ACCT" "$CONV_STATE/$INV"
 install -d -m 750 -o "$LOCK_ACCT" -g "$LOCK_ACCT" "$CVPOOL"
-locked_conv() { # <args...>: a root run as launchd makes it, no invoker.
+locked_conv() { # <args...>: a root run with no invoker.
   # The conversion is what changes the home here, so the guard is told.
   GUARD_RELEASE="$CVHOME" guarded "$CVHOME" \
   env LOCKED_STATE_ROOT="$CONV_STATE" \
@@ -3549,6 +3505,9 @@ cvrec "$CVR" "owner=$INV" "group=staff" "mode=644" "lockmode=644" "tier=content"
   "flag=uchg" "flagsym=uchg" "id=1.9" "recursive=0" "role=leaf" "state=retired" \
   "via=rm" "by=$INV" "at=2026-10-01T00:00:00Z"
 
+# The last verify result 0.16's timer kept beside the pool.
+printf 'at=2026-10-01T00:00:00Z\ninterval=900\nrecords=5\ndrifted=0\n' >"$CONV_STATE/$INV/verify"
+
 CVOUT="$SCRATCH/conv.out"
 CVRC=0
 locked_conv verify >"$CVOUT" 2>&1 || CVRC=$?
@@ -3558,6 +3517,7 @@ ok   "it says it converted the pool"           grep -qF "converting the pool of 
 ok   "and that the account owns nothing now"   grep -qF "the account $LOCK_ACCT now owns nothing locked made" "$CVOUT"
 check "the account owns nothing in the home"   "" "$(find "$CVHOME" -user "$LOCK_ACCT" -print)"
 check "nor in the pool"                        "" "$(find "$CONV_STATE" -user "$LOCK_ACCT" -print)"
+deny "the old verify result is gone"           test -e "$CONV_STATE/$INV/verify"
 check "no record keeps a tier"                 "" "$(grep -l '^tier=' "$CVPOOL"/*.meta || true)"
 check "the pool is root's 700"                 "root wheel 700" "$(stat -f '%Su %Sg %OLp' "$CVPOOL")"
 check "  with your read entry"                 " 0: user:$INV allow list,search,readattr,readextattr,readsecurity" \
