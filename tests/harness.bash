@@ -3433,7 +3433,8 @@ locked_conv() { # <args...>: a root run with no invoker.
   GUARD_RELEASE="$CVHOME" guarded "$CVHOME" \
   env LOCKED_STATE_ROOT="$CONV_STATE" \
       INSTALL_TARGET="$SCRATCH/not-installed" \
-      LOCKED_HELPER="$HELPER" \
+      LOCKED_HELPER="${CV_HELPER:-$HELPER}" \
+      LOCKED_HELPER_TEST_PAUSE="${CV_PAUSE:-}" \
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
       LOCKED_USER_HOME="$CVHOME" \
       SUDO_USER= \
@@ -3572,6 +3573,90 @@ chflags nosappnd "$CVHOME"
 rm -f -- "$CVX" "$(cv_meta "$CVX")"
 chflags sappnd "$CVHOME"
 ok   "verify clean once it is gone"            locked_conv verify --quiet
+
+note "conversion: a reseal is pinned to the recorded node"
+# Between the old seal coming off and the new one going on, the folder is
+# yours and unflagged. One swapped in at its path in that moment is not the
+# node the record names, so the seal refuses it and the record waits.
+CVQP="$CVHOME/qp"
+install -d -o "$INV" -g staff -m 755 "$CVQP"
+CVQ="$CVQP/q"
+install -d -o "$LOCK_ACCT" -g staff -m 755 "$CVQ"
+chmod +a "$CVE" "$CVQ"
+chflags uappnd "$CVQ"
+cvrec "$CVQ" "owner=$INV" "group=staff" "mode=755" "lockmode=755" "tier=placement" \
+  "flag=uappnd" "flagsym=uappnd" "id=$(cvid "$CVQ")" "recursive=0" "role=chain" \
+  "acl=$CVE" "state=locked"
+CVFIFO="$SCRATCH/s7-pause"
+mkfifo "$CVFIFO"
+CVRC=0
+CV_HELPER="$HELPER_TEST" CV_PAUSE="seal:$CVFIFO" locked_conv verify >"$CVOUT" 2>&1 &
+CVPID=$!
+if exec 3>"$CVFIFO"; then
+  mv -- "$CVQ" "$CVQP/q.old"
+  install -d -o "$INV" -g staff -m 755 "$CVQ"
+  printf 'x' >&3
+  exec 3>&-
+fi
+wait "$CVPID" || CVRC=$?
+check "verify reports drift"                   "5" "$CVRC"
+ok   "the conversion names the folder"         grep -qF "could not convert its seal; left as it was, tried again on the next root run: $CVQ" "$CVOUT"
+check "the swapped-in folder takes no flag"    "-" "$(stat -f '%Sf' "$CVQ")"
+check "the record keeps its 0.16 shape"        "placement" "$(cv_get "$CVQ" tier)"
+rm -f -- "$CVFIFO" "$(cv_meta "$CVQ")"
+rmdir -- "$CVQ" "$CVQP/q.old"
+chflags nosappnd "$CVHOME"
+rmdir -- "$CVQP"
+chflags sappnd "$CVHOME"
+
+note "conversion: a writer alarm still converts the record"
+# A seal that swapped the file in and found a writer (exit 8) has changed
+# the node, so the record must follow it: the old one names the inode the
+# swap replaced, and no later run could convert it. A stand-in helper
+# reports a writer after every swap seal.
+CVWRAP="$(dirname "$HELPER")/writer-helper"
+cat >"$CVWRAP" <<EOF
+#!/bin/bash
+out="\$("$HELPER" "\$@")"
+rc=\$?
+printf '%s\n' "\$out"
+if [ "\$rc" -eq 0 ] && [ "\$1" = seal ]; then
+  case " \$* " in *" --swap "*) printf 'writer\t4242\tfake-writer\n'; exit 8 ;; esac
+fi
+exit "\$rc"
+EOF
+chown root:wheel "$CVWRAP"
+chmod 755 "$CVWRAP"
+CVW="$CVHOME/w.conf"
+as_user /bin/sh -c "printf 'content w\n' > '$CVW'"
+chmod 644 "$CVW"
+install -m 600 -o "$LOCK_ACCT" -g "$LOCK_ACCT" "$CVW" "$CVPOOL/$(enc_path "$CVW").snap"
+chown "$LOCK_ACCT:$LOCK_ACCT" "$CVW"
+chflags uchg "$CVW"
+cvrec "$CVW" "owner=$INV" "group=staff" "mode=644" "lockmode=644" "tier=content" \
+  "flag=uchg" "flagsym=uchg" "id=$(cvid "$CVW")" "recursive=0" "role=leaf" "state=locked"
+CVRC=0
+CV_HELPER="$CVWRAP" locked_conv verify >"$CVOUT" 2>&1 || CVRC=$?
+check "the run is clean"                       "0" "$CVRC"
+tap_output "$( [ "$CVRC" -eq 0 ] || cat "$CVOUT")"
+ok   "it raises the writer alarm"              grep -qF "a process holds a sealed file open for writing" "$CVOUT"
+ok   "  naming the writer"                     grep -qF "pid 4242  fake-writer" "$CVOUT"
+check "the record is converted"                "" "$(cv_get "$CVW" tier)"
+check "  and names the sealed node"            "$(cvid "$CVW")" "$(cv_get "$CVW" id)"
+check "the file: yours, schg"                  "$INV schg" "$(stat -f '%Su %Sf' "$CVW")"
+locked_conv verify >"$CVOUT" 2>&1 || true
+deny "a second run converts nothing"           grep -qF "converting the pool" "$CVOUT"
+rm -f -- "$CVWRAP"
+
+note "verify: a sealed file without its fingerprint is drift"
+CVWSUM="$CVPOOL/$(enc_path "$CVW").sum"
+mv -- "$CVWSUM" "$CVWSUM.away"
+CVRC=0
+locked_conv verify >"$CVOUT" 2>&1 || CVRC=$?
+check "verify reports drift"                   "5" "$CVRC"
+ok   "  and says the fingerprint is missing"   grep -qF "no fingerprint to compare its content with" "$CVOUT"
+mv -- "$CVWSUM.away" "$CVWSUM"
+ok   "verify clean with it back"               locked_conv verify --quiet
 
 }
 

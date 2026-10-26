@@ -1037,6 +1037,32 @@ same_node() { # <recorded> <live>
 # and NODE_ALARM set, so the caller records what happened and ends the run
 # nonzero.
 NODE_ALARM=0
+
+# node_alarm <log verb> <path> <exit> <helper stdout>: the alarm for a
+# change the helper made with exit 6 or 8, printed and logged. node_op and
+# the conversion (conv_helper) both raise it.
+node_alarm() {
+  local lv="$1" p="$2" rc="$3" out="$4"
+  echo >&2
+  if [ "$rc" -eq 8 ]; then
+    echo "${E_RED}${E_B}!!! a process holds a sealed file open for writing !!!${E_OFF}" >&2
+    say_err "    sealed" "$p"
+    printf '%s\n' "$out" \
+      | awk -F'\t' '$1=="writer"{printf "    pid %s  %s\n", $2, $3}' >&2
+    echo "    It opened the file in the instant between the swap and the" >&2
+    echo "    flag. What it writes shows as drift on the next verify." >&2
+    log_action "$lv" "$p" alarm-writer
+  fi
+  if printf '%s\n' "$out" | grep -q '^anomaly'; then
+    echo "${E_RED}${E_B}!!! entries changed in a folder while its seal was lifted !!!${E_OFF}" >&2
+    say_err "    sealed" "$p"
+    printf '%s\n' "$out" \
+      | awk -F'\t' '$1=="anomaly"{printf "    %s  %s  (%s)\n", $2, $3, $4}' >&2
+    echo "    The seal itself completed and the records follow it." >&2
+    log_action "$lv" "$p" anomaly
+  fi
+}
+
 node_op() {
   local lv="$1" p="$2" first
   shift 2
@@ -1046,24 +1072,7 @@ node_op() {
     0) return 0 ;;
     6|8)
       NODE_ALARM=1
-      echo >&2
-      if [ "$HELPER_RC" -eq 8 ]; then
-        echo "${E_RED}${E_B}!!! a process holds a sealed file open for writing !!!${E_OFF}" >&2
-        say_err "    sealed" "$p"
-        printf '%s\n' "$HELPER_OUT" \
-          | awk -F'\t' '$1=="writer"{printf "    pid %s  %s\n", $2, $3}' >&2
-        echo "    It opened the file in the instant between the swap and the" >&2
-        echo "    flag. What it writes shows as drift on the next verify." >&2
-        log_action "$lv" "$p" alarm-writer
-      fi
-      if printf '%s\n' "$HELPER_OUT" | grep -q '^anomaly'; then
-        echo "${E_RED}${E_B}!!! entries changed in a folder while its seal was lifted !!!${E_OFF}" >&2
-        say_err "    sealed" "$p"
-        printf '%s\n' "$HELPER_OUT" \
-          | awk -F'\t' '$1=="anomaly"{printf "    %s  %s  (%s)\n", $2, $3, $4}' >&2
-        echo "    The seal itself completed and the records follow it." >&2
-        log_action "$lv" "$p" anomaly
-      fi
+      node_alarm "$lv" "$p" "$HELPER_RC" "$HELPER_OUT"
       return 0
       ;;
     2)
@@ -2084,9 +2093,14 @@ verify_node() {
   # The content, as root: a sealed file or folder against its
   # fingerprints. Compared as sorted lines: a file installed into a sealed
   # folder by edit takes its place in path order, which is not quite the
-  # walk's order.
+  # walk's order. Every seal of a file or folder writes the fingerprints,
+  # so one missing is drift, never a pass.
   local sumf="${meta%.meta}.sum" got want
-  if [ "$EUID" -eq 0 ] && [ -f "$sumf" ] && [ ! -L "$f" ] &&
+  if [ "$EUID" -eq 0 ] && [ ! -f "$sumf" ] && [ ! -L "$f" ] &&
+     { [ -f "$f" ] || [ "$recursive" = "1" ]; }; then
+    vline drift "no fingerprint to compare its content with: $sumf"
+    bad=1
+  elif [ "$EUID" -eq 0 ] && [ ! -L "$f" ] &&
      { [ -f "$f" ] || [ "$recursive" = "1" ]; }; then
     local -a dig=(digest --src "$f" --src-id "${id/./:}" --owner "$owner" --as "$owner")
     [ "$recursive" = "1" ] && dig+=(--recursive)
@@ -5861,14 +5875,25 @@ do_verify() {
 # TODO(0.18.0): remove, with LOCKED_LOCK_ACCOUNT and the helper's --chown,
 # --mode and --acl-remove.
 
-# conv_helper <args>...: the helper, run for the conversion whatever the
-# verb's --dry-run says: a converted pool is the precondition of every
-# verb, never a step of one. Its stdout lands in CONV_OUT.
+# conv_helper <path> <args>...: the helper, run for the conversion
+# whatever the verb's --dry-run says: a converted pool is the precondition
+# of every verb, never a step of one. Its stdout lands in CONV_OUT. Exit 6
+# and 8 mean the change was made, with an alarm: it is raised here and the
+# call succeeds, so the record follows the node. Failing it instead would
+# leave a record naming the inode the swap replaced, which no later run
+# could convert.
 CONV_OUT=""
 conv_helper() {
+  local p="$1" rc=0
+  shift
   CONV_OUT=""
   verify_helper || return 1
-  CONV_OUT="$("$LOCKED_HELPER" "$@")"
+  CONV_OUT="$("$LOCKED_HELPER" "$@")" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    6|8) node_alarm convert "$p" "$rc" "$CONV_OUT"; return 0 ;;
+    *) return "$rc" ;;
+  esac
 }
 
 # conv_fail <path>: a record left as it was, for the next root run.
@@ -5929,32 +5954,32 @@ convert_record() {
     # earlier run got halfway: the gate takes either.
     local -a own=(--owner "$la,$u")
     if [ -L "$f" ]; then
-      if ! { conv_helper unseal --path "$f" --id "${rid/./:}" "${own[@]}" \
+      if ! { conv_helper "$f" unseal --path "$f" --id "${rid/./:}" "${own[@]}" \
                --chown "$owner:$group" --flag uchg --count 1 &&
-             conv_helper seal --path "$f" --id - --owner "$u" --flag schg --count 1; }; then
+             conv_helper "$f" seal --path "$f" --id "${rid/./:}" --owner "$u" --flag schg --count 1; }; then
         conv_fail "$f"
         return 1
       fi
     elif [ "$recursive" = "1" ]; then
       count="$(node_count "$f")" || return 1
-      if ! { conv_helper digest --src "$f" --src-id "${rid/./:}" "${own[@]}" \
+      if ! { conv_helper "$f" digest --src "$f" --src-id "${rid/./:}" "${own[@]}" \
                --as "$u" --recursive &&
              pre="$(conv_sums "$CONV_OUT")" &&
-             conv_helper unseal --path "$f" --id "${rid/./:}" "${own[@]}" \
+             conv_helper "$f" unseal --path "$f" --id "${rid/./:}" "${own[@]}" \
                --chown "$owner:$group" --mode "$mode" --flag uchg \
                --count "$count" --recursive &&
-             conv_helper seal --path "$f" --id - --owner "$u" --flag schg \
+             conv_helper "$f" seal --path "$f" --id "${rid/./:}" --owner "$u" --flag schg \
                --count "$count" --recursive --swap --stage "$stg"; }; then
         conv_fail "$f"
         return 1
       fi
       post="$CONV_OUT"
     else
-      if ! { conv_helper digest --src "$f" --src-id "${rid/./:}" "${own[@]}" --as "$u" &&
+      if ! { conv_helper "$f" digest --src "$f" --src-id "${rid/./:}" "${own[@]}" --as "$u" &&
              pre="$(conv_sums "$CONV_OUT")" &&
-             conv_helper unseal --path "$f" --id "${rid/./:}" "${own[@]}" \
+             conv_helper "$f" unseal --path "$f" --id "${rid/./:}" "${own[@]}" \
                --chown "$owner:$group" --mode "$mode" --flag uchg --count 1 &&
-             conv_helper seal --path "$f" --id - --owner "$u" --flag schg \
+             conv_helper "$f" seal --path "$f" --id "${rid/./:}" --owner "$u" --flag schg \
                --count 1 --swap --stage "$stg"; }; then
         conv_fail "$f"
         return 1
@@ -5964,20 +5989,20 @@ convert_record() {
   elif [ "$tier" = placement ]; then
     # Locked or unlocked, the folder is the account's with the entry on:
     # an unlock kept both. Both come off; the flag goes back on if it was.
-    if ! conv_helper unseal --path "$f" --id "${rid/./:}" --owner "$la,$u" \
+    if ! conv_helper "$f" unseal --path "$f" --id "${rid/./:}" --owner "$la,$u" \
            --chown "$owner:$group" --mode "$mode" --flag uappnd \
            --acl-remove "$u:${acl##* }" --count 1; then
       conv_fail "$f"
       return 1
     fi
     if [ "$state" = locked ] &&
-       ! conv_helper seal --path "$f" --id - --owner "$u" --flag sappnd --count 1; then
+       ! conv_helper "$f" seal --path "$f" --id "${rid/./:}" --owner "$u" --flag sappnd --count 1; then
       conv_fail "$f"
       return 1
     fi
   elif [ "$state" = locked ] && [ -f "$f" ] && [ ! -L "$f" ]; then
     # An anchor file keeps its node and its flag; it gains fingerprints.
-    if ! conv_helper digest --src "$f" --src-id "${rid/./:}" --owner "$u" --as "$u"; then
+    if ! conv_helper "$f" digest --src "$f" --src-id "${rid/./:}" --owner "$u" --as "$u"; then
       conv_fail "$f"
       return 1
     fi
