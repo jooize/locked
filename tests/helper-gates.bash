@@ -439,11 +439,22 @@ check "the same mode" "640" "$(/usr/bin/stat -f '%OLp' "$F")"
 check "the same modification time" "$OLD_MTIME" "$(/usr/bin/stat -f '%m' "$F")"
 check "the same extended attribute" "yes" "$(/usr/bin/xattr -p org.example.kept "$F" 2>/dev/null)"
 check "the kept flag and the seal's" "uchg,hidden" "$(flags_of "$F")"
-check "the fingerprint line is the copy's" "sum"$'\t'"$WANT_SUM"$'\t'"." "$SUMS"
+check "the fingerprint line is the copy's, with its bytes" "sum"$'\t'"$WANT_SUM"$'\t'"."$'\t'"18" "$SUMS"
 check "and staging is empty again" "" "$(/bin/ls -A "$STG")"
 expect "digest prints the same line" 0 - \
   "$TST" digest --src "$F" --src-id - --owner "$ME" --as "$ME"
 check "for the sealed file" "$SUMS" "$OUT"
+expect "digest --length hashes the first bytes only" 0 - \
+  "$TST" digest --src "$F" --src-id - --owner "$ME" --as "$ME" --length 9
+check "  the first line's fingerprint, 9 bytes" \
+  "sum"$'\t'"$(printf 'line one\n' | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"$'\t'"."$'\t'"9" "$OUT"
+expect "digest --length past the end hashes what is there" 0 - \
+  "$TST" digest --src "$F" --src-id - --owner "$ME" --as "$ME" --length 999
+check "  the whole file, its own count" "$SUMS" "$OUT"
+expect "digest --length takes only a count of bytes" 4 "--length must be a count of bytes" \
+  "$TST" digest --src "$F" --src-id - --owner "$ME" --as "$ME" --length -1
+expect "digest --length is refused with --recursive" 4 "--length applies to a file" \
+  "$TST" digest --src "$D" --src-id - --owner "$ME" --as "$ME" --recursive --length 1
 unseal --path "$F" --id - "${OWN[@]}" --flag uchg
 /usr/bin/chflags nohidden "$F"
 # A descriptor this shell holds open for writing points at the inode that
@@ -519,7 +530,7 @@ check "the file at the name is the staged inode" "$NEW_INO" "$(ino "$D/f")"
 check "with its bytes" "new" "$(cat "$D/f")"
 check "the mode asked for" "644" "$(/usr/bin/stat -f '%OLp' "$D/f")"
 check "and the flag" "uchg" "$(flags_of "$D/f")"
-check "the fingerprint line is the staged bytes'" "sum"$'\t'"$(sha "$D/f")"$'\t'"." "$OUT"
+check "the fingerprint line is the staged bytes'" "sum"$'\t'"$(sha "$D/f")"$'\t'"."$'\t'"$(/usr/bin/stat -f %z "$D/f")" "$OUT"
 check "and staging is empty" "" "$(/bin/ls -A "$STG")"
 stage_file $'brand new\n'
 expect "install --new refuses a name that is taken" 7 "already at the new name" \

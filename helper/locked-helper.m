@@ -203,7 +203,7 @@ usage(void)
 "                             --chown <user>:<group> --mode <octal>\n"
 "                             --flag <uchg|uappnd|schg|sappnd|none>\n"
 "       locked-helper digest --src <path> --src-id <id|-> --owner <users>\n"
-"                            --as <user> [--recursive]\n"
+"                            --as <user> [--recursive | --length <bytes>]\n"
 "       locked-helper id <path>\n"
 "       locked-helper mount <path>\n",
 	    stderr);
@@ -859,36 +859,53 @@ diff_report(const elist_t *before, const elist_t *after, const expect_t *exp)
 
 /* ---- fingerprints and open writers -------------------------------------- */
 
-/* sha256 of everything a held descriptor reads from offset 0, as hex. */
+/*
+ * sha256 of what a held descriptor reads from offset 0, as hex: all of it,
+ * or with limit >= 0 at most its first limit bytes (an append-only file is
+ * held to the bytes it was sealed with). *len is the count hashed.
+ */
 static int
-sha256_fd(int fd, char out[65])
+sha256_fd(int fd, off_t limit, char out[65], off_t *len)
 {
 	CC_SHA256_CTX c;
 	unsigned char md[CC_SHA256_DIGEST_LENGTH], buf[65536];
 	off_t off = 0;
-	ssize_t k;
+	size_t want;
+	ssize_t k = 0;
 	int i;
 
 	CC_SHA256_Init(&c);
-	while ((k = pread(fd, buf, sizeof(buf), off)) > 0) {
+	for (;;) {
+		want = sizeof(buf);
+		if (limit >= 0 && (off_t)want > limit - off)
+			want = (size_t)(limit - off);
+		if (want == 0)
+			break;
+		k = pread(fd, buf, want, off);
+		if (k <= 0)
+			break;
 		CC_SHA256_Update(&c, buf, (CC_LONG)k);
 		off += k;
 	}
-	if (k < 0)
+	if (want != 0 && k < 0)
 		return (-1);
 	CC_SHA256_Final(md, &c);
 	for (i = 0; i < CC_SHA256_DIGEST_LENGTH; i++)
 		snprintf(out + 2 * i, 3, "%02x", md[i]);
+	*len = off;
 	return (0);
 }
 
-/* sum\t<sha256>\t<path below the top, escaped; . for the top> */
+/*
+ * sum\t<sha256>\t<path below the top, escaped; . for the top>\t<bytes>
+ * The byte count is what an append-only file's later checks hash up to.
+ */
 static void
-print_sum(const char *hex, const char *rel)
+print_sum(const char *hex, const char *rel, off_t len)
 {
 	printf("sum\t%s\t", hex);
 	print_escaped(rel[0] != '\0' ? rel : ".");
-	fputc('\n', stdout);
+	printf("\t%lld\n", (long long)len);
 }
 
 typedef struct {
@@ -1457,6 +1474,7 @@ typedef struct {
 	const char	*count;
 	const char	*acl_remove;
 	const char	*stage;
+	const char	*length;
 	int		 recursive;
 	int		 swap;
 	int		 new_node;
@@ -1531,6 +1549,7 @@ parse_opts(int argc, char **argv, opts_t *o)
 		TRY("--count", count)
 		TRY("--acl-remove", acl_remove)
 		TRY("--stage", stage)
+		TRY("--length", length)
 #undef TRY
 		errf("unknown option %s", a);
 		return (-1);
@@ -2794,6 +2813,7 @@ swap_in(tree_t *t, node_t *n, const place_t *at, const char *path,
     const char *rel)
 {
 	char tmp[64], hex[65];
+	off_t hlen;
 	struct stat cst, chk, now;
 	struct timespec ts[2];
 	struct attrlist al;
@@ -2826,7 +2846,7 @@ swap_in(tree_t *t, node_t *n, const place_t *at, const char *path,
 	    fsetattrlist(cfd, &al, &n->st.st_birthtimespec,
 	    sizeof(n->st.st_birthtimespec), 0) != 0 ||
 	    fchflags(cfd, n->st.st_flags & KEPT_FLAGS) != 0 ||
-	    sha256_fd(cfd, hex) != 0 || fstat(cfd, &cst) != 0) {
+	    sha256_fd(cfd, -1, hex, &hlen) != 0 || fstat(cfd, &cst) != 0) {
 		errf("cannot make the copy to seal (%s): %s", strerror(errno),
 		    path);
 		close(cfd);
@@ -2898,7 +2918,7 @@ swap_in(tree_t *t, node_t *n, const place_t *at, const char *path,
 		goto restore;
 	}
 	elist_push(&t->staged, tmp, n->st.st_dev, n->st.st_ino);
-	print_sum(hex, rel);
+	print_sum(hex, rel, hlen);
 	close(n->fd);
 	n->fd = cfd;
 	n->st = cst;
@@ -4330,6 +4350,7 @@ cmd_install(int argc, char **argv)
 	mode_t mode;
 	uint32_t flag, keep = 0;
 	char sbuf[PATH_MAX], hex[65];
+	off_t hlen;
 	const char *sleaf;
 	int sdir = -1, rc, status = EX_HELPER_OK, moved = 0, hits;
 
@@ -4440,7 +4461,7 @@ cmd_install(int argc, char **argv)
 	/* Owner, mode and kept flags while the file is still out of reach,
 	 * and the fingerprint of exactly these bytes. */
 	if (fchown(src.fd, uid, gid) != 0 || fchmod(src.fd, mode) != 0 ||
-	    fchflags(src.fd, keep) != 0 || sha256_fd(src.fd, hex) != 0 ||
+	    fchflags(src.fd, keep) != 0 || sha256_fd(src.fd, -1, hex, &hlen) != 0 ||
 	    fstat(src.fd, &src.st) != 0) {
 		errf("cannot prepare the staged file (%s): %s",
 		    strerror(errno), o.src);
@@ -4494,7 +4515,7 @@ cmd_install(int argc, char **argv)
 			errf("cannot remove the replaced file from staging "
 			    "(%s): %s", strerror(errno), o.src);
 	}
-	print_sum(hex, "");
+	print_sum(hex, "", hlen);
 	iset_add(&one, src.st.st_dev, src.st.st_ino);
 
 cleanup:
@@ -4545,6 +4566,7 @@ digest_dir(const reader_t *r, const owners_t *owners, const node_t *dir,
 	elist_t names;
 	size_t i;
 	char hex[65];
+	off_t hlen;
 	int rc = EX_HELPER_OK;
 
 	if (depth >= MAX_DEPTH) {
@@ -4573,12 +4595,12 @@ digest_dir(const reader_t *r, const owners_t *owners, const node_t *dir,
 			rc = digest_dir(r, owners, &c, cpath, crel, dev,
 			    depth + 1, cinr);
 		else if (rc == EX_HELPER_OK && S_ISREG(c.st.st_mode)) {
-			if (sha256_fd(c.fd, hex) != 0) {
+			if (sha256_fd(c.fd, -1, hex, &hlen) != 0) {
 				errf("cannot read (%s): %s", strerror(errno),
 				    cpath);
 				rc = EX_HELPER_OPFAIL;
 			} else {
-				print_sum(hex, crel);
+				print_sum(hex, crel, hlen);
 			}
 		}
 		if (c.fd >= 0)
@@ -4595,7 +4617,10 @@ digest_dir(const reader_t *r, const owners_t *owners, const node_t *dir,
  * every regular file in the folder there, in the lines seal --swap and
  * install print. Read as --as wherever --as owns the path, through the
  * owner gate, the top pinned by --src-id: what verify compares against the
- * fingerprints a seal recorded.
+ * fingerprints a seal recorded. --length N (a file only) hashes at most its
+ * first N bytes: an append-only file still holds the bytes it was sealed
+ * with when those hash as they did, whatever was appended since. A file now
+ * shorter than N hashes short, prints its shorter count, and so differs.
  */
 static int
 cmd_digest(int argc, char **argv)
@@ -4606,7 +4631,8 @@ cmd_digest(int argc, char **argv)
 	reader_t r;
 	struct stat st;
 	node_t top;
-	char buf[PATH_MAX], hex[65];
+	char buf[PATH_MAX], hex[65], *end;
+	off_t hlen, limit = -1;
 	const char *leaf;
 	int fd, pfd, inr = 1, rc;
 
@@ -4616,18 +4642,31 @@ cmd_digest(int argc, char **argv)
 	    parse_ids(o.src_id, &sid, "--src-id") != 0 ||
 	    parse_source(&o, &owners, &r) != 0)
 		return (EX_HELPER_USAGE);
+	if (o.length != NULL) {
+		if (o.recursive) {
+			errf("--length applies to a file, not with --recursive");
+			return (EX_HELPER_USAGE);
+		}
+		errno = 0;
+		limit = (off_t)strtoll(o.length, &end, 10);
+		if (o.length[0] < '0' || o.length[0] > '9' || *end != '\0' ||
+		    errno != 0) {
+			errf("--length must be a count of bytes: %s", o.length);
+			return (EX_HELPER_USAGE);
+		}
+	}
 
 	if (!o.recursive) {
 		rc = open_source(&o, &r, &owners, &sid, &fd, &st);
 		if (rc != EX_HELPER_OK)
 			return (rc);
-		rc = sha256_fd(fd, hex);
+		rc = sha256_fd(fd, limit, hex, &hlen);
 		close(fd);
 		if (rc != 0) {
 			errf("cannot read (%s): %s", strerror(errno), o.src);
 			return (EX_HELPER_OPFAIL);
 		}
-		print_sum(hex, "");
+		print_sum(hex, "", hlen);
 		return (EX_HELPER_OK);
 	}
 	pfd = open_parent(o.src, buf, sizeof(buf), &leaf, &r, &inr);

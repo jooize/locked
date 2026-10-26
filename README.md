@@ -99,8 +99,9 @@ One sealing method, by what the node is:
 - `sudo locked verify` -- re-check every locked node against its record:
   owner, group, mode, the exact flag word, identity, the volume its path
   resolves into, and the content of every sealed file against the
-  fingerprint taken when it was sealed. Exit 5 on drift. It reports and
-  exits; nothing runs it on a schedule and it keeps no result.
+  fingerprint taken when it was sealed (an append-only file: the bytes it
+  was sealed with, whatever was appended since). Exit 5 on drift. It
+  reports and exits; nothing runs it on a schedule and it keeps no result.
 - `sudo locked setup` -- one-shot install (see below).
 
 Tests: `sudo /bin/bash tests/harness.bash` (scratch-dir only; the
@@ -340,10 +341,10 @@ one recorded at the seal and name a volume mounted over it.
 ├── run.lock                           mode 600  root:wheel
 └── jooize/                            mode 700  root:wheel  + read entry for jooize
     └── pool/                          mode 700  root:wheel  + read entry for jooize
-        ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.meta   mode 600  + read entry for jooize
-        ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.sum    mode 600
-        ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.snap   mode 600
-        ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.attic  mode 600
+        ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.meta     mode 600  + read entry for jooize
+        ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.sha256   mode 600
+        ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.snap     mode 600
+        ├── %2FUsers%2Fjooize%2F.ssh%2Fauthorized_keys.attic    mode 600
         └── .staging/                  mode 700
 ```
 Everything is root's. The root dir is execute-only (711): you can reach
@@ -358,7 +359,7 @@ user:jooize allow read,readattr,readextattr,readsecurity           (each .meta)
 
 So `locked status` works without `sudo`, and another user's pool is
 refused by the kernel. Only `.meta` gets the entry -- it records identity
-and lock state, not content -- while `.sum`, `.snap`, `.attic` and
+and lock state, not content -- while `.sha256`, `.snap`, `.attic` and
 `.staging` stay root's alone. A record is written to a temp file, given
 its entry, then renamed into place, so it is never readable by anyone
 else and never unreadable to you. `ls -le` shows the entries.
@@ -379,17 +380,21 @@ Up to 0.16 sealed nodes and the pool belonged to a lock account
 - `.snap` -- pre-edit baseline, overwritten on each unlock (`.snapdir` for
   folders sealed whole).
 - `.attic` -- discarded post-edit content, overwritten on each revert.
-- `.sum` -- the sha256 of a sealed file, or of every file in a sealed
+- `.sha256` -- the sha256 of a sealed file, or of every file in a sealed
   folder, taken by the helper while it held the bytes (the copy before the
-  swap, or the staged file an edit installs). `verify` compares the
-  content with it, as root.
+  swap, or the staged file an edit installs), in the line format
+  `shasum -a 256` prints: the hex, two spaces, the path below the sealed
+  node (`.` for a sealed file itself). `verify` compares the content with
+  it, as root.
 - `.meta` -- captured identity plus lock state, one `key=value` per line:
   `owner`, `group`, `mode` (the node's own, which a seal never changes, so
   `verify` expects exactly them), `flag` (`schg` or `sappnd`), `flagsym`
   (exact post-seal flag word), `id` (volume uuid plus inode; records
   written before 0.6.0 carry `dev.ino` and are rewritten in place on the
   next root `status`, `lock` or `unlock`), `mount` (the mount point the
-  path resolved into at the seal), `recursive`, `role` (`leaf` for a node
+  path resolved into at the seal), `sealedsize` (an append-only file only:
+  how many bytes it was sealed with, the prefix `verify` checks),
+  `recursive`, `role` (`leaf` for a node
   you protect, `chain` for a directory sealed because one needs it),
   `state` (`locked`/`unlocked`/`retired`/`suspended`), and one `mismatch`
   line per file whose edit failed its install check (when, what differed,

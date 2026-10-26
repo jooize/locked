@@ -89,6 +89,19 @@ the baseline is what the helper held, never a later read, and a write that
 races the swap-to-flag instant shows as content drift at the next verify
 instead of becoming the baseline.
 
+The fingerprints sit in `<record>.sha256`, in the line format `shasum -a
+256` prints and checks: the hex, two spaces, the path below the sealed
+node (`.` for a sealed file itself, escaped by the helper). The helper's
+own lines carry the byte count it hashed as a fourth field, which the file
+leaves out.
+
+**Append-only files.** A file sealed with `--flag sappnd` may grow; the
+seal promises only that what it held stays. So its record keeps
+`sealedsize`, the bytes hashed at the seal (or at the install of an edit
+or a revert), and verify hashes just that prefix (`digest --length`). An
+append leaves it clean; a change inside the sealed bytes, or a file now
+shorter than them, is drift. A file sealed `schg` is held to all of its
+bytes.
 **Writer scan.** After every seal and install the helper walks every
 process (libproc: `proc_listallpids`, `PROC_PIDLISTFDS`,
 `PROC_PIDFDVNODEPATHINFO`), matches the sealed file's volume and inode,
@@ -446,7 +459,8 @@ relock. Per node it compares, against the record: owner, group and mode
 (a seal never changes them, so they must match exactly), the whole flag
 word (a user flag added on top of the system one is drift), volume-uuid
 and inode identity, the mount point, and, for a sealed file or folder,
-the content against the fingerprints taken when it was sealed. A folder
+the content against the fingerprints taken when it was sealed (for an
+append-only file, its first `sealedsize` bytes). A folder
 sealed whole also gets a stray scan: any node in it not owned by the
 recorded owner or without the seal's flag.
 
@@ -481,7 +495,7 @@ root:wheel 700 with one ACL entry for that user,
 `user:<inv> allow list,search,readattr,readextattr,readsecurity`; each
 record is root 600 with `user:<inv> allow read,readattr,readextattr,
 readsecurity`, put on the temp file before its rename. Fingerprints
-(`.sum`), snapshots, the attic and staging are root's with no entry. So
+(`.sha256`), snapshots, the attic and staging are root's with no entry. So
 the user reads their own records without sudo, another user's are refused
 by the kernel, and nothing running as any user can write any of it.
 
@@ -522,8 +536,8 @@ ids <= 501). TODO 0.18.0: remove the conversion, with the helper's
   refusal, not a Touch ID prompt.
 - Snapshot / diff / revert flow and the `.snap`/`.attic`/`.meta` layout;
   the record gains `flag`, the exact post-seal flag word, the
-  volume-uuid/inode identity and the mount point, and `.sum` sits beside
-  it.
+  volume-uuid/inode identity, the mount point and, for an append-only
+  file, `sealedsize`; `.sha256` sits beside it.
 - Root-sudo invocation model for every mutating action. A no-root
   multiuser path is not needed: a system flag needs root to set, and the
   owner gate bounds root to what the invoker could do. `status` and `why`

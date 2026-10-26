@@ -702,10 +702,10 @@ check "leaf flag schg"                   "schg" "$(flags_of "$CFG")"
 check "leaf is a copy root made (a new inode)" "1" \
       "$([ "$(stat -f '%i' "$CFG")" != "$CFG_INO" ] && echo 1)"
 check "with the same bytes"              "version 1" "$(cat "$CFG")"
-CFG_SUM="$(state_of "$CFG")/$INV/pool/$(enc_path "$CFG").sum"
+CFG_SUM="$(state_of "$CFG")/$INV/pool/$(enc_path "$CFG").sha256"
 check "its fingerprint is root's 600"    "root wheel 600" "$(stat -f '%Su %Sg %OLp' "$CFG_SUM")"
 check "with no read entry"               "" "$(ls -le "$CFG_SUM" | sed 1d)"
-check "the fingerprint is the file's"    "sum"$'\t'"$(shasum -a 256 "$CFG" | awk '{print $1}')"$'\t'"." \
+check "the fingerprint is the file's, in sha256 lines" "$(shasum -a 256 "$CFG" | awk '{print $1}')  ." \
       "$(cat "$CFG_SUM")"
 check "its record is root's 600"         "root wheel 600" "$(stat -f '%Su %Sg %OLp' "$(meta_path "$CFG")")"
 check "with your read entry"             " 0: user:$INV allow read,readattr,readextattr,readsecurity" \
@@ -721,6 +721,39 @@ deny "user swap of locked leaf"          as_user mv -- "$CFG" "$CFG.bak"
 ok   "status clean"                      locked status "$CFG"
 ok   "verify clean"                      locked verify
 ok   "lock is idempotent"                locked lock --yes "$CFG"
+
+note "cli: an append-only file is held to the bytes it was sealed with"
+# --flag sappnd (a TOFU known_hosts): appends are what the seal allows, so
+# verify hashes only the first sealedsize bytes, and an edit records the
+# size it installed.
+AO="$FAKE_HOME/sub/known_hosts"
+as_user /bin/sh -c "printf 'host-a key-a\n' > '$AO'"
+ok   "lock --flag sappnd a file"         locked lock --yes --flag sappnd "$AO"
+check "  it is append-only"              "sappnd" "$(flags_of "$AO")"
+check "  its record keeps the sealed size" "13" "$(meta_get "$AO" sealedsize)"
+ok   "you may append to it"              as_user /bin/sh -c "printf 'host-b key-b\n' >> '$AO'"
+deny "but not rewrite it"                as_user /bin/sh -c "printf 'evil\n' > '$AO'"
+ok   "verify clean after an append"      locked verify
+PROPD_AO="$SCRATCH/ao-proposals"
+install -d -o "$INV" -g staff -m 755 "$PROPD_AO"
+AOP="$PROPD_AO/known_hosts.proposed"
+as_user /bin/sh -c "printf 'host-c key-c\n' > '$AOP'"
+ok   "edit installs a new append-only file" locked edit --yes --from "$AOP" "$AO"
+check "  it is append-only again"        "sappnd" "$(flags_of "$AO")"
+check "  its record keeps the new size"  "13" "$(meta_get "$AO" sealedsize)"
+ok   "you may append to it again"        as_user /bin/sh -c "printf 'host-d key-d\n' >> '$AO'"
+ok   "verify clean after that append"    locked verify
+chflags nosappnd "$AO"
+printf 'X' | dd of="$AO" bs=1 seek=0 conv=notrunc 2>/dev/null
+chflags sappnd "$AO"
+AORC=0
+locked verify >"$SCRATCH/ao-verify.out" 2>&1 || AORC=$?
+check "a change in the sealed bytes is drift" "5" "$AORC"
+ok   "  named as such"                   grep -qF "the bytes it was sealed with changed (append-only, sealed at 13 bytes)" "$SCRATCH/ao-verify.out"
+ok   "unprotect it"                      locked unprotect --yes "$AO"
+rm -f -- "$AO" "$AOP"
+rmdir -- "$PROPD_AO"
+ok   "verify clean once it is gone"      locked verify
 
 note "cli: unlock, edit in place, diff-witness relock"
 ok   "unlock leaf"                       locked unlock "$CFG"
@@ -779,7 +812,7 @@ check "dir flag schg"                    "schg" "$(flags_of "$CD")"
 check "nested file keeps its owner"      "$INV" "$(owner_of "$CD/nested/b.txt")"
 check "nested file schg"                 "schg" "$(flags_of "$CD/nested/b.txt")"
 check "the folder's fingerprints, one per file" "2" \
-      "$(grep -c '^sum' "$(state_of "$CD")/$INV/pool/$(enc_path "$CD").sum")"
+      "$(grep -c -E '^[0-9a-f]{64}  ' "$(state_of "$CD")/$INV/pool/$(enc_path "$CD").sha256")"
 deny "user add inside the sealed folder" as_user /bin/sh -c "echo evil > '$CD/nested/new.txt'"
 deny "user write inside locked dir"      as_user /bin/sh -c "echo evil >> '$CD/a.txt'"
 ok   "unlock dir"                        locked unlock "$CD"
@@ -825,7 +858,7 @@ check "and it is back to version 4"      "version 4" "$(head -1 "$CFG")"
 
 note "cli: locked edit --from -- a proposal instead of an editor"
 # A tool (or the user) writes the whole proposed file somewhere they own;
-# locked freezes it into lock-account staging before drawing the diff.
+# locked freezes it into root's staging before drawing the diff.
 PROPD="$SCRATCH/proposals"
 install -d -o "$INV" -g staff -m 755 "$PROPD"
 PROP="$PROPD/config.proposed.txt"
@@ -1845,7 +1878,7 @@ check "pool is root's 700"                  "root wheel 700" "$(stat -f '%Su %Sg
 check "  with your read entry alone"        "$DIRENT" "$(ls -led "$STATEROOT/$INV/pool" | sed 1d)"
 POOL_METAS=("$STATEROOT/$INV/pool"/*.meta)
 POOL_SNAPS=("$STATEROOT/$INV/pool"/*.snap)
-POOL_SUMS=("$STATEROOT/$INV/pool"/*.sum)
+POOL_SUMS=("$STATEROOT/$INV/pool"/*.sha256)
 if [ "${#POOL_METAS[@]}" -gt 0 ] && [ "${#POOL_SNAPS[@]}" -gt 0 ] && [ "${#POOL_SUMS[@]}" -gt 0 ]; then
   check "a record is root's 600"         "root wheel 600" "$(stat -f '%Su %Sg %OLp' "${POOL_METAS[0]}")"
   check "  with your read entry"         "$FILEENT" "$(ls -le "${POOL_METAS[0]}" | sed 1d)"
@@ -3528,11 +3561,11 @@ check "a converted record is root's 600"       "root wheel 600" "$(stat -f '%Su 
 check "the file: yours, its mode, schg"        "$INV staff 644 schg" "$(stat -f '%Su %Sg %OLp %Sf' "$CVF")"
 check "  a copy root made (a new inode)"       "1" "$([ "$(stat -f '%i' "$CVF")" != "$CVF_INO" ] && echo 1)"
 check "  with the same bytes"                  "$CVF_SUM" "$(shasum -a 256 "$CVF" | awk '{print $1}')"
-check "  and its fingerprint"                  "sum"$'\t'"$CVF_SUM"$'\t'"." "$(cat "$CVPOOL/$(enc_path "$CVF").sum")"
+check "  and its fingerprint"                  "$CVF_SUM  ." "$(cat "$CVPOOL/$(enc_path "$CVF").sha256")"
 check "  its record: schg, with its volume"    "schg $("$HELPER" mount "$CVF")" "$(cv_get "$CVF" flag) $(cv_get "$CVF" mount)"
 check "the tree: every node yours"             "" "$(find "$CVT" ! -user "$INV" -print)"
 check "  and every node schg"                  "" "$(find "$CVT" ! -flags +schg -print)"
-check "  two fingerprints"                     "2" "$(grep -c '^sum' "$CVPOOL/$(enc_path "$CVT").sum")"
+check "  two fingerprints"                     "2" "$(grep -c -E '^[0-9a-f]{64}  ' "$CVPOOL/$(enc_path "$CVT").sha256")"
 check "the chain folder: yours, sappnd"        "$INV staff 755 sappnd" "$(stat -f '%Su %Sg %OLp %Sf' "$CVA")"
 check "  with your old entry gone"             "" "$(/bin/ls -ledq -- "$CVA" | sed 1d)"
 check "~ is as it was"                         "$INV sappnd" "$(stat -f '%Su %Sf' "$CVHOME")"
@@ -3649,7 +3682,7 @@ deny "a second run converts nothing"           grep -qF "converting the pool" "$
 rm -f -- "$CVWRAP"
 
 note "verify: a sealed file without its fingerprint is drift"
-CVWSUM="$CVPOOL/$(enc_path "$CVW").sum"
+CVWSUM="$CVPOOL/$(enc_path "$CVW").sha256"
 mv -- "$CVWSUM" "$CVWSUM.away"
 CVRC=0
 locked_conv verify >"$CVOUT" 2>&1 || CVRC=$?

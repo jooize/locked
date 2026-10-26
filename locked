@@ -1168,8 +1168,9 @@ meta_field() {
 # Known keys: owner, group, mode (the node's own, which a seal never
 # changes, so verify expects exactly them), flag (the seal's: schg or
 # sappnd), flagsym (the whole flag word the seal left), id, mount (the
-# mount point the path resolved into when it was sealed), recursive (1 for
-# a folder sealed whole), role, state, plus the provenance fields the
+# mount point the path resolved into when it was sealed), sealedsize (an
+# append-only file only: the bytes it was sealed with, which verify holds
+# its first bytes to), recursive (1 for a folder sealed whole), role, state, plus the provenance fields the
 # retired/suspended states add -- via, by, at, bin -- and mismatch, which
 # may repeat: an edit that did not install as approved (see mismatch_kv),
 # carried by every rewrite and dropped only by a fresh seal, a revert, or a
@@ -1208,40 +1209,39 @@ write_meta() {
   mv -f -- "$tmp" "$meta" || return 1
 }
 
-# write_sum <sumfile> <sum lines>: the fingerprints of a sealed file or
+# write_sum <sumfile> <sha256 lines>: the fingerprints of a sealed file or
 # folder, as the helper printed them when it held the bytes (seal --swap,
-# install): root's, 600, and no read entry. A record is readable by
-# anything running as its user; a fingerprint there would let such a
-# process confirm a guess at a short secret in a file long deleted. Only
-# root reads these, and verify is root.
+# install), in the sha256 file format (see sha_lines): root's, 600, and no
+# read entry. A record is readable by anything running as its user; a
+# fingerprint there would let such a process confirm a guess at a short
+# secret in a file long deleted. Only root reads these, and verify is root.
 write_sum() {
   local tmp
-  tmp="$(mktemp "$(dirname "$1")/.sum.XXXXXX")" || return 1
+  tmp="$(mktemp "$(dirname "$1")/.sha256.XXXXXX")" || return 1
   printf '%s\n' "$2" >"$tmp" || return 1
   chmod 600 "$tmp" || return 1
   mv -f -- "$tmp" "$1" || return 1
 }
 
-# helper_sums: the sum lines of the last helper call, in the order it
-# printed them.
-helper_sums() {
-  printf '%s\n' "$HELPER_OUT" | grep '^sum' || true
+# sha_lines <helper output>: the helper's sum lines (sum, hex, path, bytes)
+# as lines of the sha256 file format shasum and sha256sum print and check:
+# the hex, two spaces, the path below the sealed node (. for the node
+# itself), escaped by the helper. The byte count is left out; sum_bytes
+# reads it.
+sha_lines() {
+  printf '%s\n' "$1" | awk -F'\t' '$1=="sum"{print $2 "  " $3}'
 }
 
-# sum_put <sumfile> <sum line>: replace the line for the same path below
-# the top (the third field), or add it: one file of a sealed folder
-# installed by edit. The path field is already escaped by the helper, so
-# a plain field compare is exact.
-sum_put() {
-  local rel="${2##*$'\t'}" cur=""
-  if [ -f "$1" ]; then
-    cur="$(REL="$rel" awk -F'\t' '$3 != ENVIRON["REL"]' "$1")" || return 1
-  fi
-  if [ -n "$cur" ]; then
-    write_sum "$1" "$(printf '%s\n%s' "$cur" "$2" | LC_ALL=C sort -t "$(printf '\t')" -k3,3)"
-  else
-    write_sum "$1" "$2"
-  fi
+# sum_bytes <helper output>: the byte count of the top's sum line (path
+# .), which an append-only file's record keeps as sealedsize.
+sum_bytes() {
+  printf '%s\n' "$1" | awk -F'\t' '$1=="sum" && $3=="."{print $4; exit}'
+}
+
+# helper_sums: the sum lines of the last helper call, in the order it
+# printed them, as sha256 lines.
+helper_sums() {
+  sha_lines "$HELPER_OUT"
 }
 
 # mismatch_kv <metafile> [<path>]: the record's mismatch lines, one per
@@ -1291,7 +1291,7 @@ meta_rewrite() {
     err_val "this record is from before 0.17.0; the next root run converts it" "$meta"
     return 1
   fi
-  for k in owner group mode flag flagsym id mount recursive role state; do
+  for k in owner group mode flag flagsym id mount sealedsize recursive role state; do
     [ "$k" != state ] || [ -z "$mm" ] || kvs+=("$mm")
     found=""
     for kv in "$@"; do
@@ -1340,8 +1340,8 @@ node_mount() {
 }
 
 # record_sealed <metafile> <path> <flag> <recursive> <role> [<mismatch
-# lines>]: the record of a node just sealed, every node field read off
-# the node as it now is.
+# lines> [sealedsize=<bytes>]]: the record of a node just sealed, every
+# node field read off the node as it now is.
 record_sealed() {
   local meta="$1" f="$2" id mnt own grp mode
   id="$(node_id "$f")" || return 1
@@ -1357,6 +1357,7 @@ record_sealed() {
     "flagsym=$(flags_of "$f")" \
     "id=$id" \
     "mount=$mnt" \
+    "${7:-}" \
     "recursive=$4" \
     "role=$5" \
     "${6:-}" \
@@ -1570,7 +1571,7 @@ verify_helper_now() {
 #     <user>/                root:wheel 700 + <user>'s read entry
 #       pool/                root:wheel 700 + <user>'s read entry
 #         *.meta             root:wheel 600 + <user>'s read entry (records)
-#         *.sum              root:wheel 600 (fingerprints; root's alone)
+#         *.sha256           root:wheel 600 (fingerprints; root's alone)
 #         *.snap, *.snapdir, *.attic, .staging/
 #                            root:wheel 600/700 (root's alone)
 #
@@ -1812,7 +1813,7 @@ snap_paths() { # sets ENC SNAP SNAPDIR ATTIC META SUM for path $1
   SNAPDIR="$USER_POOL/${ENC}.snapdir"
   ATTIC="$USER_POOL/${ENC}.attic"
   META="$USER_POOL/${ENC}.meta"
-  SUM="$USER_POOL/${ENC}.sum"
+  SUM="$USER_POOL/${ENC}.sha256"
 }
 
 # ---- verify findings ----------------------------------------------------------
@@ -2095,20 +2096,41 @@ verify_node() {
   # folder by edit takes its place in path order, which is not quite the
   # walk's order. Every seal of a file or folder writes the fingerprints,
   # so one missing is drift, never a pass.
-  local sumf="${meta%.meta}.sum" got want
+  local sumf="${meta%.meta}.sha256" got want
   if [ "$EUID" -eq 0 ] && [ ! -f "$sumf" ] && [ ! -L "$f" ] &&
      { [ -f "$f" ] || [ "$recursive" = "1" ]; }; then
     vline drift "no fingerprint to compare its content with: $sumf"
     bad=1
   elif [ "$EUID" -eq 0 ] && [ ! -L "$f" ] &&
      { [ -f "$f" ] || [ "$recursive" = "1" ]; }; then
+    # An append-only file is held to the bytes it was sealed with, its
+    # first sealedsize bytes: what was appended since is what the seal
+    # allows.
     local -a dig=(digest --src "$f" --src-id "${id/./:}" --owner "$owner" --as "$owner")
+    local ssz="" lenok=1
     [ "$recursive" = "1" ] && dig+=(--recursive)
-    if [ "$sn" -eq 0 ] && verify_helper && got="$("$LOCKED_HELPER" "${dig[@]}" 2>/dev/null)"; then
+    if [ "$flag" = sappnd ] && [ "$recursive" != "1" ]; then
+      ssz="$(meta_field "$meta" sealedsize)"
+      case "$ssz" in
+        ''|*[!0-9]*)
+          vline drift "append-only, and the record holds no sealed size to check it against"
+          bad=1
+          lenok=0
+          ;;
+        *) dig+=(--length "$ssz") ;;
+      esac
+    fi
+    if [ "$lenok" -eq 0 ]; then
+      :
+    elif [ "$sn" -eq 0 ] && verify_helper && got="$("$LOCKED_HELPER" "${dig[@]}" 2>/dev/null)"; then
       want="$(LC_ALL=C sort <"$sumf")"
-      got="$(printf '%s\n' "$got" | LC_ALL=C sort)"
+      got="$(sha_lines "$got" | LC_ALL=C sort)"
       if [ "$got" != "$want" ]; then
-        vline drift "content differs from what was sealed"
+        if [ -n "$ssz" ]; then
+          vline drift "the bytes it was sealed with changed (append-only, sealed at $ssz bytes)"
+        else
+          vline drift "content differs from what was sealed"
+        fi
         bad=1
       fi
     elif [ "$sn" -eq 0 ]; then
@@ -3252,7 +3274,11 @@ seal_node() {
   node_op lock "$f" seal "${how[@]}" || return 1
 
   if [ "$OPT_DRY" -eq 0 ]; then
-    record_sealed "$META" "$f" "$fl" "$rec" "$role" || return 1
+    local sz=""
+    if [ "$k" = file ] && [ "$fl" = sappnd ]; then
+      sz="sealedsize=$(sum_bytes "$HELPER_OUT")"
+    fi
+    record_sealed "$META" "$f" "$fl" "$rec" "$role" "" "$sz" || return 1
     case "$k" in
       file|tree) write_sum "$SUM" "$(helper_sums)" || return 1 ;;
     esac
@@ -3692,7 +3718,7 @@ rekey_record() { # <oldpath> <newpath>
   oldenc="$(encode "$old")"
   newenc="$(encode "$new")"
   [ "$oldenc" != "$newenc" ] || return 0
-  for suffix in meta sum snap snapdir attic; do
+  for suffix in meta sha256 snap snapdir attic; do
     if [ -e "$USER_POOL/$newenc.$suffix" ]; then
       err_val "a record already exists for the new path; refusing to merge into it" "$new"
       return 1
@@ -3702,7 +3728,7 @@ rekey_record() { # <oldpath> <newpath>
     move_lines "dry run: re-key record" "$old" "$new"
     return 0
   fi
-  for suffix in meta sum snap snapdir attic; do
+  for suffix in meta sha256 snap snapdir attic; do
     src="$USER_POOL/$oldenc.$suffix"
     dst="$USER_POOL/$newenc.$suffix"
     if [ -e "$src" ]; then
@@ -4553,14 +4579,20 @@ sealed_folder_for() { # <path> <is-new>
 # can write there. Prints what differs as a comma list (type, content,
 # owner, mode, flags, folder-flags) and returns 1 when anything does.
 check_install() {
-  local f="$1" want="$2" owner="$3" mode="$4" flag="$5" dflags="$6" bad="" got
+  local f="$1" want="$2" owner="$3" mode="$4" flag="$5" dflags="$6" bytes="${7:-}" bad="" got
+  local -a len=()
   if [ -L "$f" ] || [ ! -f "$f" ]; then
     printf 'type'
     return 1
   fi
+  # An append-only file may already have grown: its installed bytes are
+  # the first <bytes>.
+  if [ "$flag" = sappnd ] && [ -n "$bytes" ]; then
+    len=(--length "$bytes")
+  fi
   got="$("$LOCKED_HELPER" digest --src "$f" --src-id - --owner "$owner" \
-    --as "$owner" 2>/dev/null)" || got=""
-  [ "$got" = "$want" ] || bad="$bad,content"
+    --as "$owner" ${len[@]+"${len[@]}"} 2>/dev/null)" || got=""
+  [ "$(sha_lines "$got")" = "$want" ] || bad="$bad,content"
   [ "$(stat -f '%Su' "$f")" = "$owner" ] || bad="$bad,owner"
   [ "$(stat -f '%OLp' "$f")" = "$mode" ] || bad="$bad,mode"
   if [ "$flag" != none ]; then
@@ -4575,13 +4607,14 @@ check_install() {
   return 1
 }
 
-# stage_sum <staged file>: the fingerprint line of a staged file, as the
-# helper prints one for the top of a seal: sum, the sha256, ".". Root reads
-# its own staging here; nothing of the invoker's is on the way.
+# stage_sum <staged file>: the fingerprint line of a staged file, as
+# sha_lines writes the helper's line for the top of a seal: the sha256, two
+# spaces, ".". Root reads its own staging here; nothing of the invoker's is
+# on the way.
 stage_sum() {
   local h
   h="$(shasum -a 256 "$1")" || return 1
-  printf 'sum\t%s\t.' "${h%% *}"
+  printf '%s  .' "${h%% *}"
 }
 
 # mismatch_line <path> <what differed>: the record line for a failed
@@ -4909,8 +4942,10 @@ do_edit_one() {
   NODE_ALARM=0
   node_op edit "$f" install "${how[@]}" || { rm -f -- "$stage"; return 1; }
   [ "$(helper_sums)" = "$want" ] || what="staged"
-  local more=""
-  more="$(check_install "$f" "$want" "$owner" "$mode" "$flag" "$dflags")" || true
+  local more="" bytes sz=""
+  bytes="$(sum_bytes "$HELPER_OUT")"
+  [ "$flag" != sappnd ] || sz="sealedsize=$bytes"
+  more="$(check_install "$f" "$want" "$owner" "$mode" "$flag" "$dflags" "$bytes")" || true
   [ -z "$more" ] || what="${what:+$what,}$more"
   rm -f -- "$stage"
 
@@ -4919,8 +4954,8 @@ do_edit_one() {
     # tree as it now is: a mismatch above is on the record either way.
     snap_paths "$folder"
     meta_rewrite "$META" "$(mismatch_join "$META" "$f" "$what")" || return 1
-    write_sum "$SUM" "$("$LOCKED_HELPER" digest --src "$folder" --src-id - \
-      --owner "$owner" --as "$owner" --recursive)" || return 1
+    write_sum "$SUM" "$(sha_lines "$("$LOCKED_HELPER" digest --src "$folder" --src-id - \
+      --owner "$owner" --as "$owner" --recursive)")" || return 1
     if [ -n "$what" ]; then
       report_mismatch "$f" "$what" "$folder"
       return 1
@@ -4939,7 +4974,7 @@ do_edit_one() {
   # the mismatch itself rather than a replaced identity on top of it.
   meta_rewrite "$META" "$(mismatch_join "$META" "$f" "$what")" \
     "flagsym=$(flags_of "$f")" "id=$(node_id "$f")" \
-    "mount=$(node_mount "$f")" "state=locked" || return 1
+    "mount=$(node_mount "$f")" "$sz" "state=locked" || return 1
   write_sum "$SUM" "$want" || return 1
   if [ -n "$what" ]; then
     report_mismatch "$f" "$what" "$f"
@@ -5026,8 +5061,10 @@ do_revert_one() {
     --target-id "$cid" --owner "$inv" --chown "$owner:$group" --mode "$mode" \
     --flag "$flag" || { rm -f -- "$staged"; return 1; }
   [ "$(helper_sums)" = "$want" ] || what="staged"
-  local more=""
-  more="$(check_install "$f" "$want" "$owner" "$mode" "$flag" "$dflags")" || true
+  local more="" bytes sz=""
+  bytes="$(sum_bytes "$HELPER_OUT")"
+  [ "$flag" != sappnd ] || sz="sealedsize=$bytes"
+  more="$(check_install "$f" "$want" "$owner" "$mode" "$flag" "$dflags" "$bytes")" || true
   [ -z "$more" ] || what="${what:+$what,}$more"
   rm -f -- "$staged"
   if [ -f "$META" ]; then
@@ -5035,7 +5072,7 @@ do_revert_one() {
     # install did not land as it should.
     meta_rewrite "$META" "$(mismatch_line "$f" "$what")" \
       "flagsym=$(flags_of "$f")" "id=$(node_id "$f")" \
-      "mount=$(node_mount "$f")" || return 1
+      "mount=$(node_mount "$f")" "$sz" || return 1
     [ "$was_locked" -eq 0 ] || write_sum "$SUM" "$want" || return 1
   fi
   if [ -n "$what" ]; then
@@ -5901,6 +5938,15 @@ conv_fail() {
   err_val "could not convert its seal; left as it was, tried again on the next root run" "$1"
 }
 
+# conv_sealedsize <path> <new flag> <helper output>: the sealedsize pair
+# for an append-only file (0.16's anchor tier allowed one under ~/.ssh),
+# from the count the helper hashed; nothing for anything else.
+conv_sealedsize() {
+  if [ "$2" = sappnd ] && [ -f "$1" ] && [ ! -L "$1" ] && [ -n "$3" ]; then
+    printf 'sealedsize=%s' "$(sum_bytes "$3")"
+  fi
+}
+
 # conv_sums <sum lines>: the lines, sorted, for a comparison.
 conv_sums() {
   printf '%s\n' "$1" | grep '^sum' | LC_ALL=C sort || true
@@ -6022,12 +6068,13 @@ convert_record() {
     "flagsym=$(flags_of "$f")" \
     "id=$id" \
     "mount=$(node_mount "$f")" \
+    "$(conv_sealedsize "$f" "$nflag" "$post")" \
     "recursive=$recursive" \
     "role=$role" \
     "$mm" \
     "state=$state" || return 1
   if [ -n "$post" ]; then
-    write_sum "${meta%.meta}.sum" "$(conv_sums "$post")" || return 1
+    write_sum "${meta%.meta}.sha256" "$(sha_lines "$post")" || return 1
   fi
   log_action convert "$f" ok
 }
