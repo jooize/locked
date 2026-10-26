@@ -201,7 +201,7 @@ usage(void)
 "                             --parent-id <id|-> --name <entry>\n"
 "                             (--target-id <id> --owner <users> | --new)\n"
 "                             --chown <user>:<group> --mode <octal>\n"
-"                             --flag <uchg|uappnd|schg|sappnd>\n"
+"                             --flag <uchg|uappnd|schg|sappnd|none>\n"
 "       locked-helper digest --src <path> --src-id <id|-> --owner <users>\n"
 "                            --as <user> [--recursive]\n"
 "       locked-helper id <path>\n"
@@ -4307,7 +4307,8 @@ cmd_copy_tree(int argc, char **argv)
  * it at --name: swapped with the sealed file --target-id names (owned by
  * one of --owner; its flag lifted for the swap, the inode that went out
  * checked, then removed from staging), or, with --new, at a name nothing
- * holds yet. The flag goes on through the held descriptor of the new file,
+ * holds yet. The flag (none: no flag, for a revert of a file that is
+ * unlocked) goes on through the held descriptor of the new file,
  * and every process holding it open for writing is named (exit 8, the
  * install done). When the parent's own flags had to come off, its entries
  * are compared across the window (exit 6 on any other change).
@@ -4364,8 +4365,11 @@ cmd_install(int argc, char **argv)
 		errf("--mode must be octal permission bits, no set-id bit");
 		return (EX_HELPER_USAGE);
 	}
-	if (parse_flag(o.flag, &flag) != 0) {
-		errf("--flag must be one of uchg, uappnd, schg, sappnd");
+	/* none: a revert of a file that is unlocked puts it back unsealed. */
+	if (strcmp(o.flag, "none") == 0)
+		flag = 0;
+	else if (parse_flag(o.flag, &flag) != 0) {
+		errf("--flag must be one of uchg, uappnd, schg, sappnd, none");
 		return (EX_HELPER_USAGE);
 	}
 

@@ -1,8 +1,8 @@
 # Declarative locked install for nix-darwin.
 #
 # Declares everything `sudo locked setup` does imperatively: the binary in
-# the system profile, the hidden lock account and group, a digest-pinned
-# /etc/sudoers.d/locked entry, and the verify LaunchDaemon. The sudoers
+# the system profile, a digest-pinned /etc/sudoers.d/locked entry, and the
+# verify LaunchDaemon. The sudoers
 # digest and the installed binary derive from ONE string at eval time
 # (scriptText below), so they can never disagree -- the drift window that
 # manual setup closes by re-running is structurally absent here. The
@@ -11,7 +11,7 @@
 #
 # Darwin-only on purpose: locked is built on BSD file flags, dscl and
 # launchd; there is nothing portable to declare.
-{ config, options, lib, pkgs, ... }:
+{ config, lib, pkgs, ... }:
 
 let
   cfg = config.security.locked;
@@ -98,58 +98,6 @@ let
 
   validUser = user: builtins.match "[A-Za-z_][A-Za-z0-9_-]*" user != null;
 
-  # Same derivation as the script's lock_account_for().
-  lockAccount = "_${cfg.user}-lock";
-
-  # Account provisioning mirrors `setup` steps 2-4 (proven idempotent),
-  # the same way pinned's module provisions its groups: Darwin has no id
-  # allocator, so a declarative users.users entry would force a hand-
-  # picked uid into the config. Instead scan the hidden 401-499 service
-  # range for the first free id at activation time. The trade, accepted
-  # knowingly: nix-darwin does not manage the account's lifecycle
-  # (creation-if-absent only, no declarative deletion); nothing consumes
-  # the id NUMBER -- sudoers, chown and the script all go by name.
-  provisionAccounts = ''
-    if ! /usr/bin/dscl . -read "/Groups/${lockAccount}" PrimaryGroupID >/dev/null 2>&1; then
-      taken="$(/usr/bin/dscl . -list /Groups PrimaryGroupID | /usr/bin/awk '{print $2}')"
-      locked_gid=""
-      for c in $(/usr/bin/seq 401 499); do
-        if ! printf '%s\n' "$taken" | /usr/bin/grep -qx "$c"; then locked_gid="$c"; break; fi
-      done
-      if [ -z "$locked_gid" ]; then
-        echo "locked: no free gid in 401-499; refusing to provision ${lockAccount}" >&2
-        exit 1
-      fi
-      echo "creating group ${lockAccount} (gid $locked_gid, hidden range)..." >&2
-      /usr/bin/dscl . -create "/Groups/${lockAccount}"
-      /usr/bin/dscl . -create "/Groups/${lockAccount}" RealName "Lock group for ${cfg.user}"
-      /usr/bin/dscl . -create "/Groups/${lockAccount}" PrimaryGroupID "$locked_gid"
-    fi
-    if ! /usr/bin/dscl . -read "/Users/${lockAccount}" UniqueID >/dev/null 2>&1; then
-      locked_gid="$(/usr/bin/dscl . -read "/Groups/${lockAccount}" PrimaryGroupID | /usr/bin/awk '{print $2}')"
-      taken="$(/usr/bin/dscl . -list /Users UniqueID | /usr/bin/awk '{print $2}')"
-      locked_uid=""
-      for c in $(/usr/bin/seq 401 499); do
-        if ! printf '%s\n' "$taken" | /usr/bin/grep -qx "$c"; then locked_uid="$c"; break; fi
-      done
-      if [ -z "$locked_uid" ]; then
-        echo "locked: no free uid in 401-499; refusing to provision ${lockAccount}" >&2
-        exit 1
-      fi
-      echo "creating user ${lockAccount} (uid $locked_uid, hidden range)..." >&2
-      /usr/bin/dscl . -create "/Users/${lockAccount}"
-      /usr/bin/dscl . -create "/Users/${lockAccount}" UniqueID "$locked_uid"
-      /usr/bin/dscl . -create "/Users/${lockAccount}" PrimaryGroupID "$locked_gid"
-      /usr/bin/dscl . -create "/Users/${lockAccount}" UserShell /usr/bin/false
-      /usr/bin/dscl . -create "/Users/${lockAccount}" NFSHomeDirectory /var/empty
-      /usr/bin/dscl . -create "/Users/${lockAccount}" RealName "Lock user for ${cfg.user}"
-      /usr/bin/dscl . -create "/Users/${lockAccount}" IsHidden 1
-      /usr/bin/dscacheutil -flushcache
-    fi
-    # Membership is what reads the user's own pool and verify status
-    # (unprivileged `locked status`); asserted on every activation.
-    /usr/sbin/dseditgroup -o edit -a "${cfg.user}" -t user "${lockAccount}" 2>/dev/null || true
-  '';
 in
 {
   options.security.locked = {
@@ -159,53 +107,9 @@ in
       type = lib.types.str;
       description = ''
         The human operator: granted sudo for the locked binary
-        (digest-pinned, no NOPASSWD) and made a member of the lock group,
-        which can read the user's own pool records. The lock account and
-        group are named _<user>-lock, matching the script's own
-        derivation.
+        (digest-pinned, no NOPASSWD). Their pool and verify status are
+        readable to them through an ACL entry the script itself gives.
       '';
-    };
-
-    uid = lib.mkOption {
-      type = lib.types.nullOr lib.types.int;
-      default = null;
-      description = ''
-        Uid for the lock account (also its gid unless gid is set),
-        declared via users.knownUsers -- the preferred, declarative
-        mode: the number lives in the config, and on-disk ownership of
-        the snapshot tree survives any account recreation with its
-        meaning intact. Pick a free id in the hidden 400-499 service
-        range; list what is taken with:
-
-            dscl . -list /Users UniqueID | awk '$2 >= 400 && $2 < 500'
-            dscl . -list /Groups PrimaryGroupID | awk '$2 >= 400 && $2 < 500'
-
-        For a config that must not carry a machine-specific number, set
-        allocateIds instead; one of the two is required. Deletion is a
-        manual ceremony either way -- nix-darwin refuses to delete
-        accounts with ids <= 501.
-      '';
-    };
-
-    allocateIds = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
-      description = ''
-        Opt out of declaring numbers: provision the lock account and
-        group imperatively at activation with the first free ids in
-        401-499 (setup's own allocation logic; idempotent). Nothing
-        consumes the id numbers, so this is safe -- the trade is that
-        the account lives outside nix-darwin's users.knownUsers
-        registry. (One option name, allocateIds, across this module
-        family -- see security.pinned.allocateIds.)
-      '';
-    };
-
-    gid = lib.mkOption {
-      type = lib.types.nullOr lib.types.int;
-      default = cfg.uid;
-      defaultText = lib.literalExpression "config.security.locked.uid";
-      description = "Gid for the lock group when uid is set.";
     };
 
     installPath = lib.mkOption {
@@ -255,43 +159,12 @@ in
           assertion = pkgs.stdenv.hostPlatform.isDarwin;
           message = "security.locked is Darwin-only (BSD file flags)";
         }
-        {
-          # Exactly one mode: declarative is the default expectation
-          # (spirit of nix -- the config carries the number); imperative
-          # allocation is the explicit opt-out, never a silent fallback.
-          assertion = (cfg.uid != null) != cfg.allocateIds;
-          message = "security.locked: set uid (declarative, preferred) or allocateIds = true (activation-time allocation) -- exactly one";
-        }
       ];
 
       environment.systemPackages = [ package ];
 
       environment.etc."sudoers.d/locked".source = sudoersFile;
     }
-
-    # Two provisioning modes, the assertion above enforcing a conscious
-    # choice: declared number -> users.knownUsers, converged by
-    # nix-darwin; allocateIds -> imperative first-free allocation, same
-    # as `setup` would do.
-    (lib.mkIf (cfg.uid != null) {
-      users.knownUsers = [ lockAccount ];
-      users.knownGroups = [ lockAccount ];
-      users.users.${lockAccount} = {
-        uid = cfg.uid;
-        gid = cfg.gid;
-        description = "Lock user for ${cfg.user}";
-        # home/shell left null: nix-darwin creates with /var/empty and
-        # /usr/bin/false, exactly the imperative values.
-      };
-      users.groups.${lockAccount} = {
-        gid = cfg.gid;
-        description = "Lock group for ${cfg.user}";
-        members = [ cfg.user ];
-      };
-    })
-    (lib.mkIf cfg.allocateIds {
-      system.activationScripts.extraActivation.text = lib.mkAfter provisionAccounts;
-    })
 
     {
       # Declarative replacement for install_verify_timer. The daemon runs
@@ -317,16 +190,5 @@ in
         };
       };
     }
-  ]
-  # The lock account is root-only BY CONSTRUCTION here -- this module is what
-  # creates it, with no shell, no password and no service behind it -- so this
-  # is the one place entitled to tell pinned that a file it owns is as
-  # unwritable to the user as a root-owned one. The test is on `options`, not
-  # `config`: reading config.security.pinned to decide what to define would
-  # make this module's output depend on a value it contributes to, which is
-  # infinite recursion. A machine without pinned's module simply has no such
-  # option, and this contributes nothing.
-  ++ lib.optional (options ? security && options.security ? pinned) {
-    security.pinned.rootOnlyOwners = [ lockAccount ];
-  }));
+  ]));
 }

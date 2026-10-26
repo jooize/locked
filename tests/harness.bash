@@ -7,17 +7,14 @@
 # assertion has a flag-vs-noflag control (clear the flag, re-run, expect
 # success) so a failure can't be blamed on permissions or the sandbox.
 #
-# No global state is touched: the lock account is stood in by the existing
-# `daemon` user (the account's identity is irrelevant to flag mechanics;
-# what matters is that the invoker does not own the node), the state root
-# (pools and verify status), the legacy root the layout conversion reads
-# and the fake home live in scratch dirs, one per section, and the cleanup
-# traps clear all flags before removing them. Ancestry fixtures live in
-# another scratch dir under /var/db (the 1777 /private/tmp would itself
-# fail the walk), and the window helper this harness builds lives in one
-# there for the same reason; the traps remove both. Add rights on placement dirs come
-# from an ACL entry naming the invoker, not from a group, so the daemon
-# stand-in exercises them here too (section 6).
+# No global state is touched: the state root (pools and verify status) and
+# the fake home live in scratch dirs, one per section, and the cleanup traps
+# clear all flags before removing them. The existing `daemon` account
+# stands in for another user, and for 0.16's lock account in the one-shot
+# conversion (section 7). Ancestry fixtures live in another scratch dir
+# under /var/db (the 1777 /private/tmp would itself fail the walk), and the
+# window helper this harness builds lives in one there for the same reason;
+# the traps remove both.
 #
 # One thing this harness cannot keep entirely to itself: if the trash
 # service is reachable from the terminal running it, the trash probe below
@@ -49,10 +46,10 @@ shopt -s nullglob
 # ("${BSL}u{200B}"), so no escape is ever spelled out in this file.
 BSL='\'
 
-# srow <glyph> <word> <tier> <flag> <path>: a status row as locked prints
+# srow <glyph> <word> <role> <flag> <path>: a status row as locked prints
 # it off a tty -- the glyph, three word columns padded to the widest word
 # of their sets, the path last -- less its four-space indent.
-srow() { printf '%s  %-11s  %-9s  %-6s  %s' "$1" "$2" "$3" "$4" "$5"; }
+srow() { printf '%s  %-11s  %-5s  %-6s  %s' "$1" "$2" "$3" "$4" "$5"; }
 
 # ---- TAP output ------------------------------------------------------------
 #
@@ -192,15 +189,14 @@ cleanup() {
 trap cleanup EXIT
 
 # Environment for every locked invocation: a scratch state root, daemon as
-# the stand-in lock account, fake home. These seams only work because we
-# execute the script directly as root -- sudo's env_reset strips them on
-# real invocations.
+# 0.16's lock account for the conversion, fake home. These seams only work
+# because we execute the script directly as root -- sudo's env_reset strips
+# them on real invocations.
 LOCK_ACCT=daemon
 
-# Every root invocation runs the one-shot layout conversion, which MOVES
-# whatever it finds at the legacy root. Left at its default, one invocation
-# that forgot the seam would move the machine's real pool into this scratch
-# dir, and the cleanup trap would delete it. Exported rather than passed per
+# Every root invocation runs the one-shot conversion over every pool under
+# the state root. Left at its default, one invocation that forgot the seam
+# would convert the machine's real pools. Exported rather than passed per
 # call, so every child -- env blocks, expect's spawn -- inherits it whatever
 # its own command line says; the check makes a regression here fatal.
 #
@@ -212,11 +208,10 @@ new_scratch() {
   chmod 755 "$SCRATCH"
   FAKE_HOME="$SCRATCH/home"
   STATEROOT="$SCRATCH/state"
-  export LOCKED_LEGACY_ROOT="$SCRATCH/legacy"
   export LOCKED_STATE_ROOT="$STATEROOT"
-  case "$LOCKED_LEGACY_ROOT" in
+  case "$LOCKED_STATE_ROOT" in
     "$SCRATCH"/*) ;;
-    *) bail "LOCKED_LEGACY_ROOT is outside the scratch dir; refusing to run" ;;
+    *) bail "LOCKED_STATE_ROOT is outside the scratch dir; refusing to run" ;;
   esac
   install -d -o "$INV" -g staff "$FAKE_HOME"
   install -d -o "$INV" -g staff "$SCRATCH/raw"   # user-owned container for raw probes
@@ -445,8 +440,12 @@ put_id() { # <path> <id>: rewrite just the id field of an existing record
   m="$(meta_path "$1")"
   sed "s|^id=.*|id=$2|" "$m" >"$m.tmp"
   mv -f "$m.tmp" "$m"
-  chown "$LOCK_ACCT:$LOCK_ACCT" "$m"
-  chmod 640 "$m"
+  rec_mode "$m"
+}
+rec_mode() { # <record>: the shape write_meta gives a record
+  chown root:wheel "$1"
+  chmod 600 "$1"
+  chmod +a "user:$INV allow read,readattr,readextattr,readsecurity" "$1"
 }
 id_form_of() { # <id> -> vol|dev, the same test the script makes
   case "${1%%.*}" in
@@ -459,14 +458,13 @@ put_meta() { # <path> <key=value>...: craft a record write_meta would accept
   m="$(meta_path "$1")"
   shift
   printf '%s\n' "$@" >"$m"
-  chown "$LOCK_ACCT:$LOCK_ACCT" "$m"
-  chmod 640 "$m"
+  rec_mode "$m"
 }
 
 # ---- 0. window helper ------------------------------------------------------
 #
-# atomic_replace routes EVERY staging copy through the compiled window
-# helper, so lock, edit and revert all need one -- not just the placement
+# pool_copy, the seals and install route EVERY copy through the compiled window
+# helper, so lock, edit and revert all need one -- not just the mediated
 # verbs. Build the repo's source and install it where verify_helper's walk
 # accepts it: root-owned, no group/other write, and a fully root-owned
 # 755-or-stricter ancestry on both the textual and the resolved path. That
@@ -651,7 +649,7 @@ chflags -- nouappnd "$A"
 ok   "control: rename after nouappnd"    as_user mv -- "$A/existing.txt" "$A/renamed.txt"
 ok   "control: delete after nouappnd"    as_user rm -- "$A/new.txt"
 
-note "raw primitives: sappnd file (root-anchor, ownership stays user)"
+note "raw primitives: sappnd file (ownership stays user)"
 SF="$SCRATCH/raw/sappnd-file.txt"
 as_user /bin/sh -c "echo start > '$SF'"
 chflags -- sappnd "$SF"
@@ -685,22 +683,35 @@ ok   "empty pool status succeeds"        locked status
 locked status >"$POOL" 2>&1
 ok   "empty pool listing says so"        grep -qF "pool for $INV is empty" "$POOL"
 
-note "cli: content-tier file lock provisions the chain"
+note "cli: a file lock provisions the chain"
 as_user mkdir -- "$FAKE_HOME/sub"
-# 777 throughout this file's fixtures: where a dir IS adopted as placement,
-# the invoker keeps full write via the OTHER bits (the seal's ACL entry
-# adds, never removes), so every denial stays attributable to a flag
-# rather than to ordinary permissions. Section 6 seals 755 and 700 dirs
-# instead, where the ACL entry is the only way in. This one is the leaf's own parent,
-# which the chain never provisions -- see section 5 at the end of the
-# file -- so it simply stays the invoker's.
+# 777 throughout this file's fixtures, so every denial stays attributable
+# to a flag rather than to ordinary permissions. This one is the leaf's own
+# parent, which the chain never provisions -- see section 5 at the end of
+# the file -- so it simply stays the invoker's.
 chmod 777 "$FAKE_HOME/sub"
 CFG="$FAKE_HOME/sub/we ird %config.txt"   # space + percent stress the encoding
 as_user /bin/sh -c "printf 'version 1\n' > '$CFG'"
+CFG_INO="$(stat -f '%i' "$CFG")"
+CFG_MODE="$(stat -f '%OLp' "$CFG")"
 
 ok   "lock --yes leaf"                   locked lock --yes "$CFG"
-check "leaf owner is lock account"       "$LOCK_ACCT" "$(owner_of "$CFG")"
-check "leaf flag uchg"                   "uchg" "$(flags_of "$CFG")"
+check "leaf keeps its owner"             "$INV" "$(owner_of "$CFG")"
+check "leaf keeps its mode"              "$CFG_MODE" "$(stat -f '%OLp' "$CFG")"
+check "leaf flag schg"                   "schg" "$(flags_of "$CFG")"
+check "leaf is a copy root made (a new inode)" "1" \
+      "$([ "$(stat -f '%i' "$CFG")" != "$CFG_INO" ] && echo 1)"
+check "with the same bytes"              "version 1" "$(cat "$CFG")"
+CFG_SUM="$(state_of "$CFG")/$INV/pool/$(enc_path "$CFG").sum"
+check "its fingerprint is root's 600"    "root wheel 600" "$(stat -f '%Su %Sg %OLp' "$CFG_SUM")"
+check "with no read entry"               "" "$(ls -le "$CFG_SUM" | sed 1d)"
+check "the fingerprint is the file's"    "sum"$'\t'"$(shasum -a 256 "$CFG" | awk '{print $1}')"$'\t'"." \
+      "$(cat "$CFG_SUM")"
+check "its record is root's 600"         "root wheel 600" "$(stat -f '%Su %Sg %OLp' "$(meta_path "$CFG")")"
+check "with your read entry"             " 0: user:$INV allow read,readattr,readextattr,readsecurity" \
+      "$(ls -le "$(meta_path "$CFG")" | sed 1d)"
+check "the record names its volume"      "$("$HELPER" mount "$CFG")" "$(meta_get "$CFG" mount)"
+deny "the record holds no tier"          grep -q '^tier=' "$(meta_path "$CFG")"
 check "leaf parent keeps its owner"      "$INV" "$(owner_of "$FAKE_HOME/sub")"
 check "leaf parent carries no flag"      "" "$(flags_of "$FAKE_HOME/sub")"
 check "home flag sappnd"                 "sappnd" "$(flags_of "$FAKE_HOME")"
@@ -718,7 +729,7 @@ check "unlocked flags empty"             "" "$(flags_of "$CFG")"
 check "leaf parent still unflagged"      "" "$(flags_of "$FAKE_HOME/sub")"
 ok   "user in-place edit while unlocked" as_user /bin/sh -c "printf 'version 2\n' > '$CFG'"
 ok   "relock with --yes seals"           locked lock --yes "$CFG"
-check "relocked flag uchg"               "uchg" "$(flags_of "$CFG")"
+check "relocked flag schg"               "schg" "$(flags_of "$CFG")"
 NT="$FAKE_HOME/notty.txt"
 as_user /bin/sh -c "echo x > '$NT'"
 deny "lock without --yes fails closed off-tty" locked_notty lock "$NT"
@@ -736,7 +747,7 @@ ok   "relock names the snapshot side"    grep -qF -- "--- snapshot: $CFG" "$RLF"
 ok   "relock names the current side"     grep -qF -- "+++ current: $CFG" "$RLF"
 ok   "revert"                            locked revert "$CFG"
 check "content back to unlock-time"      "version 2" "$(head -1 "$CFG")"
-check "reverted file still uchg"         "uchg" "$(flags_of "$CFG")"
+check "reverted file still schg"         "schg" "$(flags_of "$CFG")"
 ok   "verify clean after revert"         locked verify
 
 note "cli: drift detection + verify status + repair"
@@ -745,8 +756,7 @@ note "cli: drift detection + verify status + repair"
 ESCF="$FAKE_HOME/caf"$'\303\251'"\\x.txt"
 as_user /bin/sh -c 'echo e > "$1"' sh "$ESCF"
 ok   "lock a file whose name needs escaping" locked lock --yes "$ESCF"
-chflags -- nouchg "$CFG" "$ESCF"         # simulate an attacker-with-root / forgotten relock
-chown "$INV" "$CFG" "$ESCF"
+chflags -- noschg "$CFG" "$ESCF"         # simulate an attacker-with-root / forgotten relock
 if locked verify >/dev/null 2>&1; then
   tap_fail "verify should exit nonzero on drift"
 else
@@ -755,8 +765,10 @@ else
 fi
 VSTAT="$STATEROOT/$INV/verify"
 vstat() { sed -n "s/^$1=//p" "$VSTAT" | head -1; }
-check "status file is root's, group-readable" "root $LOCK_ACCT 640" \
+check "status file is root's 600"       "root wheel 600" \
       "$(stat -f '%Su %Sg %OLp' "$VSTAT")"
+check "with your read entry"             " 0: user:$INV allow read,readattr,readextattr,readsecurity" \
+      "$(ls -le "$VSTAT" | sed 1d)"
 check "status counts both drifted nodes" "2" "$(vstat drifted)"
 ok   "status names the drifted path"     grep -qxF "drift=$CFG" "$VSTAT"
 ok   "a non-ASCII name and a backslash are escaped" \
@@ -774,18 +786,21 @@ ok   "verify clean after repair"         locked verify
 check "status says clean after repair"   "0" "$(vstat drifted)"
 deny "and names no path"                 grep -q '^drift=' "$VSTAT"
 
-note "cli: content-tier directory (recursive)"
+note "cli: a folder sealed whole"
 CD="$FAKE_HOME/cfgdir"
 as_user mkdir -p -- "$CD/nested"
 as_user /bin/sh -c "echo a > '$CD/a.txt'; echo b > '$CD/nested/b.txt'"
 ok   "lock --yes dir"                    locked lock --yes "$CD"
-check "dir flag uchg"                    "uchg" "$(flags_of "$CD")"
-check "nested file owner lock account"   "$LOCK_ACCT" "$(owner_of "$CD/nested/b.txt")"
-check "nested file uchg"                 "uchg" "$(flags_of "$CD/nested/b.txt")"
+check "dir flag schg"                    "schg" "$(flags_of "$CD")"
+check "nested file keeps its owner"      "$INV" "$(owner_of "$CD/nested/b.txt")"
+check "nested file schg"                 "schg" "$(flags_of "$CD/nested/b.txt")"
+check "the folder's fingerprints, one per file" "2" \
+      "$(grep -c '^sum' "$(state_of "$CD")/$INV/pool/$(enc_path "$CD").sum")"
+deny "user add inside the sealed folder" as_user /bin/sh -c "echo evil > '$CD/nested/new.txt'"
 deny "user write inside locked dir"      as_user /bin/sh -c "echo evil >> '$CD/a.txt'"
 ok   "unlock dir"                        locked unlock "$CD"
-check "dir owner back to user"           "$INV" "$(owner_of "$CD")"
-check "nested owner back to user"        "$INV" "$(owner_of "$CD/nested/b.txt")"
+check "dir flag off"                     "" "$(flags_of "$CD")"
+check "nested flag off"                  "" "$(flags_of "$CD/nested/b.txt")"
 ok   "relock dir"                        locked lock --yes "$CD"
 ok   "verify clean with dir in pool"     locked verify
 
@@ -802,8 +817,8 @@ ok   "verify clean after chain reseal"   locked verify
 note "cli: locked edit -- sudoedit-style, no unlock window"
 ok   "edit installs via staging"         locked edit --yes --editor "$ED" "$CFG"
 check "edited content installed"         "edited by script" "$(head -1 "$CFG")"
-check "still locked after edit"          "uchg" "$(flags_of "$CFG")"
-check "owner still lock account"         "$LOCK_ACCT" "$(owner_of "$CFG")"
+check "still locked after edit"          "schg" "$(flags_of "$CFG")"
+check "owner still yours"                "$INV" "$(owner_of "$CFG")"
 ok   "verify clean after edit"           locked verify
 ok   "revert undoes the edit"            locked revert "$CFG"
 check "revert restored pre-edit"         "version 4" "$(head -1 "$CFG")"
@@ -838,8 +853,8 @@ check "edit --from installs the proposal" "0" "$EDRC"
 ok   "edit --from names current"          grep -qF -- "--- current: $CFG" "$EDF"
 ok   "edit --from names proposed"         grep -qF -- "+++ proposed: $PROP" "$EDF"
 check "proposed content installed"        "from a proposal" "$(head -1 "$CFG")"
-check "still locked after edit --from"    "uchg" "$(flags_of "$CFG")"
-check "owner still lock account"          "$LOCK_ACCT" "$(owner_of "$CFG")"
+check "still locked after edit --from"    "schg" "$(flags_of "$CFG")"
+check "owner still yours"                 "$INV" "$(owner_of "$CFG")"
 ok   "verify clean after edit --from"     locked verify
 ok   "revert undoes the --from edit"      locked revert "$CFG"
 check "revert restored the pre-edit file" "version 4" "$(head -1 "$CFG")"
@@ -847,7 +862,7 @@ check "revert restored the pre-edit file" "version 4" "$(head -1 "$CFG")"
 refuse "a missing proposal is refused"    "--from: not a regular file" \
        locked edit --yes --from "$PROPD/nope" "$CFG"
 check "the target is untouched"           "version 4" "$(head -1 "$CFG")"
-check "the target is still sealed"        "uchg" "$(flags_of "$CFG")"
+check "the target is still sealed"        "schg" "$(flags_of "$CFG")"
 refuse "--from with --editor is refused"  "alternatives" \
        locked edit --yes --from "$PROP" --editor "$ED" "$CFG"
 refuse "--from with two files is refused" "one proposed copy for one file" \
@@ -862,7 +877,7 @@ cat -- "$CFG" >"$PROPSAME"
 chown "$INV" "$PROPSAME"
 check "an unchanged proposal installs nothing" "no changes: $CFG" \
       "$(locked edit --yes --from "$PROPSAME" "$CFG")"
-check "the unchanged target is still sealed"   "uchg" "$(flags_of "$CFG")"
+check "the unchanged target is still sealed"   "schg" "$(flags_of "$CFG")"
 
 # Off-tty the gate has nobody to ask, so it fails closed and names --yes --
 # and the frozen copy must not be left behind in staging.
@@ -884,22 +899,22 @@ ok   "the edit body was extracted"        test -s "$EDITBODY"
 ok   "the diff reads the frozen copy"     \
      grep -qF -- 'show_diff "$label" file "$f" "$old" "$stage" "$lhs" "$rhs"' "$EDITBODY"
 ok   "the install reads the frozen copy"  \
-     grep -qF 'atomic_replace "$stage" "$f"' "$EDITBODY"
+     grep -qF -- '(--src "$stage"' "$EDITBODY"
 FREEZELN="$(grep -n 'show_diff' "$EDITBODY" | head -1 | cut -d: -f1)"
 deny "the proposal is not named after the freeze" \
      /bin/sh -c "tail -n +$FREEZELN '$EDITBODY' | grep -q 'OPT_FROM'"
 
-note "cli: edit inside a folder sealed as content"
-# CD is sealed above (content, the whole tree). Its files have no records
+note "cli: edit inside a folder sealed whole"
+# CD is sealed above (the whole tree). Its files have no records
 # of their own; an edit follows the folder's record and never unlocks it.
 pool_meta() { printf '%s/%s/pool/%s.meta' "$STATEROOT" "$INV" "$(printf '%s' "$1" | sed -e 's|%|%25|g' -e 's|/|%2F|g')"; }
 PROPF="$PROPD/folder.proposed.txt"
 as_user /bin/sh -c "printf 'edited in the folder\n' > '$PROPF'"
 ok   "edit --from a file in a sealed folder"   locked edit --yes --from "$PROPF" "$CD/nested/b.txt"
 check "the folder file has the proposal"       "edited in the folder" "$(head -1 "$CD/nested/b.txt")"
-check "the folder file is still frozen"        "uchg" "$(flags_of "$CD/nested/b.txt")"
-check "the folder file owner lock account"     "$LOCK_ACCT" "$(owner_of "$CD/nested/b.txt")"
-check "its directory is frozen again"          "uchg" "$(flags_of "$CD/nested")"
+check "the folder file is still frozen"        "schg" "$(flags_of "$CD/nested/b.txt")"
+check "the folder file keeps its owner"        "$INV" "$(owner_of "$CD/nested/b.txt")"
+check "its directory is frozen again"          "schg" "$(flags_of "$CD/nested")"
 deny "the folder file gets no record"          test -e "$(pool_meta "$CD/nested/b.txt")"
 
 PROPN="$PROPD/new.proposed.txt"
@@ -912,11 +927,11 @@ check "edit --from creates a file in a sealed folder" "0" "$ENRC"
 ok   "the diff names the new file"             grep -qF -- "--- new file: $NEWF" "$EDN"
 ok   "the diff shows the new content"          grep -qF -- "+a new file" "$EDN"
 check "the new file has the proposal"          "a new file" "$(head -1 "$NEWF")"
-check "the new file is frozen"                 "uchg" "$(flags_of "$NEWF")"
-check "the new file owner lock account"        "$LOCK_ACCT" "$(owner_of "$NEWF")"
+check "the new file is frozen"                 "schg" "$(flags_of "$NEWF")"
+check "the new file is yours"                  "$INV" "$(owner_of "$NEWF")"
 check "the new file takes the folder mode without execute" \
       "$(printf '%o' $(( 0$(stat -f '%OLp' "$CD") & 0666 )))" "$(stat -f '%OLp' "$NEWF")"
-check "its directory is frozen again"          "uchg" "$(flags_of "$CD/nested")"
+check "its directory is frozen again"          "schg" "$(flags_of "$CD/nested")"
 deny "the new file gets no record"             test -e "$(pool_meta "$NEWF")"
 ok   "verify clean after edits in the folder"  locked verify
 
@@ -946,33 +961,17 @@ check "all 10 questions are found"             "10" "$(grep -c . "$QLIT" | tr -d
 deny "no question holds a value"               grep -q '\$' "$QLIT"
 deny "no question is capitalized"              grep -qE '(q|ask)="[A-Z]|confirm(_hard)? "[A-Z]' "$LOCKED"
 check "the empty file has no content"          "0" "$(stat -f '%z' "$CD/nested/empty.txt")"
-check "the empty file is frozen"               "uchg" "$(flags_of "$CD/nested/empty.txt")"
+check "the empty file is frozen"               "schg" "$(flags_of "$CD/nested/empty.txt")"
 refuse "a new file outside a sealed folder is refused" "not in pool" \
        locked edit --yes --from "$PROPN" "$FAKE_HOME/sub/nothing.txt"
 
 # The seal is checked, not assumed: a node the record says is frozen but
 # is not stops the edit, and nothing is sealed on its behalf.
-chflags nouchg "$CD/a.txt"
-refuse "an unfrozen node in the folder is refused" "not frozen (uchg)" \
+chflags noschg "$CD/a.txt"
+refuse "an unfrozen node in the folder is refused" "not sealed as its folder's record says" \
        locked edit --yes --from "$PROPF" "$CD/a.txt"
 check "the unfrozen file is untouched"         "a" "$(head -1 "$CD/a.txt")"
-chflags uchg "$CD/a.txt"
-
-# The rename lifts uchg on the file's directory for a moment, and only a
-# directory closed to the invoker may be lifted. An ACL entry that could
-# let them in while it is open refuses the edit, and the old file is left
-# frozen.
-chflags nouchg "$CD/nested"
-chmod +a "user:$INV allow add_file" "$CD/nested"
-chflags uchg "$CD/nested"
-refuse "a folder directory with an ACL entry is not lifted" "not closed to you" \
-       locked edit --yes --from "$PROPF" "$CD/nested/new.txt"
-check "the old file is intact"                 "a new file" "$(head -1 "$NEWF")"
-check "the old file is frozen again"           "uchg" "$(flags_of "$NEWF")"
-check "the directory stays frozen"             "uchg" "$(flags_of "$CD/nested")"
-chflags nouchg "$CD/nested"
-chmod -a "user:$INV allow add_file" "$CD/nested"
-chflags uchg "$CD/nested"
+chflags schg "$CD/a.txt"
 
 ok   "unlock the folder"                       locked unlock "$CD"
 refuse "edit in an unlocked folder is refused" "is unlocked" \
@@ -1041,7 +1040,7 @@ as_user ln -s "$ROOTONLY" "$PROPD/link.proposed.txt"
 refuse "a symlinked proposal is refused"  "cannot read as" \
        locked edit --yes --from "$PROPD/link.proposed.txt" "$CFG"
 check "the target is unchanged"           "version 4" "$(head -1 "$CFG")"
-check "the target is still sealed"        "uchg" "$(flags_of "$CFG")"
+check "the target is still sealed"        "schg" "$(flags_of "$CFG")"
 check "staging is left empty"             "0" \
       "$(ls -A "$STATEROOT/$INV/pool/.staging" | wc -l | tr -d ' ')"
 deny "no root-only bytes reached the target" grep -qF secret "$CFG"
@@ -1058,7 +1057,7 @@ chmod 755 "$ED2"
 refuse "a symlink left by the editor is refused" "cannot read the edited copy" \
        locked edit --yes --editor "$ED2" "$CFG"
 check "the target is unchanged"           "version 4" "$(head -1 "$CFG")"
-check "the target is still sealed"        "uchg" "$(flags_of "$CFG")"
+check "the target is still sealed"        "schg" "$(flags_of "$CFG")"
 check "staging is left empty"             "0" \
       "$(ls -A "$STATEROOT/$INV/pool/.staging" | wc -l | tr -d ' ')"
 deny "no root-only bytes reached the target" grep -qF secret "$CFG"
@@ -1079,7 +1078,7 @@ ok   "edit --from the xattr fixture"       locked edit --yes --from "$XPROP" "$X
 check "the proposed content installed"     "version 2" "$(head -1 "$XCFG")"
 check "the sealed file keeps its xattr"    "v1" "$(xattr -p house.test "$XCFG")"
 deny "the candidate's xattr is not adopted" xattr -p house.evil "$XCFG"
-check "the edited file is sealed again"    "uchg" "$(flags_of "$XCFG")"
+check "the edited file is sealed again"    "schg" "$(flags_of "$XCFG")"
 ok   "verify clean after the xattr edit"   locked verify
 ok   "revert the xattr fixture"            locked revert "$XCFG"
 check "the reverted content"               "version 1" "$(head -1 "$XCFG")"
@@ -1087,26 +1086,28 @@ check "the reverted file keeps its xattr"  "v1" "$(xattr -p house.test "$XCFG")"
 
 note "cli: an edit checks what it installed"
 # Nothing running as the invoker can change a file between the install
-# and the check, so the stand-in for root or a bug is a helper whose copy
-# out of edit staging gains one byte after it lands. It forwards every
+# and the check, so the stand-in for root or a bug is a helper whose
+# install gains one byte after it lands: it clears the new file's flag,
+# appends, and sets the flag again, as only root could. It forwards every
 # verb to the real helper and sits beside it, root-owned 755, where
 # verify_helper's walk accepts it.
 TAMPER="$HELPERDIR/tamper-helper"
 cat >"$SCRATCH/tamper-helper" <<EOS
 #!/bin/bash
 "$HELPER" "\$@" || exit \$?
-[ "\$1" = copy ] || exit 0
-src="" dest=""
+[ "\$1" = install ] || exit 0
+parent="" name="" flag=""
 while [ \$# -gt 0 ]; do
   case "\$1" in
-    --src) src="\$2"; shift ;;
-    --dest) dest="\$2"; shift ;;
+    --parent) parent="\$2"; shift ;;
+    --name) name="\$2"; shift ;;
+    --flag) flag="\$2"; shift ;;
   esac
   shift
 done
-case "\$(basename "\$src")" in
-  edit.*) printf 'x' >>"\$dest" ;;
-esac
+/usr/bin/chflags "no\$flag" "\$parent/\$name"
+printf 'x' >>"\$parent/\$name"
+/usr/bin/chflags "\$flag" "\$parent/\$name"
 EOS
 install -o root -g wheel -m 755 "$SCRATCH/tamper-helper" "$TAMPER"
 locked_tamper() { HELPER="$TAMPER" locked "$@"; }
@@ -1118,8 +1119,8 @@ PROPM="$PROPD/mismatch.proposed.txt"
 as_user /bin/sh -c "printf 'approved\n' > '$PROPM'"
 refuse "a folder edit that installs other bytes fails" "not what you approved (content)" \
        locked_tamper edit --yes --from "$PROPM" "$FM"
-check "the mismatched file is frozen"          "uchg" "$(flags_of "$FM")"
-check "its directory is frozen again"          "uchg" "$(flags_of "$CD/nested")"
+check "the mismatched file is frozen"          "schg" "$(flags_of "$FM")"
+check "its directory is frozen again"          "schg" "$(flags_of "$CD/nested")"
 ok   "the folder record carries the mismatch"  has_mismatch "$(pool_meta "$CD")" "content $FM"
 check "the edit refreshed the verify status"   "drifted=1" \
       "$(grep '^drifted=' "$STATEROOT/$INV/verify")"
@@ -1163,7 +1164,7 @@ chown "$INV" "$MCFG"
 ok   "lock the mismatch fixture"               locked lock --yes "$MCFG"
 refuse "a file edit that installs other bytes fails" "not what you approved (content)" \
        locked_tamper edit --yes --from "$PROPM" "$MCFG"
-check "the mismatched file is frozen"          "uchg" "$(flags_of "$MCFG")"
+check "the mismatched file is frozen"          "schg" "$(flags_of "$MCFG")"
 ok   "its record carries the mismatch"         has_mismatch "$(pool_meta "$MCFG")" "content $MCFG"
 MVO="$SCRATCH/verify-mismatch.out"
 MVRC=0
@@ -1176,19 +1177,18 @@ check "the reverted content"                   "version 1" "$(cat "$MCFG")"
 deny "the revert clears it"                    grep -q '^mismatch=' "$(pool_meta "$MCFG")"
 ok   "verify clean after the revert"           locked verify
 
-note "cli: ~/.ssh class -- anchor only, ownership never changes"
+note "cli: ~/.ssh -- schg on files, sappnd on the folder"
 as_user mkdir -m 700 -- "$FAKE_HOME/.ssh"
 SSHCFG="$FAKE_HOME/.ssh/config"
 as_user /bin/sh -c "printf 'Host example\n' > '$SSHCFG'"
 refuse "there is no --tier to ask for"   "unknown option: --tier" \
        locked lock --yes --tier content "$SSHCFG"
-ok   "lock takes the anchor tier here"   locked lock --yes "$SSHCFG"
+ok   "lock a file under ~/.ssh"          locked lock --yes "$SSHCFG"
 check "ssh config owner stays user"      "$INV" "$(owner_of "$SSHCFG")"
 check "ssh config flag defaults schg"    "schg" "$(flags_of "$SSHCFG")"
-# ~/.ssh is this leaf's own parent, and an anchor stays in the chain
-# wherever it sits: it never changes ownership, and its sappnd is what
-# holds the entries one level down.
-check "ssh dir auto-anchored sappnd"     "sappnd" "$(flags_of "$FAKE_HOME/.ssh")"
+# ~/.ssh is this leaf's own parent, and it stays in the chain wherever it
+# sits: its sappnd is what holds the entries one level down.
+check "ssh dir sealed sappnd"            "sappnd" "$(flags_of "$FAKE_HOME/.ssh")"
 check "ssh dir owner stays user"         "$INV" "$(owner_of "$FAKE_HOME/.ssh")"
 deny "user write to schg ssh config"     as_user /bin/sh -c "echo evil >> '$SSHCFG'"
 deny "user clear of schg (own file)"     as_user chflags -- noschg "$SSHCFG"
@@ -1196,14 +1196,13 @@ ok   "unlock ssh config"                 locked unlock "$SSHCFG"
 check "unlocked owner stays user"        "$INV" "$(owner_of "$SSHCFG")"
 ok   "in-place edit while unlocked"      as_user /bin/sh -c "printf 'Host edited\n' > '$SSHCFG'"
 ok   "relock (diff-witness) seals"       locked lock --yes "$SSHCFG"
-ok   "revert anchor file"                locked revert "$SSHCFG"
+ok   "revert the ssh config"             locked revert "$SSHCFG"
 check "reverted content"                 "Host example" "$(head -1 "$SSHCFG")"
 check "reverted owner stays user"        "$INV" "$(owner_of "$SSHCFG")"
 check "reverted flag schg"               "schg" "$(flags_of "$SSHCFG")"
 ok   "verify clean with ssh in pool"     locked verify
-# An anchor file with a second name: the flag is the file's, so the other
-# name is frozen too, and the plan says so. The owner never changes, so the
-# note does not say the lock account takes it.
+# A file with a second name: it is sealed as a copy, so the other name
+# keeps the old file, unsealed, and the plan says so.
 SSHKH="$FAKE_HOME/.ssh/known_hosts"
 install -d -o "$INV" -g staff -m 755 "$SCRATCH/ssh-links"
 SSHKL="$SCRATCH/ssh-links/known-hosts-link"
@@ -1211,11 +1210,10 @@ as_user /bin/sh -c "printf 'example ssh-ed25519 AAAA\n' > '$SSHKH'; ln -- '$SSHK
 SSHOUT="$SCRATCH/ssh-link-out.txt"
 SSHRC=0
 locked lock --yes "$SSHKH" >"$SSHOUT" 2>&1 || SSHRC=$?
-check "lock an anchor file with two names" "0" "$SSHRC"
-ok   "the plan notes the other name"     grep -qF "this file has 2 names (hard links); the flag is on the file," "$SSHOUT"
-deny "and does not say it changes hands" grep -qF "handed to the lock account" "$SSHOUT"
-check "the other name is frozen too"     "schg" "$(flags_of "$SSHKL")"
-check "and still yours"                  "$INV" "$(owner_of "$SSHKL")"
+check "lock a file with two names"       "0" "$SSHRC"
+ok   "the plan notes the other name"     grep -qF "this file has 2 names (hard links). It is sealed as a copy," "$SSHOUT"
+check "the other name keeps the old file, unsealed" "" "$(flags_of "$SSHKL")"
+check "the sealed name is one file now"  "1" "$(stat -f '%l' "$SSHKH")"
 ok   "unprotect the two-name file"       locked unprotect --yes "$SSHKH"
 as_user rm -f -- "$SSHKL"
 ok   "remove it from the append-only ~/.ssh" locked rm --yes "$SSHKH"
@@ -1278,9 +1276,9 @@ dw_case() { # <name> <printf escapes> <label> <needle>...: one class, three site
   locked lock --yes "$f" >/dev/null 2>&1 || rc=1
   locked unlock "$f" >/dev/null 2>&1 || rc=1
   printf '%b' "$bytes" >"$f"
-  check "content fixture ($name) was set up" "0" "$rc"
-  dw_site "content relock ($name)"        locked lock --yes "$f"
-  # Anchor relock: the same round under ~/.ssh, where the tier is forced.
+  check "file fixture ($name) was set up" "0" "$rc"
+  dw_site "file relock ($name)"           locked lock --yes "$f"
+  # The same round under ~/.ssh, whose folder is in every chain below it.
   s="$FAKE_HOME/.ssh/$name.cfg"
   rc=0
   printf 'plain\n' >"$s"
@@ -1288,8 +1286,8 @@ dw_case() { # <name> <printf escapes> <label> <needle>...: one class, three site
   locked lock --yes "$s" >/dev/null 2>&1 || rc=1
   locked unlock "$s" >/dev/null 2>&1 || rc=1
   printf '%b' "$bytes" >"$s"
-  check "anchor fixture ($name) was set up" "0" "$rc"
-  dw_site "anchor relock ($name)"         locked lock --yes "$s"
+  check "~/.ssh fixture ($name) was set up" "0" "$rc"
+  dw_site "~/.ssh relock ($name)"         locked lock --yes "$s"
   # Edit: the fixture arrives as a proposal for a sealed plain file, and
   # the revert hands that file back to the next class unchanged.
   p="$PROPD/$name.proposed"
@@ -1667,8 +1665,8 @@ install -d -o "$INV" -g staff "$ADMHOME"
 ADMCFG="$ADMHOME/zshrc"
 as_user /bin/sh -c "printf 'setopt nomatch\n' > '$ADMCFG'"
 ok   "lock under a root:admin stop node"  locked_home "$ADMHOME" lock --yes "$ADMCFG"
-check "leaf sealed uchg"                  "uchg" "$(flags_of "$ADMCFG")"
-check "home anchored sappnd"              "sappnd" "$(flags_of "$ADMHOME")"
+check "leaf sealed schg"                  "schg" "$(flags_of "$ADMCFG")"
+check "home sealed sappnd"                "sappnd" "$(flags_of "$ADMHOME")"
 check "stop node left untouched"          "" "$(flags_of "$ADMSTOP")"
 ok   "verify clean with admin stop node"  locked_home "$ADMHOME" verify
 
@@ -1697,7 +1695,7 @@ spawn env LOCKED_STATE_ROOT=$(state_for_home "$TTYHOME") INSTALL_TARGET=$SCRATCH
 expect {
   timeout { exit 1 }
   eof     { exit 1 }
-  "plan (tier "
+  "plan:"
 }
 # The path row, then the consequence line with the counts, then the
 # question, and the question line holds no path: exit 3 if a / shows on it.
@@ -1724,13 +1722,13 @@ exit [lindex \$result 3]
 EOF
   ok   "interactive lock answers one gate for the chain, under its path row, naming no path" \
     /usr/bin/expect -f "$TTYEXP"
-  check "interactive leaf sealed uchg"         "uchg" "$(flags_of "$TTYCFG")"
-  check "interactive home anchored sappnd"     "sappnd" "$(flags_of "$TTYHOME")"
+  check "interactive leaf sealed schg"         "schg" "$(flags_of "$TTYCFG")"
+  check "interactive home sealed sappnd"       "sappnd" "$(flags_of "$TTYHOME")"
 
   # A decline at the gate is a decline of the whole plan: the leaf is not
   # sealed, and the ancestor the plan listed as already locked stays as it
   # was. sappnd on the home lets a new entry be created under it, which is
-  # what the placement/anchor tiers are for.
+  # what a chain folder's sappnd is for.
   TTYDEC="$TTYHOME/declined.txt"
   as_user /bin/sh -c "printf 'x\n' > '$TTYDEC'"
   TTYEXP2="$SCRATCH/tty-decline.exp"
@@ -1755,7 +1753,7 @@ EOF
   check "a typed decline exits 2"              "2" "$TTYDRC"
   check "the declined leaf keeps its owner"    "$INV" "$(owner_of "$TTYDEC")"
   check "the declined leaf carries no flag"    "" "$(flags_of "$TTYDEC")"
-  check "the home anchor is still sealed"      "sappnd" "$(flags_of "$TTYHOME")"
+  check "the home is still sealed"             "sappnd" "$(flags_of "$TTYHOME")"
 
   # A wrong answer is not acted on: a yellow `not an answer` on its own
   # line, then the gate printed again, and the answer after it decides. The
@@ -1798,7 +1796,7 @@ EOF
 
   # The unprotect gate names what else goes, on the consequence line
   # above its question. Nothing else under this home is protected, so the
-  # anchor would be released along with the file.
+  # home folder would be released along with the file.
   TTYEXP3="$SCRATCH/tty-unprotect.exp"
   cat >"$TTYEXP3" <<EOF
 set timeout 15
@@ -1819,22 +1817,22 @@ EOF
   TTYURC=0
   /usr/bin/expect -f "$TTYEXP3" >/dev/null 2>&1 || TTYURC=$?
   check "the unprotect gate names the release; n declines" "2" "$TTYURC"
-  check "the declined unprotect left the file sealed" "uchg" "$(flags_of "$TTYCFG")"
-  check "and left the anchor sealed"            "sappnd" "$(flags_of "$TTYHOME")"
+  check "the declined unprotect left the file sealed" "schg" "$(flags_of "$TTYCFG")"
+  check "and left the home sealed"              "sappnd" "$(flags_of "$TTYHOME")"
 else
   tap_skip "interactive plan gate" "no expect on this machine"
 fi
 
 note "cli: no-arg status lists the populated pool"
-# Same fixtures as above, still in the pool: the content leaf, the home
-# anchor, and the content dir (unlocked here only to render that state).
+# Same fixtures as above, still in the pool: the leaf, the home folder in
+# its chain, and the folder (unlocked here only to render that state).
 ok   "status lists the pool"             locked status
 locked status >"$POOL" 2>&1
-ok   "listing names the locked leaf"     grep -qF "$(srow ✓ sealed content uchg "$CFG")" "$POOL"
-ok   "listing names the home anchor"     grep -qF "$(srow ✓ sealed anchor sappnd "$FAKE_HOME")" "$POOL"
+ok   "listing names the locked leaf"     grep -qF "$(srow ✓ sealed leaf schg "$CFG")" "$POOL"
+ok   "listing names the home folder"     grep -qF "$(srow ✓ sealed chain sappnd "$FAKE_HOME")" "$POOL"
 ok   "unlock dir to expose its state"    locked unlock "$CD"
 locked status >"$POOL" 2>&1
-ok   "listing marks the unlocked node"   grep -qF "$(srow '!' unlocked content '' "$CD")" "$POOL"
+ok   "listing marks the unlocked node"   grep -qF "$(srow '!' unlocked leaf '' "$CD")" "$POOL"
 ok   "relock dir after the listing"      locked lock --yes "$CD"
 
 check "the listing ends with the last verify" "last verify: ✓  clean" "$(tail -1 "$POOL" | sed 's/ (.*//')"
@@ -1844,20 +1842,35 @@ note "cli: pool permissions"
 # unprivileged status possible without exposing either the user list or
 # any file content, and what keeps the verify status root's alone.
 check "state root is root's, traverse-only" "root wheel 711" "$(stat -f '%Su %Sg %OLp' "$STATEROOT")"
-check "per-user dir is root's, lock group"  "root $LOCK_ACCT 750" "$(stat -f '%Su %Sg %OLp' "$STATEROOT/$INV")"
-check "pool is the lock account's"          "$LOCK_ACCT $LOCK_ACCT 750" "$(stat -f '%Su %Sg %OLp' "$STATEROOT/$INV/pool")"
+DIRENT=" 0: user:$INV allow list,search,readattr,readextattr,readsecurity"
+FILEENT=" 0: user:$INV allow read,readattr,readextattr,readsecurity"
+check "per-user dir is root's 700"          "root wheel 700" "$(stat -f '%Su %Sg %OLp' "$STATEROOT/$INV")"
+check "  with your read entry alone"        "$DIRENT" "$(ls -led "$STATEROOT/$INV" | sed 1d)"
+check "pool is root's 700"                  "root wheel 700" "$(stat -f '%Su %Sg %OLp' "$STATEROOT/$INV/pool")"
+check "  with your read entry alone"        "$DIRENT" "$(ls -led "$STATEROOT/$INV/pool" | sed 1d)"
 POOL_METAS=("$STATEROOT/$INV/pool"/*.meta)
 POOL_SNAPS=("$STATEROOT/$INV/pool"/*.snap)
-if [ "${#POOL_METAS[@]}" -gt 0 ] && [ "${#POOL_SNAPS[@]}" -gt 0 ]; then
-  check "meta is group-readable 640"     "640" "$(stat -f '%OLp' "${POOL_METAS[0]}")"
-  check "snapshot content stays 600"     "600" "$(stat -f '%OLp' "${POOL_SNAPS[0]}")"
+POOL_SUMS=("$STATEROOT/$INV/pool"/*.sum)
+if [ "${#POOL_METAS[@]}" -gt 0 ] && [ "${#POOL_SNAPS[@]}" -gt 0 ] && [ "${#POOL_SUMS[@]}" -gt 0 ]; then
+  check "a record is root's 600"         "root wheel 600" "$(stat -f '%Su %Sg %OLp' "${POOL_METAS[0]}")"
+  check "  with your read entry"         "$FILEENT" "$(ls -le "${POOL_METAS[0]}" | sed 1d)"
+  check "a snapshot is root's 600"       "root wheel 600" "$(stat -f '%Su %Sg %OLp' "${POOL_SNAPS[0]}")"
+  check "  with no read entry"           "" "$(ls -le "${POOL_SNAPS[0]}" | sed 1d)"
+  check "a fingerprint is root's 600"    "root wheel 600" "$(stat -f '%Su %Sg %OLp' "${POOL_SUMS[0]}")"
+  check "  with no read entry"           "" "$(ls -le "${POOL_SUMS[0]}" | sed 1d)"
+  deny "you cannot read a fingerprint"   as_user cat -- "${POOL_SUMS[0]}"
+  deny "nor a snapshot"                  as_user cat -- "${POOL_SNAPS[0]}"
+  ok   "but you can read a record"       as_user cat -- "${POOL_METAS[0]}"
 else
-  tap_fail "pool has no meta/snap to check modes on"
+  tap_fail "pool has no meta/snap/sum to check modes on"
 fi
+# Any other account is refused by the kernel: the entry names you alone.
+OTHER=daemon
+deny "another account cannot list your pool" sudo -u "$OTHER" /bin/ls -- "$STATEROOT/$INV/pool"
 
 note "cli: unprivileged status"
 # The repo lives under the invoker's home, which no other account may
-# traverse, so the lock account runs the same bytes from a root-owned,
+# traverse, so another account runs the same bytes from a root-owned,
 # world-readable copy.
 SCRIPT_COPY="$SCRATCH/locked-copy"
 install -m 755 -o root -g wheel "$LOCKED_RUN" "$SCRIPT_COPY"
@@ -1880,57 +1893,63 @@ locked_as() { # <user> <args...>: run locked unprivileged AS <user>.
 MARKER="$SCRATCH/unpriv-marker"
 : >"$MARKER"
 
-# The invoker is not in the daemon group, so the pool dir the stand-in lock
-# account owns is exactly the cross-user shape: reachable by name, entirely
-# unreadable. Fail closed with one line, not a cascade of glob noise.
-refuse "unprivileged status refuses an unreadable pool" "cannot read pool for $INV" \
+# You read your own pool without sudo, through the read entry.
+ok   "unprivileged status lists your pool"      locked_as "$INV" status
+locked_as "$INV" status >"$POOL" 2>&1
+ok   "  with the sealed leaf"                   grep -qF "$(srow ✓ sealed leaf schg "$CFG")" "$POOL"
+ok   "status of one path works too"             locked_as "$INV" status "$CFG"
+# A pool without your read entry (an earlier layout a root run has not
+# converged yet) fails closed with one line, not a cascade of glob noise.
+chmod -a "user:$INV allow list,search,readattr,readextattr,readsecurity" "$STATEROOT/$INV"
+refuse "a pool you cannot read is refused"      "cannot read the pool of $INV" \
        locked_as "$INV" status
-refuse "same refusal for status with a path"            "cannot read pool for $INV" \
-       locked_as "$INV" status "$CFG"
+chmod +a "user:$INV allow list,search,readattr,readextattr,readsecurity" "$STATEROOT/$INV"
 
-# As the lock account the derived pool is daemon's own, which does not
-# exist -- so this drives the whole non-root branch (uid-derived invoker,
-# provisioning skipped, nothing written) down to the empty-pool listing.
-ok   "unprivileged status as the lock account"  locked_as "$LOCK_ACCT" status
-locked_as "$LOCK_ACCT" status >"$POOL" 2>&1
-ok   "it lists the lock account's OWN pool"     grep -qF "pool for $LOCK_ACCT is empty" "$POOL"
+# Another account's derived pool is its own, which does not exist -- so
+# this drives the whole non-root branch (uid-derived invoker, provisioning
+# skipped, nothing written) down to the empty-pool listing.
+ok   "unprivileged status as another account"  locked_as "$OTHER" status
+locked_as "$OTHER" status >"$POOL" 2>&1
+ok   "it lists that account's OWN pool"         grep -qF "pool for $OTHER is empty" "$POOL"
 ok   "with no verify run recorded for it"       grep -qF "last verify: -  none recorded" "$POOL"
 
 check "unprivileged status wrote nothing"       "" \
       "$(/usr/bin/find "$STATEROOT" -newer "$MARKER" -print)"
 
 note "cli: unprivileged status reads the verify status"
-# The lock account stands in for a user reading their own status through
-# the lock group. Its per-user dir is a fixture in the shape root converges
-# to; the files are what a verify run would write.
-VFX="$STATEROOT/$LOCK_ACCT"
-install -d -m 750 -o root -g "$LOCK_ACCT" "$VFX"
-vfixture() { # <line>...: the fixture status file, root's and group-readable
+# Another account stands in for a user reading their own status through
+# their read entry. Its per-user dir is a fixture in the shape root
+# converges to; the files are what a verify run would write.
+VFX="$STATEROOT/$OTHER"
+install -d -m 700 -o root -g wheel "$VFX"
+chmod +a "user:$OTHER allow list,search,readattr,readextattr,readsecurity" "$VFX"
+vfixture() { # <line>...: the fixture status file, root's, with the entry
   printf '%s\n' "$@" >"$VFX/verify"
-  chown "root:$LOCK_ACCT" "$VFX/verify"
-  chmod 640 "$VFX/verify"
+  chown root:wheel "$VFX/verify"
+  chmod 600 "$VFX/verify"
+  chmod +a "user:$OTHER allow read,readattr,readextattr,readsecurity" "$VFX/verify"
 }
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 vfixture "at=$NOW_ISO" "interval=900" "records=3" "drifted=0"
-locked_as "$LOCK_ACCT" status >"$POOL" 2>&1
+locked_as "$OTHER" status >"$POOL" 2>&1
 ok   "a clean run reads as clean"               grep -qF "last verify: ✓  clean" "$POOL"
 deny "and not as stale"                         grep -qF "stale" "$POOL"
 
 vfixture "at=$NOW_ISO" "interval=900" "records=3" "drifted=3" \
          "drift=/a/one" "drift=/a/caf\\xc3\\xa9"
-locked_as "$LOCK_ACCT" status >"$POOL" 2>&1
+locked_as "$OTHER" status >"$POOL" 2>&1
 ok   "drift reads as drift, with its count"     grep -qF "last verify: ✗  3 drifted" "$POOL"
 ok   "the recorded paths are shown as the characters they name" \
      grep -qxF "      /a/caf$(printf '%b' '\xc3\xa9')" "$POOL"
 ok   "the uncapped remainder is counted"        grep -qF "and 1 more" "$POOL"
 
 vfixture "at=2026-01-01T00:00:00Z" "interval=900" "records=3" "drifted=0"
-locked_as "$LOCK_ACCT" status >"$POOL" 2>&1
+locked_as "$OTHER" status >"$POOL" 2>&1
 ok   "an old clean run still says what it found" grep -qF "last verify: ✓  clean" "$POOL"
 ok   "and that it is stale"                     grep -qF "note: that run is stale; the timer runs every 900s" "$POOL"
 
 vfixture "at=$NOW_ISO" "interval=soon" "drifted=0"
-locked_as "$LOCK_ACCT" status >"$POOL" 2>&1
+locked_as "$OTHER" status >"$POOL" 2>&1
 ok   "a malformed status says so"               grep -qF "last verify: ✗  malformed: $VFX/verify" "$POOL"
 
 rm -f -- "$VFX/verify"
@@ -2046,7 +2065,7 @@ refuse "setup refused when nix-managed" "nix-managed" locked_it "$SETUP_IT" setu
 
 }
 
-# ---- 4. mediated placement verbs -------------------------------------------
+# ---- 4. mediated verbs --------------------------------------------------------
 section_4() {
 #
 # This section leaves retired, suspended and re-keyed records in its pool.
@@ -2054,10 +2073,8 @@ section_4() {
 # section's whole-pool verify ever meets them.
 #
 # Fixtures live under MED, whose stop node is SCRATCH (root:wheel 755).
-# Placement dirs are created 777 so the invoker keeps write through the
-# OTHER bits: the seal's ACL entry grants add rights only, and
-# do_trash_one's parent-writability pre-check must pass for the ordinary
-# cases. A real 755 placement dir refuses trash; section 6 shows it.
+# Dirs are created 777 so every denial is a flag's, and do_trash_one's
+# parent-writability pre-check passes for the ordinary cases.
 
 note "mediated: fixtures"
 MED="$SCRATCH/med"
@@ -2077,7 +2094,7 @@ deny "the file is gone"                        test -e "$RMD/victim.txt"
 check "parent flag restored after rm"          "uappnd" "$(flags_of "$RMD")"
 ok   "locked rm removes an empty directory"    locked rm --yes "$RMD/emptydir"
 deny "the empty directory is gone"             test -e "$RMD/emptydir"
-# sappnd is the other sealed-parent shape (the anchor tier uses it on ~).
+# sappnd is the other sealed-parent shape (every chain folder carries it).
 chflags -- nouappnd "$RMD"
 as_user /bin/sh -c "echo v2 > '$RMD/victim2.txt'"
 chflags -- sappnd "$RMD"
@@ -2141,7 +2158,7 @@ deny "the leaf's own parent is not provisioned" test -f "$(meta_path "$MED")"
 install -d -o "$INV" -g staff -m 755 "$MED/keeper"
 as_user /bin/sh -c "echo k > '$MED/keeper/keep.txt'"
 ok   "a keeper leaf seals the mediated area"   locked lock --yes "$MED/keeper/keep.txt"
-check "the mediated area became placement"     "uappnd" "$(flags_of "$MED")"
+check "the mediated area became a chain folder" "sappnd" "$(flags_of "$MED")"
 check "as a chain node"                        "chain" "$(meta_get "$MED" role)"
 check "and kept its mode"                      "777" "$(stat -f '%OLp' "$MED")"
 ok   "locked rm on a pool node"                locked rm --yes "$POOLF"
@@ -2158,10 +2175,9 @@ SUBT="$MED/subtree"
 as_user mkdir -p -- "$SUBT/inner"
 as_user /bin/sh -c "echo q > '$SUBT/inner/q.txt'"
 ok   "lock a leaf deep in a subtree"           locked lock --yes "$SUBT/inner/q.txt"
-chflags -- nouappnd "$SUBT/inner"
-chflags -- nouchg "$SUBT/inner/q.txt"
+chflags -- noschg "$SUBT/inner/q.txt"
 rm -f -- "$SUBT/inner/q.txt"
-chflags -- nouappnd "$SUBT"
+chflags -- nosappnd "$SUBT"
 rmdir -- "$SUBT/inner"
 locked rm --yes "$SUBT" >"$OUTF" 2>&1 || true
 ok   "rm refuses a subtree holding records"    grep -qF "locked records live under it" "$OUTF"
@@ -2222,7 +2238,7 @@ ok   "the new record key exists"               test -f "$(meta_path "$MVB/rename
 ok   "the snapshot moved with it"              test -f "$(snap_path "$MVB/renamed.txt")"
 check "the recorded identity is unchanged"     "$RKID" "$(meta_get "$MVB/renamed.txt" id)"
 check "the record is still locked"             "locked" "$(meta_get "$MVB/renamed.txt" state)"
-check "the moved node is still sealed"         "uchg" "$(flags_of "$MVB/renamed.txt")"
+check "the moved node is still sealed"         "schg" "$(flags_of "$MVB/renamed.txt")"
 ok   "verify clean after the move"             locked verify --quiet
 
 note "rekey: record-only repair"
@@ -2237,9 +2253,9 @@ refuse "rekey refuses a node the record does not describe" \
 ok   "the record stayed where it was"          test -f "$(meta_path "$RKD/k.txt")"
 # Move it by other means: exactly the situation rekey exists to repair.
 chflags -- nouappnd "$RKD"
-chflags -- nouchg "$RKD/k.txt"
+chflags -- noschg "$RKD/k.txt"
 mv -- "$RKD/k.txt" "$RKD/moved.txt"
-chflags -- uchg "$RKD/moved.txt"
+chflags -- schg "$RKD/moved.txt"
 chflags -- uappnd "$RKD"
 ok   "rekey accepts the very node the record describes" \
      locked rekey "$RKD/k.txt" "$RKD/moved.txt"
@@ -2251,9 +2267,9 @@ ok   "verify clean after the re-key"           locked verify --quiet
 # so the repair rekey exists for must not fail over the id's spelling.
 put_id "$RKD/moved.txt" "999.$(stat -f '%i' "$RKD/moved.txt")"
 chflags -- nouappnd "$RKD"
-chflags -- nouchg "$RKD/moved.txt"
+chflags -- noschg "$RKD/moved.txt"
 mv -- "$RKD/moved.txt" "$RKD/moved2.txt"
-chflags -- uchg "$RKD/moved2.txt"
+chflags -- schg "$RKD/moved2.txt"
 chflags -- uappnd "$RKD"
 ok   "rekey accepts a legacy dev.ino record" \
      locked rekey "$RKD/moved.txt" "$RKD/moved2.txt"
@@ -2264,11 +2280,11 @@ RKT2="$MED/rekeytree2"
 as_user mkdir -p -- "$RKT/in"
 as_user /bin/sh -c "echo t > '$RKT/in/t.txt'"
 ok   "lock a leaf under the tree to be moved"  locked lock --yes "$RKT/in/t.txt"
-chflags -- nouappnd "$MED"
-chflags -- nouappnd "$RKT"
+chflags -- nosappnd "$MED"
+chflags -- nosappnd "$RKT"
 mv -- "$RKT" "$RKT2"
-chflags -- uappnd "$RKT2"
-chflags -- uappnd "$MED"
+chflags -- sappnd "$RKT2"
+chflags -- sappnd "$MED"
 refuse "rekey refuses a recorded subtree without --recursive" \
        "locked records live under it" \
        locked rekey "$RKT" "$RKT2"
@@ -2285,10 +2301,10 @@ ok   "lock the node to be tombstoned"          locked lock --yes "$TSF"
 refuse "tombstone refuses while the path exists" "present on disk" \
        locked tombstone --yes "$TSF"
 check "the record is untouched"                "locked" "$(meta_get "$TSF" state)"
-chflags -- nouappnd "$MED"
-chflags -- nouchg "$TSF"
+chflags -- nosappnd "$MED"
+chflags -- noschg "$TSF"
 rm -f -- "$TSF"
-chflags -- uappnd "$MED"
+chflags -- sappnd "$MED"
 ok   "tombstone retires an absent record"      locked tombstone --yes "$TSF"
 check "state is retired"                       "retired" "$(meta_get "$TSF" state)"
 check "provenance is the assertion"            "assertion" "$(meta_get "$TSF" via)"
@@ -2371,7 +2387,7 @@ check "the record still says locked"           "locked" "$(meta_get "$FKD/t.txt"
 
 F6="$(mkfake exit6 \
   "chflags -- nouappnd '$FKD'" \
-  "chflags -- nouchg '$FKD/t.txt'" \
+  "chflags -- noschg '$FKD/t.txt'" \
   "rm -f -- '$FKD/t.txt'" \
   "chflags -- uappnd '$FKD'" \
   "printf 'anomaly\t+\tstranger.txt\t16777233:424242\n'" \
@@ -2405,8 +2421,8 @@ ok   "the file survived both refusals"         test -f "$TRD/t.txt"
 rmdir -- "$STATEROOT/root/pool" "$STATEROOT/root" 2>/dev/null || true
 
 NWD="$MED/nowrite"
-install -d -o "$LOCK_ACCT" -g "$LOCK_ACCT" -m 700 "$NWD"
-install -m 644 -o "$LOCK_ACCT" -g "$LOCK_ACCT" /dev/null "$NWD/x.txt"
+install -d -o daemon -g daemon -m 700 "$NWD"
+install -m 644 -o daemon -g daemon /dev/null "$NWD/x.txt"
 locked trash --yes "$NWD/x.txt" >"$OUTF" 2>&1 || true
 ok   "trash refuses a parent the invoker cannot write" \
      grep -qF "cannot write the directory it is in: $NWD" "$OUTF"
@@ -2440,7 +2456,7 @@ install -d -o "$INV" -g staff -m 755 "$FBIN"
 as_user /bin/sh -c "echo b > '$FBIN/withbin.txt'"
 FTB="$(mkfake trash-bin \
   "chflags -- nouappnd '$TRD'" \
-  "chflags -- nouchg '$TRB'" \
+  "chflags -- noschg '$TRB'" \
   "rm -f -- '$TRB'" \
   "chflags -- uappnd '$TRD'" \
   "printf 'binurl\t%s\n' '$FBIN/withbin.txt'" \
@@ -2455,7 +2471,7 @@ as_user /bin/sh -c "echo n > '$TRN'"
 ok   "lock the missing-bin fixture"            locked lock --yes "$TRN"
 FTN="$(mkfake trash-nobin \
   "chflags -- nouappnd '$TRD'" \
-  "chflags -- nouchg '$TRN'" \
+  "chflags -- noschg '$TRN'" \
   "rm -f -- '$TRN'" \
   "chflags -- uappnd '$TRD'" \
   'exit 0')"
@@ -2500,10 +2516,10 @@ XASNAP="$(snap_path "$XAF")"
 check "the source xattr rode onto the snapshot" "carried" \
       "$(xattr -p com.locked.harness "$XASNAP" 2>/dev/null)"
 check "the snapshot carries no flags"          "" "$(flags_of "$XASNAP")"
-# The edit re-snapshots BEFORE it clears the flag, so this copy is taken
-# from a still-uchg source: the staged result must not inherit it.
+# The edit re-snapshots BEFORE it installs, so this copy is taken from a
+# still-schg source: the staged result must not inherit it.
 ok   "edit the sealed file through staging"    locked edit --yes --editor "$ED" "$XAF"
-check "the edited file is sealed again"        "uchg" "$(flags_of "$XAF")"
+check "the edited file is sealed again"        "schg" "$(flags_of "$XAF")"
 check "the re-snapshot still has no flags"     "" "$(flags_of "$XASNAP")"
 check "the re-snapshot still carries the xattr" "carried" \
       "$(xattr -p com.locked.harness "$XASNAP" 2>/dev/null)"
@@ -2518,8 +2534,8 @@ install -d -o "$INV" -g staff -m 755 "$VD/bin"
 RETIRED="$VD/retired.txt"
 as_user /bin/sh -c "echo r > '$RETIRED'"
 put_meta "$RETIRED" \
-  "owner=$INV" "group=staff" "mode=644" "lockmode=444" \
-  "tier=content" "flag=uchg" "flagsym=uchg" "id=1.1" "recursive=0" "role=leaf" \
+  "owner=$INV" "group=staff" "mode=644" \
+  "flag=schg" "flagsym=schg" "id=1.1" "recursive=0" "role=leaf" \
   "state=retired" "via=rm" "by=$INV" "at=2026-08-25T00:00:00Z"
 locked verify >"$OUTF" 2>&1 || true
 deny "a retired record says nothing in verify" grep -qF "$RETIRED" "$OUTF"
@@ -2527,8 +2543,8 @@ ok   "verify is clean with a retired record"   locked verify --quiet
 
 FINALIZE="$VD/finalize.txt"
 put_meta "$FINALIZE" \
-  "owner=$INV" "group=staff" "mode=644" "lockmode=444" \
-  "tier=content" "flag=uchg" "flagsym=uchg" "id=1.2" "recursive=0" "role=leaf" \
+  "owner=$INV" "group=staff" "mode=644" \
+  "flag=schg" "flagsym=schg" "id=1.2" "recursive=0" "role=leaf" \
   "state=suspended" "by=$INV" "at=2026-08-25T00:00:00Z" "bin=$VD/bin/gone.txt"
 locked verify >"$OUTF" 2>&1 || true
 ok   "a vanished bin entry finalizes the suspension" \
@@ -2540,8 +2556,8 @@ check "and the bin it came from is kept"       "$VD/bin/gone.txt" "$(meta_get "$
 STILL="$VD/still-binned.txt"
 as_user /bin/sh -c "echo s > '$VD/bin/still-binned.txt'"
 put_meta "$STILL" \
-  "owner=$INV" "group=staff" "mode=644" "lockmode=444" \
-  "tier=content" "flag=uchg" "flagsym=uchg" "id=1.3" "recursive=0" "role=leaf" \
+  "owner=$INV" "group=staff" "mode=644" \
+  "flag=schg" "flagsym=schg" "id=1.3" "recursive=0" "role=leaf" \
   "state=suspended" "by=$INV" "at=2026-08-25T00:00:00Z" \
   "bin=$VD/bin/still-binned.txt"
 locked verify >"$OUTF" 2>&1 || true
@@ -2551,8 +2567,8 @@ check "and it stays suspended"                 "suspended" "$(meta_get "$STILL" 
 BACK="$VD/back.txt"
 as_user /bin/sh -c "echo b > '$BACK'"
 put_meta "$BACK" \
-  "owner=$INV" "group=staff" "mode=644" "lockmode=444" \
-  "tier=content" "flag=uchg" "flagsym=uchg" "id=1.4" "recursive=0" "role=leaf" \
+  "owner=$INV" "group=staff" "mode=644" \
+  "flag=schg" "flagsym=schg" "id=1.4" "recursive=0" "role=leaf" \
   "state=suspended" "by=$INV" "at=2026-08-25T00:00:00Z" "bin=$VD/bin/back.txt"
 if locked verify >"$OUTF" 2>&1; then vrc=0; else vrc=$?; fi
 check "a reappearance drifts"                  "5" "$vrc"
@@ -2563,14 +2579,14 @@ ok   "the drift points at re-locking"          grep -qF "sudo locked lock $BACK"
 
 note "status: retired and suspended rows"
 locked status >"$OUTF" 2>&1 || true
-ok   "the pool listing marks a retired node"   grep -qF "$(srow '~' retired content '' "$RETIRED")" "$OUTF"
+ok   "the pool listing marks a retired node"   grep -qF "$(srow '~' retired leaf '' "$RETIRED")" "$OUTF"
 ok   "and says how it was retired"             grep -qF "via rm at " "$OUTF"
-ok   "the pool listing marks a suspended node" grep -qF "$(srow '~' suspended content '' "$BACK")" "$OUTF"
+ok   "the pool listing marks a suspended node" grep -qF "$(srow '~' suspended leaf '' "$BACK")" "$OUTF"
 ok   "the suspended row carries its bin"       grep -qF "bin: $VD/bin/back.txt" "$OUTF"
 locked status "$RETIRED" >"$OUTF" 2>&1 || true
-ok   "per-path status renders the retired row" grep -qF "$(srow '~' retired content '' "$RETIRED")" "$OUTF"
+ok   "per-path status renders the retired row" grep -qF "$(srow '~' retired leaf '' "$RETIRED")" "$OUTF"
 locked status "$BACK" >"$OUTF" 2>&1 || true
-ok   "per-path status renders the suspended row" grep -qF "$(srow '~' suspended content '' "$BACK")" "$OUTF"
+ok   "per-path status renders the suspended row" grep -qF "$(srow '~' suspended leaf '' "$BACK")" "$OUTF"
 ok   "per-path status shows the bin line"      grep -qF "bin: $VD/bin/back.txt" "$OUTF"
 
 note "mediated: the pool is left consistent"
@@ -2584,7 +2600,7 @@ note "why: what is actually stopping this"
 WHYF="$MED/why-plain.txt"
 as_user /bin/sh -c "echo w > '$WHYF'"
 locked why "$WHYF" >"$OUTF" 2>&1 || true
-ok   "why says the ancestor is flagged"        grep -qF "note: this directory is flagged uappnd" "$OUTF"
+ok   "why says the ancestor is flagged"        grep -qF "note: this directory is flagged sappnd" "$OUTF"
 ok   "and names it last"                       grep -qF "be removed or renamed while it is sealed: $MED" "$OUTF"
 ok   "why offers the mediated rm"              grep -qF "sudo locked rm $WHYF" "$OUTF"
 ok   "why offers the mediated trash"           grep -qF "sudo locked trash $WHYF" "$OUTF"
@@ -2601,7 +2617,7 @@ locked why "$WHYQ" >"$OUTF" 2>&1 || true
 ok   "why quotes a path the shell would split" \
      grep -qF "sudo locked rm '$MED/why it'\\''s *.txt'" "$OUTF"
 locked why "$XAF" >"$OUTF" 2>&1 || true
-ok   "why names an immutable pool leaf"        grep -qF "is immutable (uchg)" "$OUTF"
+ok   "why names an immutable pool leaf"        grep -qF "is immutable (schg)" "$OUTF"
 ok   "why offers edit on a pool leaf"          grep -qF "sudo locked edit $XAF" "$OUTF"
 ok   "why offers unlock on a pool leaf"        grep -qF "sudo locked unlock $XAF" "$OUTF"
 FGN="$MED/foreign.txt"
@@ -2642,34 +2658,32 @@ ok   "the drift names the identity"            grep -qF "(node replaced)" "$OUTF
 put_id "$IDL" "$("$HELPER" id "$IDL" | tr ':' '.')"
 ok   "verify clean once the record is right again" locked verify --quiet
 
-note "lock: a chain directory reseals as placement through its leaf"
+note "lock: a chain directory reseals through its leaf"
 PLD="$MED/placearea"
 install -d -o "$INV" -g staff -m 750 "$PLD"
 install -d -o "$INV" -g staff -m 755 "$PLD/inner"
 PLL="$PLD/inner/leaf.txt"
 as_user /bin/sh -c "echo p > '$PLL'"
 ok   "a leaf two levels down seals the dir"    locked lock --yes "$PLL"
-check "the dir was adopted as placement"       "placement" "$(meta_get "$PLD" tier)"
+check "the dir is sealed sappnd"               "sappnd" "$(flags_of "$PLD")"
 check "recorded as a chain node"               "chain" "$(meta_get "$PLD" role)"
 check "and the leaf as a leaf"                 "leaf" "$(meta_get "$PLL" role)"
-ok   "unlock the placement dir"                locked unlock "$PLD"
-check "the unlocked dir keeps the lock account" "$LOCK_ACCT" "$(owner_of "$PLD")"
+ok   "unlock the chain dir"                    locked unlock "$PLD"
+check "the unlocked dir is still yours"        "$INV" "$(owner_of "$PLD")"
 check "and keeps its own mode"                 "750" "$(stat -f '%OLp' "$PLD")"
-# A tree under the dir whose group differs from the leaf's would make a
-# content-tier relock refuse it as mixed ownership. Before 0.14.0 every
-# entry born under a seal did differ -- it took the lock group -- and this
-# is the 2026-09-09 failure: unlock said placement, lock assumed content.
+check "and carries no flag"                    "" "$(flags_of "$PLD")"
+# A folder under it with another group changes nothing: a seal changes no
+# owner or group, so nothing in a tree has to match.
 mkdir -p -- "$PLD/sub"
 chgrp wheel "$PLD/sub"
 locked lock --yes "$PLL" >"$OUTF" 2>&1 || true
-ok   "the leaf's plan relocks it as placement" grep -qF "relocked (placement): $PLD" "$OUTF"
-deny "and never mentions mixed ownership"      grep -qF "mixed ownership" "$OUTF"
-deny "and never calls the placement mode drift" grep -qF "mode drifted" "$OUTF"
-check "the relocked dir is uappnd again"       "uappnd" "$(flags_of "$PLD")"
+ok   "the leaf's plan seals it again"          grep -qF "locked (sappnd): $PLD" "$OUTF"
+deny "and never calls its mode drift"          grep -qF "mode drifted" "$OUTF"
+check "the relocked dir is sappnd again"       "sappnd" "$(flags_of "$PLD")"
 refuse "naming a chain directory is refused"  "sealed as a chain directory" \
        locked lock --yes "$PLD"
-check "the refusal changed nothing"            "uappnd" "$(flags_of "$PLD")"
-check "the recorded tier still stands"          "placement" "$(meta_get "$PLD" tier)"
+check "the refusal changed nothing"            "sappnd" "$(flags_of "$PLD")"
+check "the record is still the chain's"        "chain" "$(meta_get "$PLD" role)"
 
 note "identity: a legacy record re-seals without an alarm"
 ok   "unlock for the legacy re-seal"           locked unlock "$PLD"
@@ -2721,11 +2735,11 @@ ok   "the plan notes the target is not protected" grep -qF "what it points at is
 ok   "  and names the target"                  grep -qxF "      $LNKT" "$OUTF"
 ok   "  and offers the command that protects it" grep -qF "sudo locked lock $LNKT" "$OUTF"
 ok   "  or both at once"                       grep -qF "sudo locked lock $LNK $LNKT" "$OUTF"
-check "the LINK node is sealed"                "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$LNK")"
+check "the LINK node is sealed"                "$INV schg" "$(stat -f '%Su %Sf' "$LNK")"
 check "the target keeps its owner"             "$INV" "$(owner_of "$LNKT")"
 check "the target carries no flag"             "" "$(flags_of "$LNKT")"
 deny "the target got no record of its own"     test -f "$(meta_path "$LNKT")"
-check "the record names the content tier"      "content" "$(meta_get "$LNK" tier)"
+check "the record names the flag"              "schg" "$(meta_get "$LNK" flag)"
 check "and is not recursive"                   "0" "$(meta_get "$LNK" recursive)"
 deny "no snapshot is taken for a link"         test -f "$(snap_path "$LNK")"
 # The link's own parent is out of the chain, so nothing but the link node
@@ -2737,7 +2751,7 @@ ok   "verify clean with a sealed link"         locked verify --quiet
 # A link is one node everywhere: status reads the link's own record rather
 # than resolving to a target that has none.
 locked status "$LNK" >"$OUTF" 2>&1 || true
-ok   "status reports the link's own record"    grep -qF "$(srow ✓ sealed content uchg "$LNK")" "$OUTF"
+ok   "status reports the link's own record"    grep -qF "$(srow ✓ sealed leaf schg "$LNK")" "$OUTF"
 deny "and never resolves to the target"        grep -qF "$LNKT" "$OUTF"
 
 # The point of the change: the link entry can no longer be re-pointed.
@@ -2745,7 +2759,7 @@ deny "the invoker cannot repoint the sealed link" as_user ln -sfn "$LNKO" "$LNK"
 check "the link still names its target"        "$LNKT" "$(readlink "$LNK")"
 check "and still resolves to the target"       "target" "$(head -1 "$LNK")"
 # Attribution, stated: the parent carries no flag at all, so the link
-# node's own uchg is the only thing refusing the swap -- which is what
+# node's own schg is the only thing refusing the swap -- which is what
 # sealing the link rather than its target bought.
 check "no flag on the parent to credit it to"  "" "$(flags_of "$LNKD")"
 
@@ -2758,7 +2772,7 @@ check "and still points where it did"          "$LNKT" "$(readlink "$LNK")"
 # control for the denial above is the unsealed re-point at the top of this
 # section, and the parent carries no flag to credit the refusal to.
 ok   "relock the link"                         locked lock --yes "$LNK"
-check "the relocked link is sealed again"      "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$LNK")"
+check "the relocked link is sealed again"      "$INV schg" "$(stat -f '%Su %Sf' "$LNK")"
 ok   "verify clean after the round trip"       locked verify --quiet
 # Same one-node rule for revert: a link has no snapshot, and the file it
 # points at is not what was named.
@@ -2799,8 +2813,8 @@ check "the target took the edit"               "edited" "$(head -1 "$LNKT")"
 ok   "the diff names the file"                 grep -qxF "file:      $LNKT" "$OUTF"
 ok   "  and the link it came through"          grep -qxF "via link:  $LNK" "$OUTF"
 check "the link still names its target"        "$LNKT" "$(readlink "$LNK")"
-check "the link node is still sealed"          "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$LNK")"
-check "the target is sealed again"             "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$LNKT")"
+check "the link node is still sealed"          "$INV schg" "$(stat -f '%Su %Sf' "$LNK")"
+check "the target is sealed again"             "$INV schg" "$(stat -f '%Su %Sf' "$LNKT")"
 ok   "verify clean after an edit through a link" locked verify --quiet
 ok   "unprotect the target"                    locked unprotect --yes "$LNKT"
 check "the target is back to the invoker"      "$INV" "$(owner_of "$LNKT")"
@@ -2815,8 +2829,8 @@ DNGT="$LNKD/nothing-here.txt"
 as_user ln -s "$DNGT" "$DNG"
 locked lock --yes "$DNG" >"$OUTF" 2>&1 || true
 ok   "the witness says the target is missing"  grep -qF "target missing" "$OUTF"
-check "the dangling LINK node is sealed"       "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$DNG")"
-check "the record names the content tier"      "content" "$(meta_get "$DNG" tier)"
+check "the dangling LINK node is sealed"       "$INV schg" "$(stat -f '%Su %Sf' "$DNG")"
+check "the record names the flag"              "schg" "$(meta_get "$DNG" flag)"
 ok   "and the link got a record of its own"    test -f "$(meta_path "$DNG")"
 deny "no snapshot is taken for a dangling link" test -f "$(snap_path "$DNG")"
 deny "the missing target is still missing"     test -e "$DNGT"
@@ -2827,21 +2841,21 @@ check "the unlocked dangling link is back to the invoker" "$INV" "$(owner_of "$D
 check "and carries no flag"                    "" "$(flags_of "$DNG")"
 check "and still points where it did"          "$DNGT" "$(readlink "$DNG")"
 
-# Under ~/.ssh a path takes the anchor tier, but a link takes content, as
-# it does everywhere: the OS checks resolve the path, so they judge the
-# target and never the link. The ~/.ssh this needs is the one section 2
-# builds, sealed sappnd by an anchor-tier leaf in it; this section has its
-# own fake home, so it builds the same shape here.
+# Under ~/.ssh a link is sealed as a link, as it is everywhere: the OS
+# checks resolve the path, so they judge the target and never the link.
+# The ~/.ssh this needs is the one section 2 builds, sealed sappnd through a
+# leaf in it; this section has its own fake home, so it builds the same
+# shape here.
 as_user mkdir -m 700 -- "$FAKE_HOME/.ssh"
 as_user /bin/sh -c "printf 'Host example\n' > '$FAKE_HOME/.ssh/config'"
-ok   "an anchor-tier leaf seals ~/.ssh"        locked lock --yes "$FAKE_HOME/.ssh/config"
+ok   "a leaf in it seals ~/.ssh"               locked lock --yes "$FAKE_HOME/.ssh/config"
 LNK2="$FAKE_HOME/.ssh/link2"
 as_user ln -s "$LNKT" "$LNK2"
 ok   "a link under ~/.ssh is sealed"           locked lock --yes "$LNK2"
-check "as content: the lock account's, frozen" "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$LNK2")"
-check "the record names the content tier"      "content" "$(meta_get "$LNK2" tier)"
+check "as a link: yours, frozen"              "$INV schg" "$(stat -f '%Su %Sf' "$LNK2")"
+check "the record names the flag"              "schg" "$(meta_get "$LNK2" flag)"
 check "the .ssh folder keeps its owner"        "$INV" "$(owner_of "$FAKE_HOME/.ssh")"
-check "and its anchor flag"                    "sappnd" "$(flags_of "$FAKE_HOME/.ssh")"
+check "and its flag"                           "sappnd" "$(flags_of "$FAKE_HOME/.ssh")"
 deny "the invoker cannot repoint it"           as_user ln -sfn "$LNKO" "$LNK2"
 ok   "unprotect the ssh link"                  locked unprotect --yes "$LNK2"
 check "the link is back to the invoker"        "$INV" "$(owner_of "$LNK2")"
@@ -2851,7 +2865,7 @@ note "lock: the plan is derived first and gated once"
 # Every seal used to ask for itself, so declining an ancestor left the leaf
 # ALREADY SEALED under a parent nobody had protected. The plan is derived
 # before anything is touched, printed root-most first, and answered once.
-# Its own stop node, so the chain is exactly leaf + one placement ancestor
+# Its own stop node, so the chain is exactly leaf + one chain ancestor
 # -- the leaf sits two levels down, since its own parent is not in the
 # chain and PLAND has to be the grandparent to be provisioned at all.
 PLANSTOP="$SCRATCH/planstop"
@@ -2867,13 +2881,13 @@ as_user /bin/sh -c "echo plan > '$PLANF'"
 PLANRC=0
 locked_notty lock "$PLANF" >"$OUTF" 2>&1 || PLANRC=$?
 check "an unanswerable gate declines"          "2" "$PLANRC"
-ok   "the plan is printed before the gate"     grep -qxF "plan (tier content):" "$OUTF"
+ok   "the plan is printed before the gate"     grep -qxF "plan:" "$OUTF"
 deny "a refusal prints no row for the path"  grep -qxF "path:  $PLANF" "$OUTF"
-ok   "the plan lists the leaf"                 grep -q "seal content  *$PLANF" "$OUTF"
-ok   "the plan lists the grandparent"          grep -q "seal placement  *$PLAND$" "$OUTF"
-deny "and never the leaf parent"               grep -q "seal placement  *$PLAND/inner$" "$OUTF"
-PLAN_P="$(grep -n "seal placement" "$OUTF" | head -1 | cut -d: -f1)"
-PLAN_L="$(grep -n "seal content" "$OUTF" | head -1 | cut -d: -f1)"
+ok   "the plan lists the leaf"                 grep -q "seal schg  *$PLANF" "$OUTF"
+ok   "the plan lists the grandparent"          grep -q "seal sappnd  *$PLAND$" "$OUTF"
+deny "and never the leaf parent"               grep -q "seal sappnd  *$PLAND/inner$" "$OUTF"
+PLAN_P="$(grep -n "seal sappnd" "$OUTF" | head -1 | cut -d: -f1)"
+PLAN_L="$(grep -n "seal schg" "$OUTF" | head -1 | cut -d: -f1)"
 ok   "the plan reads root-most first"          test "$PLAN_P" -lt "$PLAN_L"
 check "the declined leaf keeps its owner"      "$INV" "$(owner_of "$PLANF")"
 check "and carries no flag"                    "" "$(flags_of "$PLANF")"
@@ -2886,10 +2900,10 @@ as_user /bin/sh -c "echo o > '$PLAND/other/o.txt'"
 ok   "another leaf's chain seals the grandparent" locked lock --yes "$PLAND/other/o.txt"
 locked_notty lock "$PLANF" >"$OUTF" 2>&1 || true
 ok   "the plan shows the sealed ancestor"      grep -q "already locked  *$PLAND" "$OUTF"
-ok   "and still offers the leaf"               grep -q "seal content  *$PLANF" "$OUTF"
+ok   "and still offers the leaf"               grep -q "seal schg  *$PLANF" "$OUTF"
 
 locked lock --dry-run --yes "$PLANF" >"$OUTF" 2>&1 || true
-ok   "dry run prints the plan"                 grep -qxF "plan (tier content):" "$OUTF"
+ok   "dry run prints the plan"                 grep -qxF "plan:" "$OUTF"
 ok   "dry run says nothing changed"            grep -qF "dry run: nothing changed" "$OUTF"
 check "dry run left the leaf's owner"          "$INV" "$(owner_of "$PLANF")"
 check "dry run left no flag on it"             "" "$(flags_of "$PLANF")"
@@ -2908,10 +2922,10 @@ as_user /bin/rm -f -- "$HIDF"
 deny "dry run wrote no record"                 test -f "$(meta_path "$PLANF")"
 
 ok   "the leaf seals after the previews"       locked lock --yes "$PLANF"
-check "the leaf is sealed"                     "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$PLANF")"
+check "the leaf is sealed"                     "$INV schg" "$(stat -f '%Su %Sf' "$PLANF")"
 locked lock --yes "$PLANF" >"$OUTF" 2>&1 || true
 ok   "a whole chain asks nothing"              grep -qF "already locked: $PLANF" "$OUTF"
-deny "and prints no plan"                      grep -qF "plan (" "$OUTF"
+deny "and prints no plan"                      grep -qxF "plan:" "$OUTF"
 ok   "verify clean after the plan round"       locked verify --quiet
 
 }
@@ -2922,8 +2936,8 @@ section_5() {
 # You name the leaves; every chain directory is derived from them. A node is
 # held in place by its own flag or by an append-only parent and by nothing
 # else, so the chain starts at the leaf's grandparent -- the leaf's own
-# parent is held by the grandparent's uappnd -- except where that parent is
-# the ANCHOR, whose sappnd is what holds the entries one level below it. A
+# parent is held by the grandparent's sappnd -- except where that parent is
+# ~ or ~/.ssh, whose sappnd is what holds the entries one level below it. A
 # chain record nothing needs any more is released by the next gated plan:
 # lock, unprotect, rm, or the lock plan mv runs for a moved leaf.
 #
@@ -2934,7 +2948,7 @@ LPSTOP="$SCRATCH/lpusers"
 install -d -m 755 -o root -g wheel "$LPSTOP"
 LPHOME="$LPSTOP/home"
 install -d -o "$INV" -g staff "$LPHOME"
-LPA="$LPHOME/a"           # the leaf's grandparent: placement
+LPA="$LPHOME/a"           # the leaf's grandparent: a chain folder
 LPB="$LPA/b"              # the leaf's own parent: untouched
 install -d -o "$INV" -g staff -m 777 "$LPA"
 install -d -o "$INV" -g staff -m 755 "$LPB"
@@ -2942,24 +2956,24 @@ LPF="$LPB/leaf.txt"
 as_user /bin/sh -c "echo lp > '$LPF'"
 LPB_BEFORE="$(stat -f '%Su %Sg %OLp' "$LPB")"
 LPF_ID0="$(stat -f '%Su:%Sg %OLp' "$LPF")"
-# The same identity as locked words it: the mode first, the names last.
-LPF_BACK0="back to $(stat -f '%OLp %Su:%Sg' "$LPF")"
+# What locked says a protection ending leaves: the flag comes off.
+LPF_BACK0="schg cleared"
 LPOUT="$SCRATCH/leafparent.out"
 
 locked_home "$LPHOME" lock --yes "$LPF" >"$LPOUT" 2>&1 || true
-check "the three-deep leaf is sealed"          "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$LPF")"
+check "the three-deep leaf is sealed"          "$INV schg" "$(stat -f '%Su %Sf' "$LPF")"
 check "recorded as a leaf"                     "leaf" "$(meta_get "$LPF" role)"
 check "the leaf parent is exactly as it was"   "$LPB_BEFORE" "$(stat -f '%Su %Sg %OLp' "$LPB")"
 check "and carries no flag"                    "" "$(flags_of "$LPB")"
 deny  "and got no record"                      test -f "$(meta_path "$LPB")"
-check "the grandparent is placement"           "uappnd" "$(flags_of "$LPA")"
-check "and went to the lock account"           "$LOCK_ACCT" "$(owner_of "$LPA")"
+check "the grandparent is sealed sappnd"       "sappnd" "$(flags_of "$LPA")"
+check "and stays yours"                        "$INV" "$(owner_of "$LPA")"
 check "recorded as a chain node"               "chain" "$(meta_get "$LPA" role)"
-check "the home above it is anchored"          "sappnd" "$(flags_of "$LPHOME")"
+check "the home above it is sealed"            "sappnd" "$(flags_of "$LPHOME")"
 check "the home keeps its owner"               "$INV" "$(owner_of "$LPHOME")"
-check "the anchor is a chain node too"         "chain" "$(meta_get "$LPHOME" role)"
-ok   "the plan listed the grandparent"         grep -q "seal placement  *$LPA\$" "$LPOUT"
-deny "and never listed the leaf parent"        grep -q "seal placement  *$LPB\$" "$LPOUT"
+check "the home is a chain node too"           "chain" "$(meta_get "$LPHOME" role)"
+ok   "the plan listed the grandparent"         grep -q "seal sappnd  *$LPA\$" "$LPOUT"
+deny "and never listed the leaf parent"        grep -q "seal sappnd  *$LPB\$" "$LPOUT"
 ok   "verify clean after the three-deep lock"  locked_home "$LPHOME" verify --quiet
 
 note "chain: what the leaf parent still refuses, and what it allows"
@@ -2975,18 +2989,18 @@ ok   "a dir is created inside it"              as_user mkdir -- "$LPB/.oauth_ref
 ok   "and rmdir takes it back"                 as_user rmdir -- "$LPB/.oauth_refresh.lock"
 ok   "a temp+rename save lands"                as_user /bin/sh -c "echo t > '$LPB/t.tmp' && mv -- '$LPB/t.tmp' '$LPB/t.txt'"
 ok   "and leaves no strand"                    as_user rm -f -- "$LPB/t.txt"
-# Control for the move denial: the grandparent's uappnd is what refused it.
-chflags -- nouappnd "$LPA"
+# Control for the move denial: the grandparent's sappnd is what refused it.
+chflags -- nosappnd "$LPA"
 ok   "with the grandparent cleared it moves"   as_user mv -- "$LPB" "$LPB.moved"
 ok   "and moves back"                          as_user mv -- "$LPB.moved" "$LPB"
-chflags -- uappnd "$LPA"
-check "the grandparent is sealed again"        "uappnd" "$(flags_of "$LPA")"
-# Control for the leaf denials: the leaf's own uchg is what refused them.
+chflags -- sappnd "$LPA"
+check "the grandparent is sealed again"        "sappnd" "$(flags_of "$LPA")"
+# Control for the leaf denials: the leaf's own schg is what refused them.
 ok   "unlock the leaf for the control"         locked_home "$LPHOME" unlock "$LPF"
 ok   "the unlocked leaf moves"                 as_user mv -- "$LPF" "$LPB/moved.txt"
 ok   "and moves back"                          as_user mv -- "$LPB/moved.txt" "$LPF"
 ok   "relock the leaf"                         locked_home "$LPHOME" lock --yes "$LPF"
-check "the leaf is sealed again"               "uchg" "$(flags_of "$LPF")"
+check "the leaf is sealed again"               "schg" "$(flags_of "$LPF")"
 ok   "verify clean after the controls"         locked_home "$LPHOME" verify --quiet
 
 note "unprotect: the file goes home, and so does the chain nothing else needs"
@@ -2998,13 +3012,13 @@ ok   "the plan names the file, which ends its row" grep -qx "  unprotect  *$LPF"
 check "and its identity on the row below"      "$LPF_BACK0" \
       "$(grep -A1 -x "  unprotect  *$LPF" "$LPOUT" | tail -n1 | sed 's/^ *//')"
 ok   "the plan releases the grandparent, unused" grep -q "^  release  *unused  $LPA\$" "$LPOUT"
-ok   "and the home anchor"                     grep -q "^  release  *unused  $LPHOME\$" "$LPOUT"
+ok   "and the home"                            grep -q "^  release  *unused  $LPHOME\$" "$LPOUT"
 LPR_A="$(grep -n "release  *unused  $LPA\$" "$LPOUT" | cut -d: -f1)"
 LPR_H="$(grep -n "release  *unused  $LPHOME\$" "$LPOUT" | cut -d: -f1)"
 ok   "releases read root-most first"           test "$LPR_H" -lt "$LPR_A"
 ok   "the dry run says nothing changed"        grep -qF "dry run: nothing changed" "$LPOUT"
-check "the dry run left the file sealed"       "uchg" "$(flags_of "$LPF")"
-check "and the grandparent"                    "uappnd" "$(flags_of "$LPA")"
+check "the dry run left the file sealed"       "schg" "$(flags_of "$LPF")"
+check "and the grandparent"                    "sappnd" "$(flags_of "$LPA")"
 LPRC=0
 locked_home "$LPHOME" unprotect "$LPF" </dev/null >"$LPOUT" 2>&1 || LPRC=$?
 check "without a tty or --yes it declines"     "2" "$LPRC"
@@ -3020,13 +3034,11 @@ check "it is the invoker's again"              "$LPF_ID0" "$(stat -f '%Su:%Sg %O
 check "with no flag"                           "" "$(flags_of "$LPF")"
 check "its record is retired"                  "retired" "$(meta_get "$LPF" state)"
 check "via unprotect"                          "unprotect" "$(meta_get "$LPF" via)"
-ok   "the grandparent is released"             grep -qxF "✓ released: $LPA" "$LPOUT"
-check "and says what it went back to"          "back to 777 $INV:staff" \
-      "$(grep -A1 -xF "✓ released: $LPA" "$LPOUT" | tail -n1 | sed 's/^ *//')"
+ok   "the grandparent is released"             grep -qxF "✓ released (sappnd cleared): $LPA" "$LPOUT"
 check "back to its own identity"               "$INV staff 777" "$(stat -f '%Su %Sg %OLp' "$LPA")"
 check "with no flag"                           "" "$(flags_of "$LPA")"
 check "its record retired as unneeded"         "unneeded" "$(meta_get "$LPA" via)"
-ok   "the anchor is released"                  grep -qxF "✓ released (sappnd cleared): $LPHOME" "$LPOUT"
+ok   "the home is released"                    grep -qxF "✓ released (sappnd cleared): $LPHOME" "$LPOUT"
 check "the home carries no flag"               "" "$(flags_of "$LPHOME")"
 check "and never changed owner"                "$INV" "$(owner_of "$LPHOME")"
 deny "one result line per release"             grep -qF "record retired:" "$LPOUT"
@@ -3037,14 +3049,14 @@ refuse "unprotecting it again says so"         "not protected" \
 note "lock: a path protected again starts fresh"
 as_user /bin/sh -c "echo lp3 > '$LPF'"
 locked_home "$LPHOME" lock --yes "$LPF" >"$LPOUT" 2>&1 || true
-ok   "the plan seals the file anew"            grep -q "seal content  *$LPF\$" "$LPOUT"
-deny "and never calls it a relock"             grep -q "relock content" "$LPOUT"
+ok   "the plan seals the file anew"            grep -q "seal schg  *$LPF\$" "$LPOUT"
+deny "and never calls it a relock"             grep -q "relock schg" "$LPOUT"
 ok   "the witness starts from what it holds"   grep -qF "adopting into pool (no prior snapshot): $LPF" "$LPOUT"
 ok   "the snapshot is the new content"         cmp -s "$(snap_path "$LPF")" "$LPF"
 check "the record is live again"               "locked" "$(meta_get "$LPF" state)"
-ok   "the grandparent is sealed anew"          grep -q "seal placement  *$LPA\$" "$LPOUT"
-check "and carries its flag"                   "uappnd" "$(flags_of "$LPA")"
-check "the home is anchored again"             "sappnd" "$(flags_of "$LPHOME")"
+ok   "the grandparent is sealed anew"          grep -q "seal sappnd  *$LPA\$" "$LPOUT"
+check "and carries its flag"                   "sappnd" "$(flags_of "$LPA")"
+check "the home is sealed again"               "sappnd" "$(flags_of "$LPHOME")"
 ok   "verify clean after the fresh seal"       locked_home "$LPHOME" verify --quiet
 
 note "chain: a directory another leaf needs is kept, and says why when it goes"
@@ -3056,13 +3068,13 @@ SH1="$SHD/near.txt"        # SHD is this leaf's own parent
 SH2="$SHDEEP/far.txt"      # SHD is this leaf's grandparent
 as_user /bin/sh -c "echo n > '$SH1'; echo f > '$SH2'"
 ok   "lock the deeper leaf"                    locked_home "$LPHOME" lock --yes "$SH2"
-check "its grandparent took placement"         "uappnd" "$(flags_of "$SHD")"
+check "its grandparent took sappnd"         "sappnd" "$(flags_of "$SHD")"
 locked_home "$LPHOME" lock --yes "$SH1" >"$LPOUT" 2>&1 || true
-check "the shallow leaf is sealed"             "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$SH1")"
+check "the shallow leaf is sealed"             "$INV schg" "$(stat -f '%Su %Sf' "$SH1")"
 deny "its plan never offers to release the shared node" grep -q "release  *[a-z]*  *$SHD\$" "$LPOUT"
-check "the shared node kept its flag"          "uappnd" "$(flags_of "$SHD")"
+check "the shared node kept its flag"          "sappnd" "$(flags_of "$SHD")"
 locked_home "$LPHOME" status "$SH1" >"$LPOUT" 2>&1 || true
-ok   "a recorded leaf parent prints as placement" grep -qF "$(srow ✓ sealed placement uappnd "$SHD")" "$LPOUT"
+ok   "a recorded leaf parent prints as a chain row" grep -qF "$(srow ✓ sealed chain sappnd "$SHD")" "$LPOUT"
 deny "and not as the context row"              grep -qF "$(srow - "not needed" '' '' "$SHD")" "$LPOUT"
 
 locked_home "$LPHOME" unprotect --dry-run "$SH2" >"$LPOUT" 2>&1 || true
@@ -3073,8 +3085,8 @@ deny "and the grandparent stays: another leaf needs it" grep -q "release  *[a-z]
 ok   "unprotect the deeper leaf"               locked_home "$LPHOME" unprotect --yes "$SH2"
 check "the shared node went home"              "$INV staff 777" "$(stat -f '%Su %Sg %OLp' "$SHD")"
 check "with no flag"                           "" "$(flags_of "$SHD")"
-check "the shallow leaf is still sealed"       "uchg" "$(flags_of "$SH1")"
-check "and its grandparent too"                "uappnd" "$(flags_of "$LPA")"
+check "the shallow leaf is still sealed"       "schg" "$(flags_of "$SH1")"
+check "and its grandparent too"                "sappnd" "$(flags_of "$LPA")"
 locked_home "$LPHOME" status "$SH1" >"$LPOUT" 2>&1 || true
 ok   "status: the released parent is context"  grep -qF -- "$(srow - "not needed" '' '' "$SHD")" "$LPOUT"
 ok   "with what keeps it on the line under"    grep -qF "its parent keeps it in place: $LPA" "$LPOUT"
@@ -3088,22 +3100,20 @@ install -d -o "$INV" -g staff -m 755 "$ORD/in"
 ORF="$ORD/in/o.txt"
 as_user /bin/sh -c "echo o > '$ORF'"
 ok   "lock a leaf that will go away"           locked_home "$LPHOME" lock --yes "$ORF"
-check "its grandparent took placement"         "uappnd" "$(flags_of "$ORD")"
+check "its grandparent took sappnd"         "sappnd" "$(flags_of "$ORD")"
 # The file goes behind locked's back (root, by hand) and a human asserts
 # it: the record retires and ORD protects nothing -- but only a gated verb
 # releases, so it stays sealed until the next plan.
-chflags -- nouchg "$ORF"
+chflags -- noschg "$ORF"
 rm -f -- "$ORF"
 ok   "tombstone the vanished leaf"             locked_home "$LPHOME" tombstone --yes "$ORF"
-check "the unneeded dir is still sealed"       "uappnd" "$(flags_of "$ORD")"
+check "the unneeded dir is still sealed"       "sappnd" "$(flags_of "$ORD")"
 locked_home "$LPHOME" status >"$LPOUT" 2>&1 || true
 ok   "the pool listing notes it"               grep -qF "no protected file needs these any more:" "$LPOUT"
 ok   "by name"                                 grep -qF "      $ORD" "$LPOUT"
 GUARD_RELEASE="$ORD" locked_home "$LPHOME" lock --yes "$SH1" >"$LPOUT" 2>&1 || true
 ok   "an unrelated lock plans the release"     grep -q "^  release  *unused  $ORD\$" "$LPOUT"
-ok   "and applies it"                          grep -qxF "✓ released: $ORD" "$LPOUT"
-check "back to the invoker's identity"         "back to 777 $INV:staff" \
-      "$(grep -A1 -xF "✓ released: $ORD" "$LPOUT" | tail -n1 | sed 's/^ *//')"
+ok   "and applies it"                          grep -qxF "✓ released (sappnd cleared): $ORD" "$LPOUT"
 deny "the whole chain asked for no seal"       grep -q "^  seal " "$LPOUT"
 check "the dir carries no flag"                "" "$(flags_of "$ORD")"
 check "its record retired as unneeded"         "unneeded" "$(meta_get "$ORD" via)"
@@ -3117,18 +3127,16 @@ install -d -o "$INV" -g staff -m 755 "$RMD/in"
 RMF="$RMD/in/r.txt"
 as_user /bin/sh -c "echo r > '$RMF'"
 ok   "lock the file to be removed"             locked_home "$LPHOME" lock --yes "$RMF"
-check "its grandparent took placement"         "uappnd" "$(flags_of "$RMD")"
+check "its grandparent took sappnd"         "sappnd" "$(flags_of "$RMD")"
 locked_home "$LPHOME" rm --yes "$RMF" >"$LPOUT" 2>&1 || true
 ok   "the gate lists what goes with it"        grep -qF "removing it also releases:" "$LPOUT"
 ok   "by name and reason"                      grep -q "release  *unused  $RMD\$" "$LPOUT"
 ok   "the file it removes has its own row"     grep -qxF "file:  $RMF" "$LPOUT"
 deny "the file is gone"                        test -e "$RMF"
 check "its record retired via rm"              "rm" "$(meta_get "$RMF" via)"
-ok   "the chain dir was released after it"     grep -qxF "✓ released: $RMD" "$LPOUT"
-check "back to the invoker's identity"         "back to 777 $INV:staff" \
-      "$(grep -A1 -xF "✓ released: $RMD" "$LPOUT" | tail -n1 | sed 's/^ *//')"
+ok   "the chain dir was released after it"     grep -qxF "✓ released (sappnd cleared): $RMD" "$LPOUT"
 check "and carries no flag"                    "" "$(flags_of "$RMD")"
-check "the grandparent above stays for the others" "uappnd" "$(flags_of "$LPA")"
+check "the grandparent above stays for the others" "sappnd" "$(flags_of "$LPA")"
 ok   "verify clean after the rm"               locked_home "$LPHOME" verify --quiet
 
 note "mv: a moved file takes its chain along"
@@ -3139,12 +3147,12 @@ install -d -o "$INV" -g staff -m 755 "$MFD/in" "$MTD/in"
 MVF="$MFD/in/m.txt"
 as_user /bin/sh -c "echo m > '$MVF'"
 ok   "lock the file to be moved"               locked_home "$LPHOME" lock --yes "$MVF"
-check "its grandparent took placement"         "uappnd" "$(flags_of "$MFD")"
+check "its grandparent took sappnd"         "sappnd" "$(flags_of "$MFD")"
 locked_home "$LPHOME" mv --yes "$MVF" "$MTD/in/m.txt" >"$LPOUT" 2>&1 || true
 ok   "the file moved"                          test -f "$MTD/in/m.txt"
-check "still sealed as itself"                 "uchg" "$(flags_of "$MTD/in/m.txt")"
-ok   "the lock plan sealed the new chain"      grep -q "seal placement  *$MTD\$" "$LPOUT"
-check "the new grandparent is placement"       "uappnd" "$(flags_of "$MTD")"
+check "still sealed as itself"                 "schg" "$(flags_of "$MTD/in/m.txt")"
+ok   "the lock plan sealed the new chain"      grep -q "seal sappnd  *$MTD\$" "$LPOUT"
+check "the new grandparent is sealed sappnd"   "sappnd" "$(flags_of "$MTD")"
 ok   "and released the old one"                grep -q "release  *unused  $MFD\$" "$LPOUT"
 check "the old grandparent carries no flag"    "" "$(flags_of "$MFD")"
 # Off a tty the move still happens (it has no gate of its own), the lock
@@ -3156,7 +3164,7 @@ ok   "with the command that settles it"        grep -qF "sudo locked lock $MFD/i
 check "the declined plan sealed nothing"       "" "$(flags_of "$MFD")"
 GUARD_RELEASE="$MTD" \
 ok   "the command does settle it"              locked_home "$LPHOME" lock --yes "$MFD/in/m.txt"
-check "the new grandparent is sealed"          "uappnd" "$(flags_of "$MFD")"
+check "the new grandparent is sealed"          "sappnd" "$(flags_of "$MFD")"
 check "the old one released"                   "" "$(flags_of "$MTD")"
 ok   "verify clean after the moves"            locked_home "$LPHOME" verify --quiet
 
@@ -3166,28 +3174,28 @@ ok   "the chain names the leaf parent"         \
      grep -qF -- "$(srow - "not needed" '' '' "$LPB")" "$LPOUT"
 deny "and never marks it unlocked"             grep -q "^    !  .* $LPB\$" "$LPOUT"
 deny "and never calls it a drift"              grep -q "^    ✗  .* $LPB\$" "$LPOUT"
-ok   "the grandparent prints as placement"     grep -qF "$(srow ✓ sealed placement uappnd "$LPA")" "$LPOUT"
-ok   "the leaf prints as its own row"          grep -qF "$(srow ✓ sealed content uchg "$LPF")" "$LPOUT"
+ok   "the grandparent prints as a chain row"   grep -qF "$(srow ✓ sealed chain sappnd "$LPA")" "$LPOUT"
+ok   "the leaf prints as its own row"          grep -qF "$(srow ✓ sealed leaf schg "$LPF")" "$LPOUT"
 
-note "chain: the anchor stays in the chain as a leaf's own parent"
+note "chain: ~ stays in the chain as a leaf's own parent"
 # ~/.zshrc's parent IS the home. Its sappnd is what holds ~/.claude and
 # ~/.config in place, so it stays in the chain wherever it sits.
 ZRC="$LPHOME/.zshrc"
 as_user /bin/sh -c "echo 'setopt nomatch' > '$ZRC'"
 locked_home "$LPHOME" lock --yes "$ZRC" >"$LPOUT" 2>&1 || true
-check "the startup file is sealed"             "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$ZRC")"
-check "the home anchor is still sappnd"        "sappnd" "$(flags_of "$LPHOME")"
+check "the startup file is sealed"             "$INV schg" "$(stat -f '%Su %Sf' "$ZRC")"
+check "the home is still sappnd"               "sappnd" "$(flags_of "$LPHOME")"
 check "and still owned by the user"            "$INV" "$(owner_of "$LPHOME")"
 check "its record is still locked"             "locked" "$(meta_get "$LPHOME" state)"
 deny "the plan never offered to release it"    grep -q "release  *$LPHOME " "$LPOUT"
 locked_home "$LPHOME" status "$ZRC" >"$LPOUT" 2>&1 || true
-ok   "the anchor prints as a chain row"        grep -qF "$(srow ✓ sealed anchor sappnd "$LPHOME")" "$LPOUT"
+ok   "the home prints as a chain row"          grep -qF "$(srow ✓ sealed chain sappnd "$LPHOME")" "$LPOUT"
 deny "and never as a context row"              grep -qF "$(srow - "not needed" '' '' "$LPHOME")" "$LPOUT"
 refuse "a chain dir cannot be named"           "sealed as a chain directory" \
        locked_home "$LPHOME" lock --yes "$LPA"
 refuse "nor unprotected by name"               "not protected by name" \
        locked_home "$LPHOME" unprotect --yes "$LPA"
-ok   "verify clean with an anchor leaf parent" locked_home "$LPHOME" verify --quiet
+ok   "verify clean with ~ as a leaf parent"    locked_home "$LPHOME" verify --quiet
 BRC=0
 locked_home "$LPHOME" lock --yes "$SH1" "$ZRC" >"$LPOUT" 2>&1 || BRC=$?
 check "a batch of whole chains exits 0"        "0" "$BRC"
@@ -3201,23 +3209,22 @@ install -d -o "$INV" -g staff -m 777 "$ORD2"
 install -d -o "$INV" -g staff -m 755 "$ORD2/in"
 as_user /bin/sh -c "echo o > '$ORD2/in/o.txt'"
 ok   "lock a second leaf that will go away"    locked_home "$LPHOME" lock --yes "$ORD2/in/o.txt"
-chflags -- nouchg "$ORD2/in/o.txt"
+chflags -- noschg "$ORD2/in/o.txt"
 rm -f -- "$ORD2/in/o.txt"
 ok   "tombstone it"                            locked_home "$LPHOME" tombstone --yes "$ORD2/in/o.txt"
 SH1M="$(meta_path "$SH1")"
 sed '/^role=/d' "$SH1M" >"$SH1M.tmp"
 mv -f "$SH1M.tmp" "$SH1M"
-chown "$LOCK_ACCT:$LOCK_ACCT" "$SH1M"
-chmod 640 "$SH1M"
+rec_mode "$SH1M"
 if locked_home "$LPHOME" verify >"$LPOUT" 2>&1; then vrc=0; else vrc=$?; fi
 check "verify calls a roleless record drift"   "5" "$vrc"
 ok   "and says what is missing"                grep -qF "record has no role" "$LPOUT"
 locked_home "$LPHOME" lock --yes "$ZRC" >"$LPOUT" 2>&1 || true
 ok   "a plan says why it releases nothing"     grep -qF "no directory is released this run; this record has no role: $SH1" "$LPOUT"
-check "the unneeded dir stays sealed"          "uappnd" "$(flags_of "$ORD2")"
+check "the unneeded dir stays sealed"          "sappnd" "$(flags_of "$ORD2")"
 printf 'role=leaf\n' >>"$SH1M"
 GUARD_RELEASE="$ORD2" locked_home "$LPHOME" lock --yes "$ZRC" >"$LPOUT" 2>&1 || true
-ok   "with the role back, the plan releases it" grep -qF "✓ released: $ORD2" "$LPOUT"
+ok   "with the role back, the plan releases it" grep -qF "✓ released (sappnd cleared): $ORD2" "$LPOUT"
 check "and the dir carries no flag"            "" "$(flags_of "$ORD2")"
 ok   "verify clean again"                      locked_home "$LPHOME" verify --quiet
 
@@ -3267,13 +3274,13 @@ do
   ok "lock ${leaf#"$WPHOME"/}" locked_home "$WPHOME" lock --yes "$leaf"
   locked_home "$WPHOME" status "$leaf" >>"$WPOUT" 2>&1 || true
 done
-check "the symlink node is sealed by its own uchg" "$LOCK_ACCT uchg" \
+check "the symlink node is sealed by its own schg" "$INV schg" \
       "$(stat -f '%Su %Sf' "$WPHOME/.claude/settings.json")"
 for d in .config .config/agents .config/agents/claude Library; do
-  check "$d is a sealed chain node"            "uappnd chain" \
+  check "$d is a sealed chain node"            "sappnd chain" \
         "$(flags_of "$WPHOME/$d") $(meta_get "$WPHOME/$d" role)"
 done
-check "the home is the anchor"                 "sappnd" "$(flags_of "$WPHOME")"
+check "the home is sealed"                     "sappnd" "$(flags_of "$WPHOME")"
 check ".claude was never touched"              "$WPCLAUDE_B" "$(stat -f '%Su %Sg %OLp' "$WPHOME/.claude")"
 deny ".claude has no record"                   test -f "$(meta_path "$WPHOME/.claude")"
 check "nor the settings dir"                   "$WPSET_B" \
@@ -3307,26 +3314,24 @@ for d in .config .config/agents .config/agents/claude; do
   check "$d is back to the invoker, unflagged" "$INV staff 777 -" \
         "$(stat -f '%Su %Sg %OLp %Sf' "$WPHOME/$d")"
 done
-check "Library stays for the ghostty prefs"    "uappnd" "$(flags_of "$WPHOME/Library")"
-check "the home stays the anchor"              "sappnd" "$(flags_of "$WPHOME")"
-check "the link is still sealed as itself"     "uchg" "$(flags_of "$WPHOME/.claude/settings.json")"
+check "Library stays for the ghostty prefs"    "sappnd" "$(flags_of "$WPHOME/Library")"
+check "the home stays sealed"                  "sappnd" "$(flags_of "$WPHOME")"
+check "the link is still sealed as itself"     "schg" "$(flags_of "$WPHOME/.claude/settings.json")"
 ok   "verify clean after the unprotect"        locked_home "$WPHOME" verify --quiet
 
 }
 
-# ---- 6. placement: the way in is one ACL entry -------------------------------
+# ---- 6. system flags: what a seal binds -------------------------------------
 section_6() {
 #
-# A placement seal hands the directory to the lock account, keeps its group
-# and mode, and lets the invoker back in through one ACL entry: add rights,
-# never delete or delete_child, no inherit flags. The entry names the
-# invoker's uid, so unlike the lock-group door it replaced it works with
-# the daemon stand-in -- and these fixtures are 755 and 700, with no group
-# or other write, so every add below goes through the entry and nothing
-# else. The 700 dir carries Apple's own ~/Library entry, which lock must
-# keep and release must leave.
+# A seal changes a node's flag word and nothing else: owner, group, mode
+# and ACL stay as they were, Apple's own ~/Library entry included. A
+# system flag binds the owner too: they may add to a sappnd folder and
+# nothing more, and they cannot clear the flag. verify holds each sealed
+# node to its record: owner, group, mode, the whole flag word, its
+# identity, the volume its path resolves into, and its content.
 
-note "placement: sealed with an ACL entry, group and mode kept"
+note "flags: a chain folder keeps its owner, group, mode and ACL"
 ACSTOP="$SCRATCH/aclusers"
 install -d -m 755 -o root -g wheel "$ACSTOP"
 ACHOME="$ACSTOP/home"
@@ -3337,172 +3342,276 @@ install -d -o "$INV" -g staff -m 755 "$ACD" "$ACD/app"
 install -d -o "$INV" -g staff -m 700 "$ACL7" "$ACL7/prefs"
 chmod +a "group:everyone deny delete" "$ACL7"
 as_user /bin/sh -c "echo a > '$ACD/app/a.conf'; echo p > '$ACL7/prefs/p.plist'"
-ACE="user:$INV allow list,add_file,search,add_subdirectory,readattr,readextattr,readsecurity"
 ACOUT="$SCRATCH/acl.out"
 acl_h() { /bin/ls -ledq -- "$1" | sed -e 1d -e 's/^ *[0-9][0-9]*: //'; }
-acl_has_h() { local e; e="$(acl_h "$1")"; printf '%s\n' "$e" | grep -qxF -- "$2"; }
 
 ok   "lock a leaf under the 755 dir"           locked_home "$ACHOME" lock --yes "$ACD/app/a.conf"
 ok   "lock a leaf under the 700 dir"           locked_home "$ACHOME" lock --yes "$ACL7/prefs/p.plist"
-check "the 755 dir: lock account, group and mode kept" \
-      "$LOCK_ACCT staff 755 uappnd" "$(stat -f '%Su %Sg %OLp %Sf' "$ACD")"
+check "the 755 dir: yours, group and mode kept, sappnd" \
+      "$INV staff 755 sappnd" "$(stat -f '%Su %Sg %OLp %Sf' "$ACD")"
 check "the 700 dir: the same"                  \
-      "$LOCK_ACCT staff 700 uappnd" "$(stat -f '%Su %Sg %OLp %Sf' "$ACL7")"
-check "the record carries the entry"           "$ACE" "$(meta_get "$ACD" acl)"
-check "and the record the dir's own mode"      "755" "$(meta_get "$ACD" lockmode)"
-ok   "the 755 dir carries the entry"           acl_has_h "$ACD" "$ACE"
-ok   "the 700 dir carries it too"              acl_has_h "$ACL7" "$ACE"
-ok   "next to Apple's entry, which stays"      acl_has_h "$ACL7" "group:everyone deny delete"
+      "$INV staff 700 sappnd" "$(stat -f '%Su %Sg %OLp %Sf' "$ACL7")"
+check "the 755 dir has no ACL"                 "" "$(acl_h "$ACD")"
+check "the 700 dir keeps Apple's entry alone"  "group:everyone deny delete" "$(acl_h "$ACL7")"
+check "the record holds the dir's own mode"    "755" "$(meta_get "$ACD" mode)"
 ok   "verify clean after both seals"           locked_home "$ACHOME" verify --quiet
 
-note "placement: the entry adds, and entries keep their group"
-ok   "the invoker adds a file"                 as_user /bin/sh -c "echo n > '$ACD/new.txt'"
-check "which takes the dir's group"            "staff" "$(stat -f '%Sg' "$ACD/new.txt")"
-check "and no ACL"                             "" "$(acl_h "$ACD/new.txt")"
-ok   "the invoker adds a directory"            as_user mkdir -- "$ACD/newdir"
-check "which takes the dir's group too"        "staff" "$(stat -f '%Sg' "$ACD/newdir")"
-check "and no ACL"                             "" "$(acl_h "$ACD/newdir")"
-ok   "and a grandchild inside it"              as_user /bin/sh -c "echo g > '$ACD/newdir/g.txt'"
-check "the grandchild as well"                 "staff" "$(stat -f '%Sg' "$ACD/newdir/g.txt")"
-ok   "the invoker lists the 700 dir"           as_user ls -- "$ACL7"
-ok   "and adds inside it"                      as_user /bin/sh -c "echo n > '$ACL7/new.plist'"
+note "flags: what a sappnd folder still lets you do, and what not"
+ok   "you add a file"                          as_user /bin/sh -c "echo n > '$ACD/new.txt'"
+ok   "and a directory"                         as_user mkdir -- "$ACD/newdir"
+ok   "and a file inside that"                  as_user /bin/sh -c "echo g > '$ACD/newdir/g.txt'"
+ok   "you list the 700 dir"                    as_user ls -- "$ACL7"
+ok   "and add inside it"                       as_user /bin/sh -c "echo n > '$ACL7/new.plist'"
 deny "another user cannot list the 700 dir"    sudo -u nobody ls -- "$ACL7"
+deny "you cannot rename an entry"              as_user mv -- "$ACD/new.txt" "$ACD/renamed.txt"
+deny "nor remove one"                          as_user rm -f -- "$ACD/new.txt"
+deny "nor clear the flag"                      as_user chflags nosappnd "$ACD"
+deny "nor zero the flag word"                  as_user chflags 0 "$ACD"
+deny "nor chmod the dir"                       as_user chmod 777 "$ACD"
+deny "nor add an ACL entry"                    as_user chmod +a "user:$INV allow delete_child" "$ACD"
+check "the dir is exactly as sealed"           "$INV staff 755 sappnd" "$(stat -f '%Su %Sg %OLp %Sf' "$ACD")"
+deny "you cannot write a sealed file"          as_user /bin/sh -c "echo evil >> '$ACD/app/a.conf'"
+deny "nor clear its flag"                      as_user chflags noschg "$ACD/app/a.conf"
 
-note "placement: what the invoker still cannot do"
-deny "rename an entry"                         as_user mv -- "$ACD/new.txt" "$ACD/renamed.txt"
-deny "remove one"                              as_user rm -f -- "$ACD/new.txt"
-deny "strip the entry"                         as_user chmod -a "$ACE" "$ACD"
-deny "widen it"                                as_user chmod +a "user:$INV allow delete_child" "$ACD"
-deny "clear the flag"                          as_user chflags nouappnd "$ACD"
-deny "chmod the dir"                           as_user chmod 777 "$ACD"
-check "and the entry is exactly as sealed"     "$ACE" "$(acl_h "$ACD")"
-
-note "placement: an unlock keeps the entry, and a relock needs it"
+note "flags: an unlock lifts the flag and nothing else"
 ok   "unlock the 755 dir"                      locked_home "$ACHOME" unlock "$ACD"
-check "the unlocked dir keeps owner, group and mode" \
-      "$LOCK_ACCT staff 755 -" "$(stat -f '%Su %Sg %OLp %Sf' "$ACD")"
-ok   "and the entry"                           acl_has_h "$ACD" "$ACE"
-deny "with the flag off, the entry alone still refuses a rename" \
-     as_user mv -- "$ACD/new.txt" "$ACD/renamed.txt"
-ok   "the file is where it was"                test -f "$ACD/new.txt"
-chmod -a "$ACE" "$ACD"
-refuse "a relock without the entry is refused" "no longer carries its ACL entry" \
-       locked_home "$ACHOME" lock --yes "$ACD/app/a.conf"
-check "and leaves the dir unflagged"           "" "$(flags_of "$ACD")"
-chmod +a "$ACE" "$ACD"
+check "the unlocked dir: owner, group, mode kept, no flag" \
+      "$INV staff 755 -" "$(stat -f '%Su %Sg %OLp %Sf' "$ACD")"
+ok   "now the rename works"                    as_user mv -- "$ACD/new.txt" "$ACD/renamed.txt"
 locked_home "$ACHOME" lock --yes "$ACD/app/a.conf" >"$ACOUT" 2>&1 || true
-ok   "with the entry back, the plan relocks it" grep -qF "relocked (placement): $ACD" "$ACOUT"
-check "the relocked dir is uappnd again"       "uappnd" "$(flags_of "$ACD")"
+ok   "the leaf's plan seals it again"          grep -qF "locked (sappnd): $ACD" "$ACOUT"
+check "the relocked dir is sappnd again"       "sappnd" "$(flags_of "$ACD")"
 ok   "verify clean after the relock"           locked_home "$ACHOME" verify --quiet
 
-note "placement: verify reads the entry and the group"
-chflags nouappnd "$ACD"; chmod -a "$ACE" "$ACD"; chflags uappnd "$ACD"
-if locked_home "$ACHOME" verify >"$ACOUT" 2>&1; then vrc=0; else vrc=$?; fi
-check "a missing entry is drift"               "5" "$vrc"
-ok   "and the drift names the entry"           grep -qF "ACL entry missing or changed" "$ACOUT"
-chflags nouappnd "$ACD"; chmod +a "$ACE,delete_child" "$ACD"; chflags uappnd "$ACD"
-if locked_home "$ACHOME" verify >"$ACOUT" 2>&1; then vrc=0; else vrc=$?; fi
-check "a widened entry is drift"               "5" "$vrc"
-chflags nouappnd "$ACD"; chmod -a "user:$INV allow delete_child" "$ACD"; chflags uappnd "$ACD"
-ok   "verify clean with the entry as sealed"   locked_home "$ACHOME" verify --quiet
-chflags nouappnd "$ACD"; chgrp wheel "$ACD"; chflags uappnd "$ACD"
+note "flags: verify holds every node to its record"
+chgrp wheel "$ACD" 2>/dev/null || { chflags nosappnd "$ACD"; chgrp wheel "$ACD"; chflags sappnd "$ACD"; }
 if locked_home "$ACHOME" verify >"$ACOUT" 2>&1; then vrc=0; else vrc=$?; fi
 check "a changed group is drift"               "5" "$vrc"
 ok   "and the drift names it"                  grep -qF "group wheel, expected staff" "$ACOUT"
-chflags nouappnd "$ACD"; chgrp staff "$ACD"; chflags uappnd "$ACD"
-ACDM="$(meta_path "$ACD")"
-sed '/^acl=/d' "$ACDM" >"$ACDM.tmp"
-mv -f "$ACDM.tmp" "$ACDM"
-chown "$LOCK_ACCT:$LOCK_ACCT" "$ACDM"
-chmod 640 "$ACDM"
+chflags nosappnd "$ACD"; chgrp staff "$ACD"; chflags sappnd "$ACD"
+ok   "verify clean with the group back"        locked_home "$ACHOME" verify --quiet
+# The owner may still ADD a user flag on top of a system one; the record
+# holds the whole flag word, so that is drift too.
+ACF="$ACD/app/a.conf"
+ok   "you can add a user flag to a sealed file" as_user chflags hidden "$ACF"
 if locked_home "$ACHOME" verify >"$ACOUT" 2>&1; then vrc=0; else vrc=$?; fi
-check "a placement record without the entry is drift" "5" "$vrc"
-ok   "and says it predates 0.14.0"             grep -qF "written before locked 0.14.0" "$ACOUT"
-printf 'acl=%s\n' "$ACE" >>"$ACDM"
-ok   "verify clean with the record whole"      locked_home "$ACHOME" verify --quiet
+check "an added user flag is drift"            "5" "$vrc"
+ok   "and the drift names the flag word"       grep -qF "flags 'schg,hidden', expected 'schg'" "$ACOUT"
+chflags nohidden "$ACF"
+# Content: only root can write a sealed file, so the stand-in for root or a
+# bug clears the flag, appends and sets it again. The fingerprint taken at
+# the seal is what tells.
+chflags noschg "$ACF"; printf 'x' >>"$ACF"; chflags schg "$ACF"
+if locked_home "$ACHOME" verify >"$ACOUT" 2>&1; then vrc=0; else vrc=$?; fi
+check "changed content is drift"               "5" "$vrc"
+ok   "and the drift says so"                   grep -qF "content differs from what was sealed" "$ACOUT"
+ok   "unlock to repair"                        locked_home "$ACHOME" unlock "$ACF"
+ok   "relock takes the content as it is now"   locked_home "$ACHOME" lock --yes "$ACF"
+ok   "verify clean after the repair"           locked_home "$ACHOME" verify --quiet
 
-note "placement: trash needs rights the entry does not give"
-refuse "trash out of a placement dir is refused" "cannot write the directory it is in: $ACD" \
-       locked_home "$ACHOME" trash --yes "$ACD/new.txt"
-ok   "the file is still there"                 test -f "$ACD/new.txt"
-locked_home "$ACHOME" why "$ACD/new.txt" >"$ACOUT" 2>&1 || true
-ok   "why still offers rm"                     grep -qF "sudo locked rm $ACD/new.txt" "$ACOUT"
-deny "and no longer offers trash"              grep -qF "sudo locked trash $ACD/new.txt" "$ACOUT"
+note "flags: a volume mounted over a sealed path is named"
+# A disk image attaches over any folder its user owns, whatever its flag.
+# verify reads the mount point each sealed path resolves into.
+ACIMG="$SCRATCH/over.dmg"
+ACMNT_OK=0
+if /usr/bin/hdiutil create -quiet -size 1m -fs HFS+ -volname lockedover "$ACIMG" >/dev/null 2>&1 &&
+   /usr/bin/hdiutil attach -quiet -nobrowse -mountpoint "$ACD" "$ACIMG" >/dev/null 2>&1; then
+  ACMNT_OK=1
+fi
+if [ "$ACMNT_OK" -eq 1 ]; then
+  if locked_home "$ACHOME" verify >"$ACOUT" 2>&1; then vrc=0; else vrc=$?; fi
+  /usr/bin/hdiutil detach -quiet "$ACD" >/dev/null 2>&1 || /usr/bin/hdiutil detach -force "$ACD" >/dev/null 2>&1 || true
+  check "a mount over a sealed folder is drift" "5" "$vrc"
+  ok   "and the drift names the mount point"    grep -qF "a volume is mounted over its path, at: $ACD" "$ACOUT"
+  ok   "verify clean once it is detached"       locked_home "$ACHOME" verify --quiet
+else
+  tap_skip "a mount over a sealed folder is drift" "hdiutil could not attach an image here"
+fi
 
-note "placement: an entry of yours already there refuses the seal"
-ACM="$ACHOME/mine"
-install -d -o "$INV" -g staff -m 755 "$ACM" "$ACM/in"
-chmod +a "user:$INV allow list" "$ACM"
-as_user /bin/sh -c "echo m > '$ACM/in/m.txt'"
-refuse "the seal would merge into it"          "already carries an ACL entry for $INV" \
-       locked_home "$ACHOME" lock --yes "$ACM/in/m.txt"
-check "the dir is untouched"                   "$INV staff 755 -" "$(stat -f '%Su %Sg %OLp %Sf' "$ACM")"
-check "and so is its entry"                    "user:$INV allow list" "$(acl_h "$ACM")"
+note "flags: trash out of a chain folder"
+if [ "$TRASH_SKIP" -eq 1 ]; then
+  tap_skip "trash out of a sappnd folder" "the trash service refused this terminal (TCC)"
+else
+  as_user /bin/sh -c "echo t > '$ACD/trashme.txt'"
+  ok   "trash out of a sappnd folder"          locked_home "$ACHOME" trash --yes "$ACD/trashme.txt"
+  deny "the file left the folder"              test -e "$ACD/trashme.txt"
+  check "the folder is sealed again"           "sappnd" "$(flags_of "$ACD")"
+fi
 
-note "placement: a release takes off the seal's entry and nothing else"
+note "flags: a release takes the flag off and nothing else"
 locked_home "$ACHOME" unprotect --yes "$ACD/app/a.conf" >"$ACOUT" 2>&1 || true
-ok   "unprotect releases the 755 dir"          grep -qF "released: $ACD" "$ACOUT"
-check "back to the invoker, unflagged"         "$INV staff 755 -" "$(stat -f '%Su %Sg %OLp %Sf' "$ACD")"
-check "with no ACL left"                       "" "$(acl_h "$ACD")"
+ok   "unprotect releases the 755 dir"          grep -qF "released (sappnd cleared): $ACD" "$ACOUT"
+check "back to no flag, the rest as it was"    "$INV staff 755 -" "$(stat -f '%Su %Sg %OLp %Sf' "$ACD")"
 locked_home "$ACHOME" unprotect --yes "$ACL7/prefs/p.plist" >"$ACOUT" 2>&1 || true
-ok   "unprotect releases the 700 dir"          grep -qF "released: $ACL7" "$ACOUT"
-check "back to the invoker, unflagged"         "$INV staff 700 -" "$(stat -f '%Su %Sg %OLp %Sf' "$ACL7")"
-check "with only Apple's entry left"           "group:everyone deny delete" "$(acl_h "$ACL7")"
+ok   "unprotect releases the 700 dir"          grep -qF "released (sappnd cleared): $ACL7" "$ACOUT"
+check "back to no flag, the rest as it was"    "$INV staff 700 -" "$(stat -f '%Su %Sg %OLp %Sf' "$ACL7")"
+check "with Apple's entry still alone"         "group:everyone deny delete" "$(acl_h "$ACL7")"
 ok   "verify clean after the releases"         locked_home "$ACHOME" verify --quiet
 
 }
 
-# ---- 7. one-shot layout conversion -----------------------------------------
+# ---- 7. one-shot conversion to system flags --------------------------------
 section_7() {
 #
-# 0.14.0 kept each pool at <legacy root>/<user>; the first root invocation
-# of 0.15.0 moves it to <state root>/<user>/pool. Own roots here, so the
-# conversion cannot meet the pools every section above built.
+# 0.16 gave sealed nodes to a lock account (daemon stands in for it here):
+# a content seal made a node the account's with uchg, a placement seal made
+# a chain folder the account's with uappnd and one ACL entry for you, and
+# ~ kept its owner with sappnd. The first root run of 0.17.0 converts every
+# record: each node goes back to its recorded owner, group and mode and
+# takes a system flag, a file and a tree by copy-and-swap. Fixtures are
+# built here in the 0.16 shape, by hand, in a home and state root of their
+# own; the run is a launchd verify, with no invoker.
 
-note "conversion: legacy pools move into the new layout"
+note "conversion: 0.16 lock-account seals become system flags"
+CVSTOP="$SCRATCH/cvusers"
+install -d -m 755 -o root -g wheel "$CVSTOP"
+CVHOME="$CVSTOP/home"
+install -d -o "$INV" -g staff -m 755 "$CVHOME"
 CONV_STATE="$SCRATCH/conv-state"
-CONV_LEGACY="$SCRATCH/conv-legacy"
-locked_conv() { # <args...>: a root run as launchd makes it, no invoker
-  guarded "$FAKE_HOME" \
+CVPOOL="$CONV_STATE/$INV/pool"
+install -d -m 711 -o root -g wheel "$CONV_STATE"
+install -d -m 750 -o root -g "$LOCK_ACCT" "$CONV_STATE/$INV"
+install -d -m 750 -o "$LOCK_ACCT" -g "$LOCK_ACCT" "$CVPOOL"
+locked_conv() { # <args...>: a root run as launchd makes it, no invoker.
+  # The conversion is what changes the home here, so the guard is told.
+  GUARD_RELEASE="$CVHOME" guarded "$CVHOME" \
   env LOCKED_STATE_ROOT="$CONV_STATE" \
-      LOCKED_LEGACY_ROOT="$CONV_LEGACY" \
       INSTALL_TARGET="$SCRATCH/not-installed" \
       LOCKED_HELPER="$HELPER" \
       LOCKED_LOCK_ACCOUNT="$LOCK_ACCT" \
-      LOCKED_USER_HOME="$FAKE_HOME" \
+      LOCKED_USER_HOME="$CVHOME" \
       SUDO_USER= \
       "$LOCKED_RUN" "$@"
 }
-legacy_pool() { # <user>: a 0.14.0-shaped pool with one record file in it
-  install -d -m 711 -o root -g wheel "$CONV_LEGACY"
-  install -d -m 750 -o "$LOCK_ACCT" -g "$LOCK_ACCT" "$CONV_LEGACY/$1" "$CONV_LEGACY/$1/.staging"
-  install -m 600 -o "$LOCK_ACCT" -g "$LOCK_ACCT" /dev/null "$CONV_LEGACY/$1/x.snap"
+cv_meta() { printf '%s/%s.meta' "$CVPOOL" "$(enc_path "$1")"; }
+cv_get() { awk -F= -v f="$2" '$1==f{print substr($0, length(f)+2); exit}' "$(cv_meta "$1")"; }
+cvrec() { # <path> <key=value>...: a record as 0.16 wrote it
+  local m
+  m="$(cv_meta "$1")"
+  shift
+  printf '%s\n' "$@" >"$m"
+  chown "$LOCK_ACCT:$LOCK_ACCT" "$m"
+  chmod 640 "$m"
 }
-legacy_pool "$INV"
-legacy_pool other
-POOL_INO="$(stat -f '%i' "$CONV_LEGACY/$INV")"
-ok   "verify converts every user's pool"       locked_conv verify --quiet
-deny "the legacy root is gone"                 test -e "$CONV_LEGACY"
-check "the pool moved, not copied"             "$POOL_INO" "$(stat -f '%i' "$CONV_STATE/$INV/pool")"
-check "and kept its owner and mode"            "$LOCK_ACCT $LOCK_ACCT 750" "$(stat -f '%Su %Sg %OLp' "$CONV_STATE/$INV/pool")"
-ok   "with its contents"                       test -f "$CONV_STATE/$INV/pool/x.snap"
-check "the new per-user dir is root's"         "root $LOCK_ACCT 750" "$(stat -f '%Su %Sg %OLp' "$CONV_STATE/$INV")"
-ok   "the other user's pool moved too"         test -f "$CONV_STATE/other/pool/x.snap"
-ok   "and the same run wrote both statuses"    test -f "$CONV_STATE/$INV/verify" -a -f "$CONV_STATE/other/verify"
-ok   "a second run finds nothing to convert"   locked_conv verify --quiet
+cvid() { "$HELPER" id "$1" | tr ':' '.'; }
+CVE="user:$INV allow list,add_file,search,add_subdirectory,readattr,readextattr,readsecurity"
 
-note "conversion: nothing merges, nothing is left behind silently"
-legacy_pool "$INV"
-refuse "a pool at both paths refuses"          "a pool exists at both paths; move one by hand" \
-       locked_conv verify --quiet
-ok   "and moves nothing"                       test -f "$CONV_LEGACY/$INV/x.snap"
-rm -rf -- "${CONV_LEGACY:?}/$INV"
-install -d -m 700 -o root -g wheel "$CONV_LEGACY/.stray"
-refuse "a stray entry keeps the legacy root"   "still holds entries after the move; look before removing it: $CONV_LEGACY" \
-       locked_conv verify --quiet
-ok   "and is left where it was"                test -d "$CONV_LEGACY/.stray"
-rm -rf -- "$CONV_LEGACY"
-ok   "with the legacy root gone, runs pass"    locked_conv verify --quiet
+# ~: kept its owner, sappnd, a chain record.
+chflags sappnd "$CVHOME"
+cvrec "$CVHOME" "owner=$INV" "group=staff" "mode=755" "lockmode=755" "tier=anchor" \
+  "flag=sappnd" "flagsym=sappnd" "id=$(cvid "$CVHOME")" "recursive=0" "role=chain" "state=locked"
+# A placement chain folder: the account's, group and mode kept, your entry.
+CVA="$CVHOME/cfg"
+install -d -o "$INV" -g staff -m 755 "$CVA" "$CVA/app"
+# A content file below it, sealed.
+CVF="$CVA/app/a.conf"
+as_user /bin/sh -c "printf 'content a\n' > '$CVF'"
+chmod 644 "$CVF"
+CVF_SUM="$(shasum -a 256 "$CVF" | awk '{print $1}')"
+CVF_INO="$(stat -f '%i' "$CVF")"
+install -m 600 -o "$LOCK_ACCT" -g "$LOCK_ACCT" "$CVF" "$CVPOOL/$(enc_path "$CVF").snap"
+chown "$LOCK_ACCT:$LOCK_ACCT" "$CVF"
+chflags uchg "$CVF"
+cvrec "$CVF" "owner=$INV" "group=staff" "mode=644" "lockmode=644" "tier=content" \
+  "flag=uchg" "flagsym=uchg" "id=$(cvid "$CVF")" "recursive=0" "role=leaf" "state=locked"
+# A content file that was unlocked: already yours again.
+CVU="$CVA/app/u.txt"
+as_user /bin/sh -c "echo u > '$CVU'"
+cvrec "$CVU" "owner=$INV" "group=staff" "mode=644" "lockmode=644" "tier=content" \
+  "flag=uchg" "flagsym=" "id=$(cvid "$CVU")" "recursive=0" "role=leaf" "state=unlocked"
+# A content tree, every node the account's with uchg.
+CVT="$CVA/tree"
+install -d -o "$INV" -g staff -m 755 "$CVT" "$CVT/sub"
+as_user /bin/sh -c "echo x > '$CVT/x.txt'; echo y > '$CVT/sub/y.txt'"
+chown -R "$LOCK_ACCT:$LOCK_ACCT" "$CVT"
+chflags uchg "$CVT/x.txt" "$CVT/sub/y.txt"
+chflags uchg "$CVT/sub"
+chflags uchg "$CVT"
+cvrec "$CVT" "owner=$INV" "group=staff" "mode=755" "lockmode=755" "tier=content" \
+  "flag=uchg" "flagsym=uchg" "id=$(cvid "$CVT")" "recursive=1" "role=leaf" "state=locked"
+# The chain folder itself, sealed last, as 0.16 left it.
+chown "$LOCK_ACCT" "$CVA"
+chmod +a "$CVE" "$CVA"
+chflags uappnd "$CVA"
+cvrec "$CVA" "owner=$INV" "group=staff" "mode=755" "lockmode=755" "tier=placement" \
+  "flag=uappnd" "flagsym=uappnd" "id=$(cvid "$CVA")" "recursive=0" "role=chain" \
+  "acl=$CVE" "state=locked"
+# A placement folder that was unlocked: still the account's, with the entry.
+CVP="$CVHOME/pdir"
+install -d -o "$LOCK_ACCT" -g staff -m 755 "$CVP"
+chmod +a "$CVE" "$CVP"
+cvrec "$CVP" "owner=$INV" "group=staff" "mode=755" "lockmode=755" "tier=placement" \
+  "flag=uappnd" "flagsym=" "id=$(cvid "$CVP")" "recursive=0" "role=chain" \
+  "acl=$CVE" "state=unlocked"
+# History.
+CVR="$CVHOME/gone.txt"
+cvrec "$CVR" "owner=$INV" "group=staff" "mode=644" "lockmode=644" "tier=content" \
+  "flag=uchg" "flagsym=uchg" "id=1.9" "recursive=0" "role=leaf" "state=retired" \
+  "via=rm" "by=$INV" "at=2026-10-01T00:00:00Z"
+
+CVOUT="$SCRATCH/conv.out"
+CVRC=0
+locked_conv verify >"$CVOUT" 2>&1 || CVRC=$?
+check "the converting verify run is clean"     "0" "$CVRC"
+tap_output "$( [ "$CVRC" -eq 0 ] || cat "$CVOUT")"
+ok   "it says it converted the pool"           grep -qF "converting the pool of $INV to system flags" "$CVOUT"
+ok   "and that the account owns nothing now"   grep -qF "the account $LOCK_ACCT now owns nothing locked made" "$CVOUT"
+check "the account owns nothing in the home"   "" "$(find "$CVHOME" -user "$LOCK_ACCT" -print)"
+check "nor in the pool"                        "" "$(find "$CONV_STATE" -user "$LOCK_ACCT" -print)"
+check "no record keeps a tier"                 "" "$(grep -l '^tier=' "$CVPOOL"/*.meta || true)"
+check "the pool is root's 700"                 "root wheel 700" "$(stat -f '%Su %Sg %OLp' "$CVPOOL")"
+check "  with your read entry"                 " 0: user:$INV allow list,search,readattr,readextattr,readsecurity" \
+      "$(ls -led "$CVPOOL" | sed 1d)"
+check "a converted record is root's 600"       "root wheel 600" "$(stat -f '%Su %Sg %OLp' "$(cv_meta "$CVF")")"
+
+check "the file: yours, its mode, schg"        "$INV staff 644 schg" "$(stat -f '%Su %Sg %OLp %Sf' "$CVF")"
+check "  a copy root made (a new inode)"       "1" "$([ "$(stat -f '%i' "$CVF")" != "$CVF_INO" ] && echo 1)"
+check "  with the same bytes"                  "$CVF_SUM" "$(shasum -a 256 "$CVF" | awk '{print $1}')"
+check "  and its fingerprint"                  "sum"$'\t'"$CVF_SUM"$'\t'"." "$(cat "$CVPOOL/$(enc_path "$CVF").sum")"
+check "  its record: schg, with its volume"    "schg $("$HELPER" mount "$CVF")" "$(cv_get "$CVF" flag) $(cv_get "$CVF" mount)"
+check "the tree: every node yours"             "" "$(find "$CVT" ! -user "$INV" -print)"
+check "  and every node schg"                  "" "$(find "$CVT" ! -flags +schg -print)"
+check "  two fingerprints"                     "2" "$(grep -c '^sum' "$CVPOOL/$(enc_path "$CVT").sum")"
+check "the chain folder: yours, sappnd"        "$INV staff 755 sappnd" "$(stat -f '%Su %Sg %OLp %Sf' "$CVA")"
+check "  with your old entry gone"             "" "$(/bin/ls -ledq -- "$CVA" | sed 1d)"
+check "~ is as it was"                         "$INV sappnd" "$(stat -f '%Su %Sf' "$CVHOME")"
+check "the unlocked file is as it was"         "$INV -" "$(stat -f '%Su %Sf' "$CVU")"
+check "  its record unlocked, flag schg"       "unlocked schg" "$(cv_get "$CVU" state) $(cv_get "$CVU" flag)"
+check "the unlocked folder: yours, no entry, no flag" "$INV staff 755 -" "$(stat -f '%Su %Sg %OLp %Sf' "$CVP")"
+check "  no ACL left"                          "" "$(/bin/ls -ledq -- "$CVP" | sed 1d)"
+check "  its record unlocked, flag sappnd"     "unlocked sappnd" "$(cv_get "$CVP" state) $(cv_get "$CVP" flag)"
+check "the retired record keeps its history"   "retired rm" "$(cv_get "$CVR" state) $(cv_get "$CVR" via)"
+check "a snapshot is root's now"               "root" "$(owner_of "$CVPOOL/$(enc_path "$CVF").snap")"
+
+locked_conv verify >"$CVOUT" 2>&1 || true
+deny "a second run converts nothing"           grep -qF "converting the pool" "$CVOUT"
+ok   "you read the converted pool without sudo" \
+     sudo -u "$INV" /usr/bin/env LOCKED_STATE_ROOT="$CONV_STATE" INSTALL_TARGET="$SCRATCH/not-installed" \
+       LOCKED_HELPER="$HELPER" LOCKED_USER_HOME="$CVHOME" "$LOCKED_RUN" status
+
+note "conversion: a node it cannot convert stays as it was"
+# Owned by root, not by the account nor by you: the helper's gate refuses
+# it, the record keeps its 0.16 shape for the next run, and verify says so.
+CVX="$CVHOME/root-owned.txt"
+# ~ is sappnd now: an entry may be created there, not renamed into place.
+: >"$CVX"
+chown root:wheel "$CVX"
+chmod 644 "$CVX"
+chflags uchg "$CVX"
+cvrec "$CVX" "owner=$INV" "group=staff" "mode=644" "lockmode=644" "tier=content" \
+  "flag=uchg" "flagsym=uchg" "id=$(cvid "$CVX")" "recursive=0" "role=leaf" "state=locked"
+CVRC=0
+locked_conv verify >"$CVOUT" 2>&1 || CVRC=$?
+check "verify reports drift"                   "5" "$CVRC"
+ok   "the conversion names the node it left"   grep -qF "could not convert its seal; left as it was, tried again on the next root run: $CVX" "$CVOUT"
+ok   "verify names the old record"             grep -qF "record from before 0.17.0" "$CVOUT"
+check "the record keeps its 0.16 shape"        "content" "$(cv_get "$CVX" tier)"
+check "the node is untouched"                  "root uchg" "$(stat -f '%Su %Sf' "$CVX")"
+chflags nouchg "$CVX"
+chflags nosappnd "$CVHOME"
+rm -f -- "$CVX" "$(cv_meta "$CVX")"
+chflags sappnd "$CVHOME"
+ok   "verify clean once it is gone"            locked_conv verify --quiet
 
 }
 
@@ -3569,7 +3678,7 @@ section_9() {
 #
 # The headline defect: a user gives a root-owned file a second name (a hard
 # link) inside a folder they own, and locked -- running as root -- then
-# chowns or reflags it. The seal now acts per inode through the helper's
+# reflags it. The seal acts per inode through the helper's
 # owner gate, so a node owned by anyone but the invoker is refused, link or
 # not, whatever folder it sits in. These cases are root's to run: only root
 # can own the planted node, and the pause build makes the plan-to-apply
@@ -3589,8 +3698,8 @@ printf 'root bytes\n' >"$ROOTF"
 note "owner gate: a hard link to a root file, named directly"
 # The exact live defect. lock names the link; plan_node reads its owner --
 # root, because owner is the file's, not the name's -- and refuses before
-# touching anything. Were it sealed, unlock's chown would hand you the root
-# file.
+# touching anything. Were it sealed, root would have frozen a file of its
+# own on your say.
 LINKD="$OG/linkdir"
 install -d -o "$INV" -g staff -m 755 "$LINKD"
 if as_user ln "$ROOTF" "$LINKD/sudoers-ish" 2>/dev/null; then
@@ -3615,7 +3724,7 @@ install -o root -g wheel -m 644 "$ROOTF" "$FOT/sub/theirs.txt"
 locked lock --yes "$FOT" >"$OGOUT" 2>&1 || true
 ok   "the tree seal is refused"                grep -qF "holds nodes you do not own" "$OGOUT"
 ok   "the refusal names the foreign owner"     grep -qF "owned by root" "$OGOUT"
-check "nothing in the tree was flagged"        "" "$(find "$FOT" -flags +uchg -print 2>/dev/null)"
+check "nothing in the tree was flagged"        "" "$(find "$FOT" -flags +schg -print 2>/dev/null)"
 check "the tree is still yours"                "$INV" "$(owner_of "$FOT/mine.txt")"
 
 note "owner gate: a node that is not a file, directory or symlink"
@@ -3625,7 +3734,7 @@ as_user /bin/sh -c "echo a > '$FIT/a.txt'"
 as_user mkfifo "$FIT/pipe"
 locked lock --yes "$FIT" >"$OGOUT" 2>&1 || true
 ok   "a tree with a fifo is refused"           grep -qF "not files, directories or symlinks" "$OGOUT"
-check "nothing in it was flagged"              "" "$(find "$FIT" -flags +uchg -print 2>/dev/null)"
+check "nothing in it was flagged"              "" "$(find "$FIT" -flags +schg -print 2>/dev/null)"
 as_user rm -f -- "$FIT/pipe"
 
 note "owner gate: a node planted between plan and apply"
@@ -3634,10 +3743,10 @@ note "owner gate: a node planted between plan and apply"
 # before the helper opens anything, the plant is met by its read-only count
 # pass: the tree holds one node more than the plan, so it refuses (exit 7)
 # before any change. Held after the count, the plant is met by the seal
-# itself: it hands each directory over and freezes it before reading its
-# entries, so the plant is on the final listing and meets the gate like any
-# other node, and every freeze is rolled back. Either way the tree is left
-# exactly as the plan found it.
+# itself: it freezes each directory before reading its entries, so the
+# plant is on the final listing and meets the gate like any other node, and
+# every freeze is rolled back. Either way no node is left frozen; a file the
+# seal had already swapped stays the copy, with the same bytes.
 race_case() { # <pause verb> <needle>
   RT="$OG/race-tree-$1"
   install -d -o "$INV" -g staff -m 755 "$RT" "$RT/a" "$RT/a/b"
@@ -3659,9 +3768,11 @@ race_case() { # <pause verb> <needle>
   wait "$RPID" || RRC=$?
   check "$1: the planted lock exits 3 (a failed item)" "3" "$RRC"
   ok   "$1: the helper refused the planted node"   grep -qF -e "$2" "$RROUT"
-  check "$1: no node in the tree is frozen"        "" "$(find "$RT" -flags +uchg -print 2>/dev/null)"
+  check "$1: no node in the tree is frozen"        "" "$(find "$RT" -flags +schg -print 2>/dev/null)"
   check "$1: the top is still yours"               "$INV" "$(owner_of "$RT")"
-  check "$1: a frozen directory was rolled back"   "$INV" "$(owner_of "$RT/a/b")"
+  check "$1: a frozen directory was rolled back"   "" "$(flags_of "$RT/a/b")"
+  check "$1: the files hold what they held"        "one two three" \
+        "$(cat "$RT/one.txt" "$RT/a/two.txt" "$RT/a/b/three.txt" | tr '\n' ' ' | sed 's/ $//')"
   check "$1: the planted node is still root's"     "root" "$(owner_of "$RT/a/b/planted.txt")"
   rm -f -- "$FIFO"
 }
@@ -3671,10 +3782,10 @@ race_case seal-walk "owned by root and not by $INV"
 note "reading as you: the copy verbs"
 # Root reads a source only through the owner gate, and walks to it as you:
 # the kernel checks every folder on the way, and the file's own bits when
-# it is yours. A node the lock account owns is opened by root, from that
-# node down, since the lock account cannot enter your home. Each case has
-# its control: the same copy as root alone, which the gate would let
-# through.
+# it is yours. A node owned by another account in --owner (the conversion
+# reads 0.16's lock-account nodes this way) is opened by root, from that
+# node down, since that account cannot enter your home. Each case has its
+# control: the same copy as root alone, which the gate would let through.
 RA="$OG/read-as"
 install -d -o "$INV" -g staff -m 755 "$RA"
 RADEST="$SCRATCH/read-as-dest"
@@ -3788,23 +3899,21 @@ else
   tap_skip "a relock over a root-owned link is refused" "the user may not hard-link here"
 fi
 
-note "owner gate: a placement directory swapped between plan and apply"
-# A placement seal hands a chain directory to the lock account and adds an
-# ACL entry for you. The chain is sealed leaf first, so while the leaf is
-# sealed the directory above it, and the home above that, are still yours:
-# a process of yours can move the directory away and put a symlink to a
-# root-owned directory, or another directory of yours, at its name. Root
-# acting on that name would chown the root-owned directory to the lock
-# account and give you an entry on it. The helper takes only the directory
-# the plan pinned, by its identity, on its own descriptor, so either swap
-# is refused and nothing changes.
+note "owner gate: a chain directory swapped between plan and apply"
+# The chain is sealed leaf first, so while the leaf is sealed the directory
+# above it, and the home above that, are still open: a process of yours can
+# move the directory away and put a symlink to a root-owned directory, or
+# another directory of yours, at its name. Root acting on that name would
+# freeze the root-owned directory on your say. The helper takes only the
+# directory the plan pinned, by its identity, on its own descriptor, so
+# either swap is refused and nothing changes.
 #
 # Every seal in the run pauses (the test helper). The fifo is held open
 # read and write here, so a pause waits for a byte and this side never
 # blocks: one byte lets the leaf's seal go; the swap waits until the leaf's
 # record is written, so it lands after the leaf's last read of its own
-# path; then the bytes for the placement seal, and for the anchor's should
-# the run get that far.
+# path; then the bytes for the chain folder's seal, and for the home's
+# should the run get that far.
 s9_acl() { /bin/ls -ledq -- "$1" | sed -e 1d -e 's/^ *[0-9][0-9]*: //'; }
 s9_shape() { printf '%s|%s' "$(stat -f '%Su %Sg %OLp %Sf' "$1")" "$(s9_acl "$1" | tr '\n' ';')"; }
 s9_leaf_locked() { [ "$(meta_get "$1" state)" = "locked" ]; }
@@ -3875,33 +3984,28 @@ rmdir -- "$PLD"
 mv -- "$PLD.away" "$PLD"
 ok   "dir: the leaf can be unprotected again"  locked unprotect --yes "$PLLEAF"
 
-note "owner gate: a placement seal and its release, through the helper"
-# The same seal with nothing swapped: the directory goes to the lock
-# account with your entry beside the ACL it had, and the release puts back
-# exactly what the record captured -- owner, group, mode, flags and ACL.
+note "owner gate: a chain seal and its release, through the helper"
+# The same seal with nothing swapped: the directory keeps its owner, group,
+# mode and ACL and takes sappnd, and the release takes the flag off and
+# nothing else.
 RTD="$FAKE_HOME/pl-roundtrip"
 install -d -o "$INV" -g staff -m 750 "$RTD" "$RTD/in"
 chmod +a "group:everyone deny delete" "$RTD"
 as_user /bin/sh -c "echo r > '$RTD/in/r.txt'"
 RTD_SHAPE="$(s9_shape "$RTD")"
-RTE="user:$INV allow list,add_file,search,add_subdirectory,readattr,readextattr,readsecurity"
 ok   "round trip: lock a leaf below it"        locked lock --yes "$RTD/in/r.txt"
-check "round trip: sealed to the lock account, group and mode kept" \
-      "$LOCK_ACCT staff 750 uappnd" "$(stat -f '%Su %Sg %OLp %Sf' "$RTD")"
-check "round trip: your entry after the deny entry it had" \
-      "group:everyone deny delete"$'\n'"$RTE" "$(s9_acl "$RTD")"
-check "round trip: the record carries the entry" "$RTE" "$(meta_get "$RTD" acl)"
+check "round trip: sealed sappnd, owner, group and mode kept" \
+      "$INV staff 750 sappnd" "$(stat -f '%Su %Sg %OLp %Sf' "$RTD")"
+check "round trip: its ACL as it was"          "group:everyone deny delete" "$(s9_acl "$RTD")"
 ok   "round trip: unlock the directory"        locked unlock "$RTD"
 check "round trip: the unlock lifts the flag and nothing else" \
-      "$LOCK_ACCT staff 750 -" "$(stat -f '%Su %Sg %OLp %Sf' "$RTD")"
+      "$INV staff 750 -" "$(stat -f '%Su %Sg %OLp %Sf' "$RTD")"
 ok   "round trip: lock again"                  locked lock --yes "$RTD/in/r.txt"
-check "round trip: the relock puts the flag back" "uappnd" "$(flags_of "$RTD")"
+check "round trip: the relock puts the flag back" "sappnd" "$(flags_of "$RTD")"
 locked unprotect --yes "$RTD/in/r.txt" >"$OGOUT" 2>&1 || true
-ok   "round trip: unprotect releases it"       grep -qF "released: $RTD" "$OGOUT"
+ok   "round trip: unprotect releases it"       grep -qF "released (sappnd cleared): $RTD" "$OGOUT"
 check "round trip: owner, group, mode, flags and ACL as before" \
       "$RTD_SHAPE" "$(s9_shape "$RTD")"
-deny "round trip: and the release says nothing about a stray entry" \
-     grep -qF "is not the one recorded" "$OGOUT"
 
 }
 

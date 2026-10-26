@@ -1,5 +1,5 @@
 {
-  description = "locked -- three-tier BSD-flag protection for user-space trust surfaces";
+  description = "locked -- system-flag protection for user-space trust surfaces";
 
   # No inputs: the module takes pkgs/lib from the consuming system.
   outputs = { self }: {
