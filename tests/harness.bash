@@ -7,7 +7,7 @@
 # assertion has a flag-vs-noflag control (clear the flag, re-run, expect
 # success) so a failure can't be blamed on permissions or the sandbox.
 #
-# No global state is touched: the state root (pools and verify status) and
+# No global state is touched: the state root (the pools) and
 # the fake home live in scratch dirs, one per section, and the cleanup traps
 # clear all flags before removing them. The existing `daemon` account
 # stands in for another user, and for 0.16's lock account in the one-shot

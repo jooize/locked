@@ -1,55 +1,68 @@
-# locked v2 design -- three-tier BSD-flag chains
+# locked v2 design -- system-flag chains
 
-Supersedes the 2026-07-22 two-tier draft. Grounded in the 2026-08-05 probe
-round (all primitives verified live on macOS 26.5.1, SIP enabled,
-securelevel 0; system-flag probe 18/18). Threat model unchanged: a tool
-running as the user -- terminal-app scope, no TCC-protected dirs --
-tampering with files between "I read it" and "I sign/deploy it".
+One sealing method since 0.17.0: every node keeps its owner, group, mode
+and ACL, and a system flag holds it. Grounded in two probe rounds: the
+2026-08-05 round (all primitives verified live on macOS 26.5.1, SIP
+enabled, securelevel 0; system-flag probe 18/18) and the 2026-10-26 round
+(37 cases on user-owned nodes, macOS 27.0.1, SIP on, securelevel 0).
+Threat model unchanged: a tool running as the user -- terminal-app scope,
+no TCC-protected dirs -- tampering with files between "I read it" and "I
+sign/deploy it".
 
 ## Why flags: ownership alone does not protect the *name*
 
 v1 protects file *content* (EACCES on write), but anyone with write
 permission on the parent directory can `mv` the locked file aside and drop
 a replacement. BSD flags close exactly that: a flagged node cannot be
-renamed or deleted even by a user with parent write permission, and
-`chflags` is owner-or-root only (kernel EPERM, probed), so a flag on a
-node the user does not own binds every user-UID process.
+renamed or deleted even by a user with parent write permission. A *system*
+flag (`schg`, `sappnd`) is set and cleared by root only, so it binds every
+process running as the user, the node's own owner included.
 
-## The three tiers (named by what they protect)
+## The seal
 
-| Tier | Flag | Ownership | For | Effect |
-|---|---|---|---|---|
-| `content` | `uchg` | `_<user>-lock` | leaf files; leaf dirs (recursive) | total freeze: content, rename, delete. Edit = unlock, edit, lock. |
-| `placement` | `uappnd` | `_<user>-lock`; group and mode unchanged; one add-only ACL entry for the user | ancestor dirs *above* a leaf's own parent (`~/.config`, `~/Library`, ...), derived from the leaves and never named | new entries allowed; rename/delete/replace of existing entries denied; dir itself immovable. Unlock only for uninstall/replace ceremonies. |
-| `anchor` | `sappnd` (default) or `schg` | **unchanged** (stays the user) | nodes the OS identity-checks against the user's UID: `~`, `~/.ssh` and its files | system flags are root-only to set AND clear, so the flag binds all user processes while the user stays owner -- sshd StrictModes and every owner==user check keep passing. |
+| Node | Flag | How |
+|---|---|---|
+| a file you name | `schg` (`--flag sappnd` allowed: a TOFU `known_hosts`) | copy-and-swap: root's copy is swapped in, then flagged |
+| a folder you name | `schg` on every node, top-down | each directory flagged before its entries are read; every file swapped |
+| a symlink you name | `schg` on the link | no swap: a link has no write handle |
+| `~` or `~/.ssh` named on its own | `sappnd` (default) or `schg` | that folder alone, no walk |
+| a chain folder, `~` and `~/.ssh` included | `sappnd` | the folder only |
 
-Probed facts the tiers rest on:
+Nothing changes owner, group or mode, anywhere. The owner gate asks for
+the invoker on every node, so root never does more to a node than the
+invoker could. Every check the OS makes against the user's account (sshd
+StrictModes, the ssh client's config-ownership checks, any owner == user
+test) keeps passing, for `~` and `~/.ssh` and every other node alike.
 
-- `uappnd` dir: mkdir/create/mv-INTO allowed (append); rename/delete of
-  existing entries denied; the dir itself immovable; subdir interiors
-  unaffected.
-- `uchg` dir: total entry freeze + node immovable. Flags do NOT inherit:
-  contents of existing user-owned children stay writable -- which is why
-  `content` on a directory is **recursive** (every node in the tree gets
-  `uchg` and lock-account ownership).
-- `chflags` is owner-or-root only. `sappnd`/`schg` require root even to
-  set; the owner cannot clear or zero the flag word.
+Probed facts the seal rests on (2026-10-26, probe-result.txt in the work
+item):
+
+- `schg` on a user-owned file binds the owner: no write, remove, rename,
+  chmod, ACL or xattr change, touch, hard link, atomic save, flag clear.
+  `schg` or `sappnd` on a user-owned folder binds the same way for its
+  entries. Control: `uchg` on the user's own file is cleared by its owner.
+- The owner can still *add* a user flag (`hidden`, `uchg`, ...) to a
+  `schg` node, and cannot zero the word. Harmless; verify compares the
+  whole flag word, so an addition is drift.
+- A descriptor opened for writing before `schg` still writes after it: the
+  kernel checks the flag at open, not per write. That is why a file is
+  sealed as a copy (below).
+- A disk image attaches over a user-owned folder whatever its flag
+  (plain, `sappnd`, `schg`), and over a folder in use. No flag refuses a
+  mount; verify names one (below).
+- Root clears and sets both flags live at securelevel 0. Older sources
+  say `schg` clears only in single-user mode; at securelevel 0 it does not.
+- Root cannot chown, chmod or rename a `schg` file. So a seal cannot flag
+  a root-owned copy first and hand it over afterwards.
+- `RENAME_SWAP` from root-only staging into a user folder works and leaves
+  the old inode at the staging name. It is refused while the target or the
+  staged file has `schg`, or the folder has `sappnd`, so the helper lifts
+  those inside its window. `fchflags` on the held descriptor works after
+  the swap.
+- Flags do NOT inherit: contents of existing children stay writable --
+  which is why a named folder is sealed **recursively**.
 - `sappnd` dir = create-allowed / replace-denied; `sappnd` file =
   append-only. `schg` = total freeze.
-- ACLs were evaluated and rejected for the anchor problem: the owner can
-  always rewrite their own node's ACL, so self-deny entries are advisory.
-  Flags are primary.
-- On a node the user does NOT own, an ACL entry is binding: only the owner
-  or root may change an ACL. A placement dir's add-only entry (probed
-  2026-09-15, 41/0): adds work, new entries take the dir's group and no
-  ACL, grandchildren too; rename/delete/replace stay denied under the flag,
-  and a delete entry the user puts on their own file does not beat it; the
-  user cannot strip the entry, add delete_child, clear the flag or chmod.
-  With the flag off the entry alone still refuses a rename (no
-  delete_child), though a delete entry on the user's own file then does
-  delete it -- the flag stays the guard. `test -w` says yes.
-  `chmod +a` merges a new allow entry into an existing one for the same
-  principal, and `-a` removes rights from it (fails when none match).
 - `st_dev` is not a volume key: APFS assigns it at mount, in mount order.
   It changed across a reboot on 2026-09-09, and `/` and `~` share one this
   boot (firmlinks) while their volume UUIDs differ. Identity is volume UUID
@@ -57,98 +70,140 @@ Probed facts the tiers rest on:
   containing volume for any path or descriptor, and devfs answers with
   nothing, which is why the `st_dev` spelling survives as a fallback.
 
-## Placement access: an ACL entry, not a group
+### Copy-and-swap
 
-The owner has to be the lock account (`uappnd` is a user flag its owner can
-clear), which leaves the user outside the directory. The way back in is one
-ACL entry naming the user: the rights the owner bits gave them, minus
-delete, delete_child and every write over the directory's own metadata, no
-inherit flags. Group and mode are left alone, and so are ACL entries already
-there (`~/Library` carries Apple's `group:everyone deny delete`). The record
-keeps the entry; verify checks it and the group; a release takes off that
-entry only. A candidate that already has an entry naming the user is
-refused, since `chmod +a` would merge the two.
+A file is never sealed as the inode it was. The helper copies it into
+root's staging (data, xattrs, ACL, owner, group, mode, atime, mtime,
+birthtime, the `nodump` and `hidden` flags), then, inside a window on the
+held parent, swaps the copy in with `renameatx_np(RENAME_SWAP)` and checks
+that the swapped-out inode is the one it opened and that the original's
+size and mtime did not move during the copy; otherwise it swaps back and
+refuses. Then it flags the copy through its held descriptor. The staged
+original is unlinked at the end, whatever the outcome. A refused seal does
+not swap back files already done: each stays the copy, the same bytes and
+attributes on a new inode.
 
-Before 0.14.0 the way in was group `rwx` for the lock group. A new entry
-takes its parent directory's group on macOS, as on every BSD, so everything
-created under a seal took the lock group, and everything under that; a
-sweep reset the strays and they came back. The README section "How you get
-into a placement directory" has the user-facing account. The 0.13.0 ->
-0.14.0 cut converted the live placement directories once, with a script
-kept outside the tool; a placement record without the entry is drift, and
-no lock plan reseals it.
+The fingerprint (sha256) of each file is printed from the copy before the
+swap, and `install` prints the same for the staged file it installs. So
+the baseline is what the helper held, never a later read, and a write that
+races the swap-to-flag instant shows as content drift at the next verify
+instead of becoming the baseline.
+
+**Writer scan.** After every seal and install the helper walks every
+process (libproc: `proc_listallpids`, `PROC_PIDLISTFDS`,
+`PROC_PIDFDVNODEPATHINFO`), matches the sealed file's volume and inode,
+and reports any descriptor opened for writing: a `writer` line with pid
+and program, exit 8 (done, but a writer holds the new file). Two blind
+spots, by construction: a writable shared mapping whose descriptor was
+closed within the instant, and a descriptor in flight in a Unix-socket
+message. Mapping detection was dropped on purpose: region data cannot tell
+a shared writable mapping from a written private one. The fingerprint
+catches any write either one makes.
+
+What the swap costs: a new inode. A hard link elsewhere keeps the old one,
+and the plan says so before the question.
+
+### Why not a lock account any more
+
+Up to 0.16 a sealed file or folder belonged to a lock account
+(`_<user>-lock`) with the user flag `uchg`, and a chain folder too, with
+`uappnd` and one add-only ACL entry for the user (before 0.14.0, group
+`rwx` for a lock group, which leaked the group onto everything created
+underneath). A user flag binds only on a node the user does not own, so
+the account was what made the flag hold. Only `~` and `~/.ssh` kept the
+user's ownership, with a system flag, because the OS checks their owner.
+
+The 2026-10-26 study found that system flags on user-owned nodes give the
+same binding, so every node can be sealed the way `~` already was. What
+that removed: the account and its group, the provisioning, the ACL entry
+machinery, the three tiers, and every owner hand-off in the helper. What
+it cost, and how each is met:
+
+- **Held write descriptors.** Under the account a first seal had the same
+  gap (a chown revokes no open descriptor); under one method every install
+  (edit, revert) would too. Copy-and-swap plus the writer scan closes it
+  for both.
+- **Mount-over.** Any folder the user owns takes a disk image over it. The
+  account had closed that for chain folders, never for `~`, which shadows
+  everything below it anyway. So one method adds mount points but no new
+  reach; verify's mount check names a mount on any sealed path.
+- **The install window.** Under the account the folder an edit installed
+  into was closed to the user while its flag was off. Now the folder is
+  the user's while the helper's window is open, so the helper diffs its
+  entries across the window, as `rm` and `mv` always did.
+
+0.17.0 converts every 0.16 pool once, at the first root run (below).
 
 ## Chain-walking
 
-You name what to protect; `locked lock <leaf>` derives and provisions the
+You name what to protect; `locked lock <leaf>` derives and seals the
 **entire chain** for it in one ceremony:
 
-1. The leaf's tier follows its path: `anchor` for `~` itself and anything
-   under `~/.ssh` (the OS identity-checks those, so their owner must never
-   change), `content` for everything else. There is no tier option.
-2. **The leaf's own parent is not provisioned; the chain begins at the
-   grandparent.** The anchor is the exception and stays in the chain
-   wherever it sits, `$HOME` as a leaf's own parent included.
-3. Every ancestor from there up that the invoker owns gets `placement` --
-   except `$HOME` and `~/.ssh`, which get `anchor` (`sappnd`; ownership
-   must not change).
-4. Ancestors already in the pool (meta exists) are verified, not
-   re-provisioned. The walk stops at the first node owned by neither the
-   invoker nor the lock account; that node must be root-owned with no
-   group/other write (`/Users` on stock macOS) or the lock is refused.
+1. The leaf's kind follows the node: a file, a symlink, `~` or `~/.ssh`
+   on its own, or any other folder, sealed whole. There is no tier option;
+   `--flag` picks `schg` or `sappnd` for a file, `~` or `~/.ssh`.
+2. **The leaf's own parent is not sealed; the chain begins at the
+   grandparent.** `~` and `~/.ssh` are the exception and stay in the chain
+   wherever they sit, `$HOME` as a leaf's own parent included.
+3. Every ancestor from there up that the invoker owns gets `sappnd`.
+4. Ancestors already in the pool (record exists) are verified, not
+   re-sealed. The walk stops at the first node the invoker does not own;
+   that node must be root-owned with no group/other write (`/Users` on
+   stock macOS) or the lock is refused.
 5. **Nothing is touched until the whole ceremony is derived.** Every
    refusal is raised in that pass; then the diff witness, then the plan --
-   one line per node, root-most first, the ones that need nothing shown as
-   `already locked`, and any directory the pool no longer needs as a
+   one line per node, root-most first (`seal schg`, `seal sappnd`,
+   `relock`, `reflag (old → new)`, and the ones that need nothing shown as
+   `already locked`), and any directory the pool no longer needs as a
    `release` row with its reason on the line below it -- and then one
    `[y/N]` for the lot, under a `path:` row naming the leaf and a line
    saying what a yes does (`This seals 2 nodes and releases 1
    directory.`). The question holds no value and is one verb and its noun
    (`seal this path as listed?`, or `apply the plan for this path?` when
-   the leaf's chain is already whole). Declining changes nothing at all. `--yes`
-   answers that gate, `--dry-run` prints the plan and stops before it. Each
-   seal used to ask for itself, which meant declining an ancestor left the
-   leaf sealed under a parent nobody had protected. The only question left
-   after the gate is the alarm a node raises when its identity changed
-   during an unlock window: an anomaly, not a step in the plan.
+   the leaf's chain is already whole). Declining changes nothing at all.
+   `--yes` answers that gate, `--dry-run` prints the plan and stops before
+   it. Each seal used to ask for itself, which meant declining an ancestor
+   left the leaf sealed under a parent nobody had protected. The only
+   question left after the gate is the alarm a node raises when its
+   identity changed during an unlock window: an anomaly, not a step in the
+   plan.
 
 A chain directory is never named. `lock` refuses a path whose record is a
-placement chain node: protecting it as content would freeze everything
-inside it, which is a different seal altogether.
+chain node: protecting it as a folder would freeze everything inside it,
+which is a different seal altogether.
 
 ### Why the leaf's parent is left out
 
 A node is held in place by one of exactly two things: its own flag -- XNU
 refuses `unlink` and `rename` of a vnode carrying `IMMUTABLE` or `APPEND`
 -- or an append-only parent, since entries of such a directory cannot be
-removed or renamed. The leaf holds itself (`uchg`, or the anchor's system
-flag). The leaf's parent is held by the *grandparent's* `uappnd`. Every
-ancestor above that needs its own flag for its own entry, and that same
-flag pins the entry below it. So a placement seal on the leaf's parent
-added nothing at all to the leaf's protection. For the same reason the
-chain it leaves is the smallest one that holds the path: drop any node
-from the grandparent up and that level can be renamed away.
+removed or renamed. The leaf holds itself (`schg`). The leaf's parent is
+held by the *grandparent's* `sappnd`. Every ancestor above that needs its
+own flag for its own entry, and that same flag pins the entry below it. So
+a seal on the leaf's parent added nothing at all to the leaf's
+protection. For the same reason the chain it leaves is the smallest one
+that holds the path: drop any node from the grandparent up and that level
+can be renamed away.
 
 It did break the software that owns that directory. Claude Code takes an
 OAuth refresh lock with `mkdir ~/.claude/.oauth_refresh.lock` and releases
-it with `rmdir`; under `uappnd` the `rmdir` is refused, so the stale lock
-could never be cleared, token refresh failed, and the user was logged out
-at every expiry (observed 2026-09-15, the lock dir dated minutes after the
-seal). Every temp+rename save in that directory stranded its temp for the
-same reason.
+it with `rmdir`; under an append-only flag the `rmdir` is refused, so the
+stale lock could never be cleared, token refresh failed, and the user was
+logged out at every expiry (observed 2026-09-15, the lock dir dated
+minutes after the seal). Every temp+rename save in that directory
+stranded its temp for the same reason.
 
-**The anchor is exempt.** `~` and `~/.ssh` stay in the chain wherever they
+**`~` and `~/.ssh` are exempt.** They stay in the chain wherever they
 sit, including as a leaf's own parent, which every shell startup file
-(`~/.zshrc`, `~/.bashrc`, ...) makes them. An anchor never changes
-ownership, so it costs its owner nothing; and under this very rule its
+(`~/.zshrc`, `~/.bashrc`, ...) makes them. Under this very rule their
 `sappnd` is what holds the leaf parents one level down -- `~/.claude`,
-`~/.config` -- in place. Skipping it would take the load-bearing node out
-of every chain below it.
+`~/.config` -- in place. Skipping them would take the load-bearing node
+out of every chain below it.
 
-Known cost, accepted: a non-root mount needs a user-owned mountpoint, so a
-user-owned leaf parent can be shadowed by a mount. `$HOME` -- anchor tier,
-never re-owned -- already can, so that whole class is closed by a
-mount-table check and not by this tier.
+Known cost, accepted: a disk image can be attached over any folder its
+user owns, flag or no flag, so a chain folder or the leaf's parent can be
+shadowed by a mount, as `~` itself always could. verify names a mount
+over a sealed path; no flag can refuse one.
 
 ## The pool is what you asked to protect
 
@@ -159,15 +214,13 @@ the chains of its live leaves (locked, unlocked, or suspended in the trash,
 since Put Back can return them to the path their chain pins), and a chain
 record outside that union protects nothing.
 
-So every gated verb plans releases alongside its own work: `lock`, the new
+So every gated verb plans releases alongside its own work: `lock`,
 `unprotect`, `rm` (in its existing question, applied once the removal has
 happened), and the lock plan `mv` runs for each leaf it moved. A release
-clears the flag, takes off the seal's ACL entry, and restores owner, group
-*and* mode from the record, then retires the record with `via=unneeded`.
-That is deliberately unlike `unlock` of a placement node, which keeps
-lock-account ownership and the entry because the seal is coming back.
-An anchor chain node loses only its flag. Each release row carries its
-reason as a word in the plan's qualifier column, before the path:
+clears the flag through the helper and retires the record with
+`via=unneeded`; nothing else about the folder was ever changed. Each
+release row carries its reason as a word in the plan's qualifier column,
+before the path:
 
 - `kept` when the directory still holds a protected file -- without it,
   the row reads as if that file needed it -- with a dim line under the
@@ -184,12 +237,12 @@ live record with no role, or a live leaf whose chain cannot be derived
 
 `unprotect <leaf>` is the permanent counterpart of `lock`. `unlock` is the
 edit window and keeps the record, the snapshot and the chain; `unprotect`
-ends the protection -- flag off, the pre-lock identity back, the record
-retired with `via=unprotect` -- and releases the chain nodes nothing else
-needs, under one question (`stop protecting this path?`, under a `path:`
-row naming the leaf and the line `This also releases 2 directories.`). Protecting that path again later is a first seal: a retired
-record is history, so the identity comes from the live node and the
-snapshot is taken fresh.
+ends the protection -- flag off, the record retired with `via=unprotect`
+-- and releases the chain nodes nothing else needs, under one question
+(`stop protecting this path?`, under a `path:` row naming the leaf and the
+line `This also releases 2 directories.`). Protecting that path again
+later is a first seal: a retired record is history, so the record is
+taken from the live node and the snapshot is taken fresh.
 
 `trash`, `tombstone` and `rekey` plan no releases. A trashed leaf still
 counts until verify finalizes it, and the other two are record repairs.
@@ -197,14 +250,13 @@ The directories they leave unneeded are released by the next gated plan;
 until then the pool listing names them.
 
 The 0.12.0 -> 0.13.0 cut added the field; the live pool was converted once
-by hand (content -> leaf, placement -> chain, anchor directory -> chain,
-anchor file -> leaf). verify reports a live record without a role as drift.
+by hand. verify reports a live record without a role as drift.
 
-#### The deployed pool under the rule (2026-09-15)
+#### The deployed pool under the rule
 
 | Node | Role | Why |
 |---|---|---|
-| `~` | chain (anchor) | in every chain below it |
+| `~` | chain | in every chain below it |
 | `~/.zshrc` and the other startup files | leaf | named |
 | `~/.claude` | none | leaf parent of `~/.claude/settings.json`, nothing else's ancestor |
 | `~/.claude/settings.json` (symlink) | leaf | named |
@@ -218,21 +270,21 @@ anchor file -> leaf). verify reports a live record without a role as drift.
 
 A **symlink argument names the link, not its target.** The parent is
 canonicalized and the link's own name is kept, so the link node itself is
-what gets sealed -- content tier, the only tier that applies to a link,
-since every OS identity check resolves the path and judges the target (a
-link under `~/.ssh` too). The link node is precisely what a
-same-UID process can re-point, which is what sealing the target left open.
-The target keeps its own ownership and takes its own record if you name it
-too. A dangling link is sealed the same way: its target may arrive later,
-and whether the link is worth sealing meanwhile is your call, not the
-tool's -- the witness above the plan notes that the target is missing.
+what gets sealed (`schg`, set with `lchflags`), since every OS identity
+check resolves the path and judges the target (a link under `~/.ssh`
+too). The link node is precisely what a same-UID process can re-point,
+which is what sealing the target left open. The target takes its own
+record if you name it too. A dangling link is sealed the same way: its
+target may arrive later, and whether the link is worth sealing meanwhile
+is your call, not the tool's -- the witness above the plan notes that the
+target is missing.
 
 `locked status <leaf>` verifies the FULL chain: per level owner, group,
-mode, exact flag word vs meta, and volume-uuid/inode identity. `locked unlock`
-releases only the named node (`--chain` additionally drops the flags on
-the chain's ancestors, for edits that need a rename into a frozen parent
--- atomic-save editors); the next `lock` re-walks and re-seals the chain
-in reverse.
+mode, exact flag word vs the record, volume-uuid/inode identity and mount
+point. `locked unlock` releases only the named node (`--chain`
+additionally drops the flags on the chain's ancestors, for edits that need
+a rename into a frozen parent -- atomic-save editors); the next `lock`
+re-walks and re-seals the chain in reverse.
 
 ## Guarantees and limits by verb
 
@@ -249,15 +301,25 @@ process running as the invoker can read or rewrite that copy while the
 editor is open. That is the same exposure `sudoedit` has, and the reason
 the copy is never the thing that installs. When the editor exits (with
 `--from`, right away) the bytes are read as the invoker and written into
-root-held staging. **Everything after that reads
-the frozen bytes**: the no-change check, the diff, the confirm gate, the
-install. Nothing that happens to the copy or the proposal after the diff
-is on screen can change what gets installed.
+root's staging. **Everything after that reads the frozen bytes**: the
+no-change check, the diff, the confirm gate, the install. Nothing that
+happens to the copy or the proposal after the diff is on screen can change
+what gets installed.
 
 The candidate carries content and nothing else, because it was read with
 `cat`. Extended attributes and ACLs are re-applied onto it from the
 sealed file (`xattrs-from`), never taken from the copy, so quarantine and
 ACL metadata survive an edit and the copy cannot smuggle any in.
+
+The install is the helper's `install` verb: the staged file, given the
+sealed file's owner, group and mode while still in staging, is swapped in
+for the sealed node (which must be the recorded inode) inside a window on
+the held parent, flagged through its descriptor, and followed by the entry
+diff and the writer scan. Then `edit` checks the result against what was
+approved: the fingerprint taken in staging, owner, mode, flag, and the
+folder's flags as before. A difference fails the edit and stays on the
+record as a `mismatch` line, which verify and status report as drift until
+an edit of that file installs cleanly or the record is sealed afresh.
 
 ### `unlock` and relock are detection, not prevention
 
@@ -267,30 +329,37 @@ shows what changed during the window; it does not stop it, and any reader
 in that window sees the unlocked content. `edit` is the preferred path
 because it has no window. `unlock` exists for what `edit` cannot serve:
 tools that must rename into the directory (atomic-save editors, via
-`--chain`), and edits inside a content-tier directory tree.
+`--chain`), and edits inside a folder sealed whole.
 
-### The anchor node stays mountable-over (measured 2026-09-12)
+### Any folder you own can be mounted over (measured 2026-09-12 and 2026-10-26)
 
 A user can attach a disk image over a directory
-(`hdiutil attach -mountpoint <dir>`) only where the user owns that
-directory. A placement-tier directory is owned by the lock account, so a
-mount over it is refused with "Permission denied". The anchor tier leaves
-ownership unchanged -- that is the tier's whole point, the node is the
-user's home -- so **the anchor node itself can still be mounted over**. A
-mount there shadows the entire tree by path: a reader resolving by path
-sees the image's content, and detaching afterwards leaves nothing the
-seal can show. This is a by-path substitution no flag closes. A
-mount-table check is an idea, not a decision.
+(`hdiutil attach -mountpoint <dir>`) wherever the user owns that
+directory, whatever its flag, and over a folder in use. Every sealed
+folder is the user's, so every one of them, and `~` above them all, can
+be mounted over. A mount there shadows the tree by path: a reader
+resolving by path sees the image's content, and detaching afterwards
+leaves nothing the seal can show. This is a by-path substitution no flag
+closes.
 
-### Placement under an atomic-save writer strands a temp per save
+What locked does: each record keeps the mount point its path resolved
+into at the seal (`f_mntonname` of the volume holding a folder, or a
+file's or link's folder, from the helper's `mount` verb), and verify and
+status compare it. A different volume over the path, or over any folder
+above it, is drift, named with the mount point. The kernel's mount table
+cannot be faked by a process running as the user. What it misses: a mount
+attached and detached between two looks. A root daemon watching for
+mounts (kqueue `EVFILT_FS`, `VQ_MOUNT`) is an idea, not a decision.
 
-A placement seal puts `uappnd` on the directory, which lets a writer
-create a new file but not rename over the sealed one. A temp+rename
-writer therefore leaves its temp beside the target on every save, named
+### An atomic-save writer in a chain folder strands a temp per save
+
+A chain seal puts `sappnd` on the directory, which lets a writer create a
+new file but not rename over an existing one. A temp+rename writer
+therefore leaves its temp beside the target on every save, named
 something like `<file>.tmp.<pid>.<hex>`. Measured on Claude Code's
 `.claude.json`: roughly 250 KB of strand per save, with the writer's
 in-place fallback keeping the state itself correct. The directory's
-`uappnd` refuses the unlink too, so the user cannot remove them. Cleanup
+`sappnd` refuses the unlink too, so the user cannot remove them. Cleanup
 is one command, and it takes a glob because `rm`, `trash`, `lock` and
 `unlock` all accept many paths in one batch:
 
@@ -298,14 +367,11 @@ is one command, and it takes a glob because `rm`, `trash`, `lock` and
 sudo locked rm DIR/NAME.tmp.*
 ```
 
-(`trash` is refused here: the trash service moves an entry as you, and a
-placement directory's ACL entry does not let you remove one.)
-
 There is no automatic janitor, by design: a verb that deletes files it
 was never handed is not something `locked` does.
 
 The leaf-parent rule removes the common case: a sealed file's own
-directory is no longer sealed, so an atomic-save writer beside it renames
+directory is not sealed, so an atomic-save writer beside it renames
 normally and strands nothing. What remains is a chain directory -- one
 that is a higher ancestor of some protected file -- with an atomic-save
 writer of its own inside it.
@@ -371,41 +437,83 @@ either fails closed or approves blind; there is no third behaviour. A
 diff is only a witness while a human is reading it, so the mutating verbs
 belong in a real terminal.
 
-## Detection layer: `locked verify` + the verify status
+## Detection layer: `locked verify` and `locked status`
 
-Flags deny with silent EPERM -- the attacker sees the failure, the user
-does not. `locked verify` re-checks every locked chain (existence, owner,
-group, mode, full flag word, recursive-tree spot checks) and exits
-nonzero on drift; it also catches a ceremony that forgot to relock. A
-root LaunchDaemon runs it on a timer, and each run records its result per
-user in `/var/db/locked/<user>/verify`: when it ran, the timer's interval,
-how many records it walked, how many drifted, and which (escaped to
-printable ASCII, capped). locked names no consumer. `locked status` shows
-it, and any other reader -- a statusline, a login check -- knows the path.
+Flags deny with silent EPERM -- the process that was refused sees the
+failure, the user does not. `locked verify` re-checks every locked chain
+and exits nonzero on drift; it also catches a ceremony that forgot to
+relock. Per node it compares, against the record: owner, group and mode
+(a seal never changes them, so they must match exactly), the whole flag
+word (a user flag added on top of the system one is drift), volume-uuid
+and inode identity, the mount point, and, for a sealed file or folder,
+the content against the fingerprints taken when it was sealed. A folder
+sealed whole also gets a stray scan: any node in it not owned by the
+recorded owner or without the seal's flag.
 
-The status is root's alone. The per-user dir is root-owned 750 with the
-lock group, so the user reads it through their membership and no process
-running as the user can write, replace or remove anything in it; the file
-is replaced whole by a rename from a temp in that dir, so a reader gets
-one run's complete answer. The run's start time is in the file because a
-timer can stop: a reader that finds the result older than a few intervals
-reports it as stale rather than clean. (Until 0.15.0 the result was an
-alert file written as the user under their home, which any process
-running as the user could delete.)
+verify runs when someone runs it. Nothing schedules it, and it keeps no
+result: the seals hold whether or not anyone looks, as every other setup
+on the machine is trusted to. (0.15 and 0.16 ran it from a root
+LaunchDaemon every 15 minutes and kept the last result in a status file
+for other tools; 0.17.0 dropped both.)
+
+The fingerprints are root's alone, so only root compares content.
+`locked status` without sudo checks every other field live, leaves the
+content out, gives a folder sealed whole leaf checks only (the stray
+scan sees nothing inside a folder whose modes deny the caller), and says
+so in a note. `sudo locked status` is the authoritative view.
 
 Root runs take turns on one lock (`/var/db/locked/run.lock`, flock(2),
 root 600). Without it a verify could read a record or node halfway through
-a ceremony and report drift that is not there, two ceremonies could plan
-against one pool at once (one releasing a chain node the other's new leaf
-needs), and an older verify finishing last would overwrite a newer run's
-status. The lock is held from the root convergence to exit, gates and the
-editor included, because a plan made under the lock has to be the one
-applied; an open ceremony therefore pauses the timer's verify, which the
-status shows as stale once it lasts three intervals.
+a ceremony and report drift that is not there, and two ceremonies could
+plan against one pool at once (one releasing a chain node the other's new
+leaf needs). The lock is held from the root convergence to exit, gates
+and the editor included, because a plan made under the lock has to be the
+one applied; an open ceremony therefore makes a verify wait.
 
-What this does not cover: a reader sees drift only as of the last run, up
-to one interval late, and while the machine sleeps nothing runs.
+What this does not cover: drift is seen only when someone looks, and a
+mount attached and detached between looks is never seen.
 EndpointSecurity/eslogger EPERM-monitoring is explicitly later.
+
+## State
+
+`/var/db/locked` is root:wheel 711. Each user's dir and its `pool/` are
+root:wheel 700 with one ACL entry for that user,
+`user:<inv> allow list,search,readattr,readextattr,readsecurity`; each
+record is root 600 with `user:<inv> allow read,readattr,readextattr,
+readsecurity`, put on the temp file before its rename. Fingerprints
+(`.sum`), snapshots, the attic and staging are root's with no entry. So
+the user reads their own records without sudo, another user's are refused
+by the kernel, and nothing running as any user can write any of it.
+
+The fingerprints sit beside the record, not in it, because a record is
+readable by anything running as its user: a stored sha256 there would let
+such a process confirm a guess at a short secret in a file long deleted.
+No keyed hash is used; root-only placement is the whole defense.
+
+### One-shot conversion from 0.16
+
+The first root run of 0.17.0 converts every pool still in the 0.16 shape
+(a record carrying `tier=`), under the run lock and before any verb runs.
+The per-user dir and pool become root:wheel with their read entries, and
+0.16's verify status file is removed. Then each record, leaves first and
+chain folders deepest first, through the helper on the node's own
+descriptor: content fingerprinted while still sealed, the old flag
+(`uchg`, `uappnd`) cleared, the chain folder's ACL entry removed, owner,
+group and mode set back to the recorded ones, the new seal applied (a file
+or folder by copy-and-swap), content fingerprinted again and compared; a
+difference becomes a `mismatch` line. A record of 0.16's anchor tier
+(`~`, `~/.ssh` and the files under it) keeps its node and its flag; a file
+there gains a fingerprint, not a new inode. An unlocked record, retired
+history and a node that is gone change on disk not at all; only the
+record is rewritten. The record is rewritten without
+`tier`, `lockmode` and `acl`. A record that fails stays exactly as it was,
+is named, and is tried again on the next root run; until then only the
+conversion rewrites it, and verify reports it as drift.
+
+When none is left, the lock account owns nothing locked made, and the
+user deletes the account and its group by hand (nix-darwin never deletes
+ids <= 501). TODO 0.18.0: remove the conversion, with the helper's
+`--chown`, `--mode` and `--acl-remove` on unseal that only it uses.
 
 ## Kept from v1
 
@@ -413,17 +521,19 @@ EndpointSecurity/eslogger EPERM-monitoring is explicitly later.
   enforced by sudo before our code runs; a swapped binary gets a silent
   refusal, not a Touch ID prompt.
 - Snapshot / diff / revert flow and the `.snap`/`.attic`/`.meta` layout;
-  meta gains `tier`, `flag`, the exact post-lock flag word, and the
-  volume-uuid/inode identity.
-  v1 metas are not migrated -- v1 was never provisioned.
-- Root-sudo invocation model for every mutating action. The two-tier
-  draft's no-root runas (`(_<user>-lock)`) multiuser path is deferred:
-  the anchor tier needs root regardless, and one elevation path is
-  simpler to audit. `status` alone runs unprivileged (read-only; the
-  pool's own permissions gate what each user sees).
-- `atomic_replace` staging (now flag-aware: clears/restores flags on dst
-  and temporarily lifts `uappnd` on the destination parent around the
-  rename, restoring it even on failure).
+  the record gains `flag`, the exact post-seal flag word, the
+  volume-uuid/inode identity and the mount point, and `.sum` sits beside
+  it.
+- Root-sudo invocation model for every mutating action. A no-root
+  multiuser path is not needed: a system flag needs root to set, and the
+  owner gate bounds root to what the invoker could do. `status` and `why`
+  alone run unprivileged (read-only; the pool's own permissions gate what
+  each user sees).
+- Every file root puts in the user's space is installed inside the
+  helper's window on the held parent: staged in root-only staging with
+  its final owner and mode, swapped or renamed in, flagged through its
+  descriptor, the parent's flag restored, its entries diffed, writers
+  scanned.
 
 ## Caveats
 
@@ -435,19 +545,24 @@ EndpointSecurity/eslogger EPERM-monitoring is explicitly later.
 - **The rename hole partially reopens during a `--chain` window**: a
   released ancestor can be swapped by anything with write on its parent
   (rename checks parent write only). Locked leaves keep their own flags
-  throughout, and re-seal refuses to bless a swapped placement/anchor
-  node without a human at a tty (`--yes` deliberately does not satisfy
-  that prompt); `verify` checks the identity against meta. Keep windows
-  short; prefer `locked edit`.
-- **Parent-swap above the anchor is out of scope by construction**: the
-  chain terminates at a root-owned dir, so there is no user-writable
-  ancestor left to swap. What remains is the standing floor: pinned
-  ceremonies never trust the terminal; terminal hardening protects
-  orientation.
+  throughout, and re-seal refuses to bless a swapped chain folder, `~` or
+  `~/.ssh` without a human at a tty (`--yes` deliberately does not satisfy
+  that prompt); `verify` checks the identity against the record. Keep
+  windows short; prefer `locked edit`.
+- **Parent-swap above `~` is out of scope by construction**: the chain
+  terminates at a root-owned dir, so there is no user-writable ancestor
+  left to swap. What remains is the standing floor: pinned ceremonies
+  never trust the terminal; terminal hardening protects orientation.
 - `sappnd` on `~` does not stop *creates*: absent exec-class dotfiles must
-  be created empty and content-locked first (ceremony pre-work).
+  be created empty and locked first (ceremony pre-work).
 - Flags are invisible to `ls` without `-lO`; `locked status` is the
   intended lens.
+- iCloud Drive keeps no BSD flag, `schg` included
+  ([eclecticlight 2026-06-02](https://eclecticlight.co/2026/06/02/bsd-flags-are-incompatible-with-icloud-drive/)).
+  Finder's "Locked" checkbox is `uchg`
+  ([eclecticlight 2026-05-30](https://eclecticlight.co/2026/05/30/protect-files-with-the-locked-or-immutable-flag/));
+  what Get Info shows for `schg` is not checked. How Time Machine restores
+  a `schg` file: not found, unverified.
 
 ## chflags invocation gotcha (probed)
 
