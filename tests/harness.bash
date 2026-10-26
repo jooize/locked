@@ -2712,7 +2712,15 @@ as_user ln -s "$LNKT" "$LNK"
 # The control for the denial below: unsealed, this is an ordinary swap.
 ok   "the invoker can repoint it while unsealed" as_user ln -sfn "$LNKT" "$LNK"
 
-ok   "lock --yes a link"                       locked lock --yes "$LNK"
+LNKRC=0
+locked lock --yes "$LNK" >"$OUTF" 2>&1 || LNKRC=$?
+check "lock --yes a link"                      "0" "$LNKRC"
+# The target is yours and unsealed, so the plan says the seal leaves it
+# open, with the command that closes that.
+ok   "the plan notes the target is not protected" grep -qF "what it points at is not protected" "$OUTF"
+ok   "  and names the target"                  grep -qxF "      $LNKT" "$OUTF"
+ok   "  and offers the command that protects it" grep -qF "sudo locked lock $LNKT" "$OUTF"
+ok   "  or both at once"                       grep -qF "sudo locked lock $LNK $LNKT" "$OUTF"
 check "the LINK node is sealed"                "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$LNK")"
 check "the target keeps its owner"             "$INV" "$(owner_of "$LNKT")"
 check "the target carries no flag"             "" "$(flags_of "$LNKT")"
@@ -2752,14 +2760,51 @@ check "and still points where it did"          "$LNKT" "$(readlink "$LNK")"
 ok   "relock the link"                         locked lock --yes "$LNK"
 check "the relocked link is sealed again"      "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$LNK")"
 ok   "verify clean after the round trip"       locked verify --quiet
-refuse "edit refuses a symlink"                "no content to edit" \
-       locked edit --yes --from "$LNKO" "$LNK"
-check "the refused link is untouched"          "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$LNK")"
 # Same one-node rule for revert: a link has no snapshot, and the file it
 # points at is not what was named.
 locked revert "$LNK" >"$OUTF" 2>&1 || true
 ok   "revert on a link finds no snapshot"      grep -qF "no snapshot to revert from" "$OUTF"
 check "the target content is untouched"        "target" "$(head -1 "$LNKT")"
+
+# The note stays quiet where its command cannot help or is already given:
+# a target named later in the same run, and one that is not yours. Dry
+# runs, so nothing here is sealed.
+LNK3="$LNKD/link3.txt"
+as_user ln -s "$LNKO" "$LNK3"
+locked lock --dry-run "$LNK3" >"$OUTF" 2>&1 || true
+ok   "a dry run notes the unprotected target"  grep -qF "what it points at is not protected" "$OUTF"
+locked lock --dry-run "$LNK3" "$LNKO" >"$OUTF" 2>&1 || true
+deny "no note when the run names the target too" grep -qF "what it points at is not protected" "$OUTF"
+LNKR="$SCRATCH/link-root-target.txt"
+printf 'root\n' >"$LNKR"
+as_user ln -sfn "$LNKR" "$LNK3"
+locked lock --dry-run "$LNK3" >"$OUTF" 2>&1 || true
+deny "no note for a target that is not yours"  grep -qF "what it points at is not protected" "$OUTF"
+as_user rm -- "$LNK3"
+
+# edit follows a link to the file it points at, as an editor does. The
+# file has to be sealed in your pool like any other: an unsealed target is
+# refused, and the sealed one is edited in place while the link stays as
+# it was. The diff names the file and the link it was reached through.
+refuse "edit through a link to an unsealed file" "not in pool" \
+       locked edit --yes --from "$LNKO" "$LNK"
+check "the unsealed target is untouched"       "target" "$(head -1 "$LNKT")"
+ok   "seal the target"                       locked lock --yes "$LNKT"
+LNKE="$LNKD/edit-from.txt"
+as_user /bin/sh -c "echo edited > '$LNKE'"
+LNKERC=0
+locked edit --yes --from "$LNKE" "$LNK" >"$OUTF" 2>&1 || LNKERC=$?
+check "edit through a sealed link succeeds"    "0" "$LNKERC"
+check "the target took the edit"               "edited" "$(head -1 "$LNKT")"
+ok   "the diff names the file"                 grep -qxF "file:      $LNKT" "$OUTF"
+ok   "  and the link it came through"          grep -qxF "via link:  $LNK" "$OUTF"
+check "the link still names its target"        "$LNKT" "$(readlink "$LNK")"
+check "the link node is still sealed"          "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$LNK")"
+check "the target is sealed again"             "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$LNKT")"
+ok   "verify clean after an edit through a link" locked verify --quiet
+ok   "unprotect the target"                    locked unprotect --yes "$LNKT"
+check "the target is back to the invoker"      "$INV" "$(owner_of "$LNKT")"
+as_user /bin/sh -c "echo target > '$LNKT'"
 
 # A dangling link is informed on, not refused: the target may arrive later
 # (a volume mounted, a file a first run creates), so whether the link is
@@ -2782,21 +2827,25 @@ check "the unlocked dangling link is back to the invoker" "$INV" "$(owner_of "$D
 check "and carries no flag"                    "" "$(flags_of "$DNG")"
 check "and still points where it did"          "$DNGT" "$(readlink "$DNG")"
 
-# Under ~/.ssh the path takes the anchor tier, and a link cannot: the OS
-# checks resolve the path, so they judge the target and never the link.
-# The ~/.ssh this needs is the one section 2 builds, sealed sappnd by an
-# anchor-tier leaf in it; this section has its own fake home, so it builds
-# the same shape here.
+# Under ~/.ssh a path takes the anchor tier, but a link takes content, as
+# it does everywhere: the OS checks resolve the path, so they judge the
+# target and never the link. The ~/.ssh this needs is the one section 2
+# builds, sealed sappnd by an anchor-tier leaf in it; this section has its
+# own fake home, so it builds the same shape here.
 as_user mkdir -m 700 -- "$FAKE_HOME/.ssh"
 as_user /bin/sh -c "printf 'Host example\n' > '$FAKE_HOME/.ssh/config'"
 ok   "an anchor-tier leaf seals ~/.ssh"        locked lock --yes "$FAKE_HOME/.ssh/config"
 LNK2="$FAKE_HOME/.ssh/link2"
 as_user ln -s "$LNKT" "$LNK2"
-refuse "a link under ~/.ssh is refused"        "does not apply to a link" \
-       locked lock --yes "$LNK2"
-check "the refused link keeps its owner"       "$INV" "$(owner_of "$LNK2")"
-deny "and got no record"                       test -f "$(meta_path "$LNK2")"
-ok   "the refused link leaves through rm"      locked rm --yes "$LNK2"
+ok   "a link under ~/.ssh is sealed"           locked lock --yes "$LNK2"
+check "as content: the lock account's, frozen" "$LOCK_ACCT uchg" "$(stat -f '%Su %Sf' "$LNK2")"
+check "the record names the content tier"      "content" "$(meta_get "$LNK2" tier)"
+check "the .ssh folder keeps its owner"        "$INV" "$(owner_of "$FAKE_HOME/.ssh")"
+check "and its anchor flag"                    "sappnd" "$(flags_of "$FAKE_HOME/.ssh")"
+deny "the invoker cannot repoint it"           as_user ln -sfn "$LNKO" "$LNK2"
+ok   "unprotect the ssh link"                  locked unprotect --yes "$LNK2"
+check "the link is back to the invoker"        "$INV" "$(owner_of "$LNK2")"
+ok   "the link leaves through rm"              locked rm --yes "$LNK2"
 
 note "lock: the plan is derived first and gated once"
 # Every seal used to ask for itself, so declining an ancestor left the leaf

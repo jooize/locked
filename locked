@@ -526,7 +526,9 @@ usage: sudo locked <action> [options] [args]
       diff, then the plan -- one line per node, root-most first -- then
       ONE question for the lot. --yes answers it (required when stdin is
       not a tty); --dry-run prints the plan and stops. A symlink argument
-      seals the LINK, not its target.
+      seals the LINK, not its target, and takes the content tier, under
+      ~/.ssh too; the plan says when the target is yours and not
+      protected.
       --flag sappnd|schg                 anchor flag (default sappnd)
   unprotect [--yes] [--dry-run] <path>...
       Stop protecting a path you locked: its flag comes off, its owner,
@@ -554,6 +556,8 @@ usage: sudo locked <action> [options] [args]
       record, and a file that does not exist yet there is created and
       sealed (the diff shows its whole content). Revert does not apply
       to those: they have no snapshot of their own.
+      A symlink is followed to the file it points at, as an editor
+      follows it; the diff and the question name both.
   revert [--dry-run] <path>...
       Files only: save current to .attic, restore snapshot, re-seal if
       the file was locked.
@@ -2889,8 +2893,9 @@ diff_filter() { env -i /usr/bin/perl -e "$UNTRUSTED_PL" -- lines "$1" "${2:-0}";
 # candidate's bytes, and a soft-wrapped line of it restarts at column 0,
 # where it could pose as one of the rows or the question below
 # (terminal-output, third-party text has no position).
-show_diff() { # <rule> <row label> <path> <old> <new> <old-label> <new-label>
+show_diff() { # <rule> <row label> <path> <old> <new> <old-label> <new-label> [<via label> <via path>]
   local label="$1" rowlabel="$2" path="$3" raw enc why rc=0 lines dcolor shown=0
+  local vialabel="${8:-}" viapath="${9:-}"
   shift 3
   raw="$(mktemp "${TMPDIR:-/tmp}/locked-diff.XXXXXX")" || return 1
   enc="$(mktemp "${TMPDIR:-/tmp}/locked-diff.XXXXXX")" || { rm -f -- "$raw"; return 1; }
@@ -2903,7 +2908,7 @@ show_diff() { # <rule> <row label> <path> <old> <new> <old-label> <new-label>
     return 1
   fi
   rm -f -- "$why"
-  diff_header "$label" "$rowlabel" "$path"
+  diff_header "$label" "$rowlabel" "$path" "$vialabel" "$viapath"
   if [ "$rc" -eq 0 ]; then
     echo "(no changes)"
     rm -f -- "$raw" "$enc"
@@ -2952,16 +2957,23 @@ show_diff() { # <rule> <row label> <path> <old> <new> <old-label> <new-label>
   return 0
 }
 
-# diff_header <rule> [<row label> <path>]: the section rule over a diff
-# witness, holding locked's own words only, then the path it is about on a
-# row of its own -- a path ends its line, so it never sits inside the rule
-# -- directly above the diff or the gate that offers it. Without a row
-# label the rule stands alone: the caller's question rows, right below it,
-# name the path, and a row already on screen is not printed again.
+# diff_header <rule> [<row label> <path> [<via label> <via path>]]: the
+# section rule over a diff witness, holding locked's own words only, then
+# the path it is about on a row of its own -- a path ends its line, so it
+# never sits inside the rule -- directly above the diff or the gate that
+# offers it, and under it the link the path was reached through, if any.
+# Without a row label the rule stands alone: the caller's question rows,
+# right below it, name the path, and a row already on screen is not
+# printed again.
 diff_header() {
   set_pal
   printf -- '%s--- %s ---%s\n' "$P_B" "$1" "$P_OFF"
-  [ -z "${2:-}" ] || value_rows "" "$2" subject "$3"
+  [ -n "${2:-}" ] || return 0
+  if [ -n "${5:-}" ]; then
+    value_rows "" "$2" subject "$3" "$4" id "$5"
+  else
+    value_rows "" "$2" subject "$3"
+  fi
 }
 
 # ---- planning --------------------------------------------------------------
@@ -3072,10 +3084,14 @@ plan_tree_refusals() {
 #   - A symlink inside a folder, on its first seal: the link is sealed as a
 #     link, and what it points at is not sealed at all. Said once, when the
 #     folder is adopted, rather than on every relock.
+#   - A symlink named on its own: see link_note.
 plan_notes() {
   local p="$1" first="$2" tier="$3" sp n i j c
   local -a hp=() hi=() hn=() outside=() links=()
-  [ -L "$p" ] && return 0
+  if [ -L "$p" ]; then
+    link_note "$p"
+    return 0
+  fi
   if [ ! -d "$p" ]; then
     n="$(stat -f '%l' "$p")" || return 0
     if [ "$n" -gt 1 ] && [ "$tier" = anchor ]; then
@@ -3120,6 +3136,35 @@ plan_notes() {
     path_lines "      " "${links[@]:0:5}" >&2
     [ "${#links[@]}" -le 5 ] || echo "      and $(( ${#links[@]} - 5 )) more" >&2
   fi
+}
+
+# link_note <link>: the seal is on the link, so what it points at stays as
+# open as it was. Said with the command that protects it, and only where
+# that command can work: the target exists, it is yours (the owner gate
+# refuses anything else, and a node the lock account owns is already
+# sealed, as a file in a sealed folder is), it has no live record, and no
+# later argument of this run names it. A missing target is the witness's
+# to say. Clobbers the snap_paths globals, then points them back at <link>.
+link_note() { # <link>
+  local l="$1" t a
+  t="$(readlink -f "$l" 2>/dev/null)" || return 0
+  [ -e "$t" ] || return 0
+  [ "$(stat -f '%Su' "$t")" = "$inv" ] || return 0
+  snap_paths "$t"
+  if record_live "$META"; then
+    snap_paths "$l"
+    return 0
+  fi
+  snap_paths "$l"
+  for a in "${PATHS[@]}"; do
+    [ -L "$a" ] && continue
+    [ "$(readlink -f "$a" 2>/dev/null)" = "$t" ] && return 0
+  done
+  echo "${E_YEL}note:${E_OFF} the seal is on the link; what it points at is not protected:" >&2
+  path_lines "      " "$t" >&2
+  cmd_rows "      " \
+    "sudo locked lock $(shq "$t")" "protects it too, after this" \
+    "sudo locked lock $(shq "$l") $(shq "$t")" "seals both in one run" >&2
 }
 
 # plan_node <path> <tier> [<anchor flagword>]: what sealing this node would
@@ -4471,8 +4516,13 @@ do_lock_one() {
   # must never change), content for everything else. There is no option: a
   # chain directory is never named -- it is derived from the leaves below it
   # (see plan_releases) -- and nothing else is a choice worth offering.
+  #
+  # A symlink takes the content tier wherever it is, ~/.ssh included. Every
+  # one of those identity checks resolves the path, so it judges the target
+  # and never the link, and content is the tier that seals a node as itself,
+  # which is the whole point of naming a link here.
   local leaf_tier=content
-  if [ "$f" = "$user_home" ] || [ "$under_ssh" -eq 1 ]; then
+  if [ "$is_link" -eq 0 ] && { [ "$f" = "$user_home" ] || [ "$under_ssh" -eq 1 ]; }; then
     leaf_tier=anchor
   fi
 
@@ -4492,24 +4542,12 @@ do_lock_one() {
     fi
   fi
 
-  # A symlink takes the content tier and no other. Anchor is for the nodes
-  # the OS identity-checks, and every one of those checks resolves the path,
-  # so it judges the target and never the link. Content is the tier that
-  # seals a node as itself, which is the whole point of naming a link here.
-  if [ "$is_link" -eq 1 ] && [ "$leaf_tier" != "content" ]; then
-    err_val "a symlink under ~/.ssh; the anchor tier does not apply to a link" "$f"
-    echo "         A link has no ownership the OS checks -- content is the only" >&2
-    echo "         tier that seals the link node itself. Name its target instead." >&2
-    log_action lock "$f" refuse-link-tier
-    return 1
-  fi
-
   # Anchor-flag default: sappnd, except regular files under ~/.ssh freeze
   # hard (schg) -- an append-only ssh config or authorized_keys is still an
   # injection surface. Explicit --flag overrides (the TOFU known_hosts file
   # WANTS sappnd).
   local leaf_flag="$OPT_FLAG"
-  if [ "$under_ssh" -eq 1 ] && [ "$OPT_FLAG_SET" -eq 0 ] && [ -f "$f" ]; then
+  if [ "$leaf_tier" = "anchor" ] && [ "$OPT_FLAG_SET" -eq 0 ] && [ -f "$f" ]; then
     leaf_flag=schg
   fi
 
@@ -5109,15 +5147,20 @@ drop_editdir() {
 # invoker can read. atomic_replace lifts append flags on the parent, so
 # no chain release is needed.
 do_edit_one() {
-  local f="$1"
-  # A symlink has no content of its own to put an editor on, and resolving
-  # through it would edit a file the caller did not name. Say which node is
-  # editable instead of quietly acting on another one.
+  local f="$1" link=""
+  # A symlink is followed, as an editor follows it: what gets edited is the
+  # file it points at, resolved once here. From then on everything works on
+  # that file -- its record, and the node pinned by id below -- so a link
+  # re-pointed mid-edit changes nothing, and a target that is not sealed in
+  # your pool is refused like any other file. The link is shown beside the
+  # file above the diff and the question, so the file you approve is never
+  # one you did not see named. A dangling link names a file to create, which
+  # only a sealed folder can take (below).
   if [ -L "$f" ]; then
-    say_err "skipped, a symlink has no content to edit; name the file it points at" "$f"
-    echo "  (re-pointing the link is a lock/unlock of the link node itself)" >&2
-    log_action edit "$f" refuse-symlink
-    return 1
+    local ld
+    ld="$(readlink -f "$(dirname -- "$f")")" || { say_err "skipped, cannot resolve" "$1"; return 1; }
+    link="${ld%/}/$(basename -- "$f")"
+    f="$(readlink -f "$f")" || { say_err "skipped, cannot resolve the file the link points at" "$1"; return 1; }
   fi
   # A file that does not exist yet has nothing to resolve: its folder is
   # resolved and the name kept. Only a sealed folder can take one (below).
@@ -5328,7 +5371,7 @@ do_edit_one() {
     diff_header "$label"
     echo "(no change; a mismatch is recorded for this file, see: sudo locked verify)"
   else
-    show_diff "$label" file "$f" "$old" "$stage" "$lhs" "$rhs" \
+    show_diff "$label" file "$f" "$old" "$stage" "$lhs" "$rhs" "via link" "$link" \
       || { rm -f -- "$stage"; return 1; }
   fi
   echo
@@ -5344,11 +5387,10 @@ do_edit_one() {
     c="This installs it again and clears the mismatch."
   fi
   if asking; then
-    if [ "$is_new" -eq 1 ]; then
-      value_rows "" file subject "$f" folder id "$folder" >&2
-    else
-      value_rows "" file subject "$f" >&2
-    fi
+    local -a rows=(file subject "$f")
+    [ -z "$link" ] || rows+=("via link" id "$link")
+    [ "$is_new" -eq 0 ] || rows+=(folder id "$folder")
+    value_rows "" "${rows[@]}" >&2
   fi
   confirm "$ask" "$c" || {
     echo "${E_YEL}aborted; file unchanged${E_OFF}" >&2

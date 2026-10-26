@@ -220,7 +220,7 @@ A **symlink argument names the link, not its target.** The parent is
 canonicalized and the link's own name is kept, so the link node itself is
 what gets sealed -- content tier, the only tier that applies to a link,
 since every OS identity check resolves the path and judges the target (a
-link under `~/.ssh` is therefore refused). The link node is precisely what a
+link under `~/.ssh` too). The link node is precisely what a
 same-UID process can re-point, which is what sealing the target left open.
 The target keeps its own ownership and takes its own record if you name it
 too. A dangling link is sealed the same way: its target may arrive later,

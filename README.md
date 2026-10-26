@@ -36,7 +36,9 @@ Three tiers, named by what they protect:
   until the whole ceremony is derived: the snapshot diff, then the plan --
   one line per node, root-most first -- then one question for all of it
   (`--yes` for scripted runs, `--dry-run` prints the plan and stops).
-  Naming a symlink seals the link itself, not what it points at.
+  Naming a symlink seals the link itself, not what it points at; the plan
+  says so when the target is yours and not protected, with the command
+  that protects it.
 - `sudo locked unprotect <path>` -- stop protecting it for good: flag off,
   owner, group and mode back to what they were before the first lock, the
   record retired, and every directory no other protected file needs
@@ -48,7 +50,9 @@ Three tiers, named by what they protect:
   `--from <copy>` the proposed content comes from a file you prepared
   instead of from an editor -- see below. Inside a folder locked as a
   whole, `edit` changes a file, or creates a new one, under the folder's
-  own record, so the folder is never unlocked either. After installing,
+  own record, so the folder is never unlocked either. Naming a symlink
+  edits the file it points at, as an editor would; the diff and the
+  question show both the file and the link. After installing,
   `edit` checks the file against what you approved: the same bytes, the
   owner, mode and flag it set, and its folder's flags as they were. A
   mismatch can only come from root or a bug. It fails the edit, stays on
@@ -285,7 +289,9 @@ asks once, before it has touched anything.
 
 A symlink is adopted as the link node itself: the link is what a process
 running as you could re-point, so that is what gets sealed. Its target is
-a separate node -- name it too if it should be sealed as well.
+a separate node -- name it too if it should be sealed as well. Under
+`~/.ssh` a link takes the content tier like anywhere else: ssh and sshd
+resolve the path before they check owners, so they never judge the link.
 
 ## The pool is what you protect
 
