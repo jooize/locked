@@ -17,21 +17,33 @@
  * service). Every other operation is an *at() call against a held fd.
  *
  * The same discipline carries the seal itself. `seal` and `unseal` change a
- * node's owner, mode and flag word (and a placement directory's one ACL
- * entry for the invoker), and `copy-tree` copies a folder, each
- * from a descriptor opened O_NOFOLLOW (O_SYMLINK for a link) and checked on
- * that descriptor: only a directory, a regular file or a symlink, and only
- * one owned by an account the caller names. Root never does more to an
- * inode than the invoking user could do themselves, and a second name for
- * an inode someone else owns -- a hard link the user planted after the
- * plan was made -- is still owned by that someone else, so it is refused.
+ * node's flag word, `install` puts an approved file in place of a sealed
+ * one, and `copy-tree` copies a folder, each from a descriptor opened
+ * O_NOFOLLOW (O_SYMLINK for a link) and checked on that descriptor: only a
+ * directory, a regular file or a symlink, and only one owned by an account
+ * the caller names. Every sealed node stays its owner's; the system flags
+ * (schg, sappnd) bind the owner as well, and only root clears them. Root
+ * never does more to an inode than the invoking user could do themselves,
+ * and a second name for an inode someone else owns -- a hard link the user
+ * planted after the plan was made -- is still owned by that someone else,
+ * so it is refused.
+ *
+ * A file is never sealed as the inode it was. The kernel checks write
+ * permission when a file is opened, not on each write, so a descriptor
+ * opened for writing before the flag went on would keep writing after it.
+ * `seal --swap` copies each regular file into root's staging, swaps the
+ * copy in by one rename, and flags the copy: nothing of the invoker's ever
+ * had it open. Every seal and install then lists the processes holding a
+ * sealed file open for writing (the instant between the swap and the flag)
+ * and names them. The fingerprint printed for each file is taken from the
+ * copy before the swap, so a write in that instant shows as drift.
  *
  * The copy verbs also read as the invoker (--as) wherever the invoker owns
  * the path: the walk from "/" and the open of each node run under their
  * identity, so the kernel checks every folder on the way and the node's own
  * permission bits exactly as it would for them. Only a node owned by
- * another account in --owner (the lock account, or root for its own
- * staging) is opened by root, from that node down, through the owner gate.
+ * another account in --owner (root, for its own staging) is opened by
+ * root, from that node down, through the owner gate.
  *
  * A seal or an unseal is held to the plan's node count (--count): a first
  * pass counts, read-only, every node the verb would reach, and any other
@@ -51,7 +63,12 @@
  *   7  refused: a node is not a directory, file or symlink, is not owned
  *      by an account the caller named, cannot be reached as --as, or a
  *      walk's count differs from --count -- nothing changed, and whatever a
- *      seal had already changed was rolled back
+ *      seal had already changed was rolled back (a file already swapped
+ *      stays the copy: the same bytes, owner, mode, times and attributes,
+ *      a new inode)
+ *   8  done, but a process holds a sealed file open for writing; `writer`
+ *      lines on stdout name it (an anomaly in the same run is still on
+ *      its lines)
  *
  * Node identity (`--parent-id`, `--target-id`, `--src-id`, and what the `id`
  * verb prints) is `<volume uuid>:<inode>`, or `<st_dev>:<inode>` on a
@@ -63,10 +80,11 @@
  * output always uses `:`.
  *
  * stdout carries only tab-separated machine lines (binurl, anomaly,
- * window-open, and acl-absent: an unseal found no ACL entry as
+ * window-open, writer `<pid> <program>`, sum `<sha256> <path below the
+ * top, . for the top>`, and acl-absent: an unseal found no ACL entry as
  * --acl-remove names it, and left the ACL as it was), plus the one bare
- * `<id>` line the `id` verb prints. stderr carries one lowercase prose line
- * per error.
+ * line the `id` and `mount` verbs print. stderr carries one lowercase
+ * prose line per error.
  *
  * Entry names on `anomaly` lines are backslash-escaped (\\, \t, \n, \r, \xNN
  * for other control bytes) so a hostile filename cannot forge or split a
@@ -82,15 +100,19 @@
 #include <sys/types.h>
 #include <sys/acl.h>
 #include <sys/attr.h>
+#include <sys/mount.h>
+#include <sys/proc_info.h>
 #include <sys/stat.h>
 #include <sys/stdio.h>
 #include <sys/wait.h>
 
+#include <CommonCrypto/CommonDigest.h>
 #include <copyfile.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <libproc.h>
 #include <limits.h>
 #include <membership.h>
 #include <pwd.h>
@@ -112,12 +134,18 @@
 #define EX_HELPER_WINOPEN  5
 #define EX_HELPER_ANOMALY  6
 #define EX_HELPER_REFUSED  7
+#define EX_HELPER_WRITER   8
 
 /* The flags that block unlink/rename of a node, or of entries in a directory.
  * Nothing else in the flag word is ever touched: hidden, nodump, opaque and
  * the archived bit survive the window untouched because we restore the whole
  * saved word rather than re-deriving it. */
 #define BLOCKING_FLAGS (SF_APPEND | UF_APPEND | SF_IMMUTABLE | UF_IMMUTABLE)
+
+/* The flags a swapped-in copy carries over from the file it replaces. The
+ * rest are the filesystem's to set (compressed, dataless, tracked) or the
+ * seal's own. */
+#define KEPT_FLAGS (UF_NODUMP | UF_HIDDEN)
 
 /* Recursion cap for the rm walk. One directory fd is held per level, so the
  * walk costs at most MAX_DEPTH + a small constant descriptors. */
@@ -165,11 +193,19 @@ usage(void)
 "       locked-helper seal|unseal --path <path> --id <id|-> --owner <users>\n"
 "                                 --count <n>\n"
 "                                 --flag <uchg|uappnd|schg|sappnd>\n"
-"                                 [--chown <user>:<group>] [--mode <octal>]\n"
 "                                 [--recursive]\n"
-"                                 [--acl-add <user>:<rights>]     (seal)\n"
+"                                 [--swap --stage <dir>]          (seal)\n"
+"                                 [--chown <user>:<group>] [--mode <octal>]\n"
 "                                 [--acl-remove <user>:<rights>]  (unseal)\n"
-"       locked-helper id <path>\n",
+"       locked-helper install --src <staged file> --parent <dir>\n"
+"                             --parent-id <id|-> --name <entry>\n"
+"                             (--target-id <id> --owner <users> | --new)\n"
+"                             --chown <user>:<group> --mode <octal>\n"
+"                             --flag <uchg|uappnd|schg|sappnd>\n"
+"       locked-helper digest --src <path> --src-id <id|-> --owner <users>\n"
+"                            --as <user> [--recursive]\n"
+"       locked-helper id <path>\n"
+"       locked-helper mount <path>\n",
 	    stderr);
 }
 
@@ -716,6 +752,8 @@ typedef struct {
 	const char	*added;		/* entry this op created, or NULL */
 	dev_t		 add_dev;	/* identity the added entry must have */
 	ino_t		 add_ino;
+	const char	*swapped;	/* entry this op swapped a copy into */
+	ino_t		 swap_ino;	/* the copy's inode */
 } expect_t;
 
 /*
@@ -808,11 +846,164 @@ diff_report(const elist_t *before, const elist_t *after, const expect_t *exp)
 
 			if (b->dev == a->dev && b->ino == a->ino)
 				continue;
+			if (exp->swapped != NULL &&
+			    strcmp(exp->swapped, a->name) == 0 &&
+			    a->ino == exp->swap_ino)
+				continue;
 			print_anomaly('~', a->name, a->dev, a->ino);
 			found++;
 		}
 	}
 	return (found);
+}
+
+/* ---- fingerprints and open writers -------------------------------------- */
+
+/* sha256 of everything a held descriptor reads from offset 0, as hex. */
+static int
+sha256_fd(int fd, char out[65])
+{
+	CC_SHA256_CTX c;
+	unsigned char md[CC_SHA256_DIGEST_LENGTH], buf[65536];
+	off_t off = 0;
+	ssize_t k;
+	int i;
+
+	CC_SHA256_Init(&c);
+	while ((k = pread(fd, buf, sizeof(buf), off)) > 0) {
+		CC_SHA256_Update(&c, buf, (CC_LONG)k);
+		off += k;
+	}
+	if (k < 0)
+		return (-1);
+	CC_SHA256_Final(md, &c);
+	for (i = 0; i < CC_SHA256_DIGEST_LENGTH; i++)
+		snprintf(out + 2 * i, 3, "%02x", md[i]);
+	return (0);
+}
+
+/* sum\t<sha256>\t<path below the top, escaped; . for the top> */
+static void
+print_sum(const char *hex, const char *rel)
+{
+	printf("sum\t%s\t", hex);
+	print_escaped(rel[0] != '\0' ? rel : ".");
+	fputc('\n', stdout);
+}
+
+typedef struct {
+	dev_t	dev;
+	ino_t	ino;
+} inode_t;
+
+typedef struct {
+	inode_t	*v;
+	size_t	 n;
+	size_t	 cap;
+} iset_t;
+
+static void
+iset_add(iset_t *s, dev_t dev, ino_t ino)
+{
+	if (s->n == s->cap) {
+		size_t cap = s->cap ? s->cap * 2 : 16;
+		inode_t *v = realloc(s->v, cap * sizeof(*v));
+
+		if (v == NULL)
+			fatal("out of memory");
+		s->v = v;
+		s->cap = cap;
+	}
+	s->v[s->n].dev = dev;
+	s->v[s->n].ino = ino;
+	s->n++;
+}
+
+static void
+iset_free(iset_t *s)
+{
+	free(s->v);
+	memset(s, 0, sizeof(*s));
+}
+
+/*
+ * The open-writer check. The kernel asks for write permission when a file
+ * is opened, never on each write, so a descriptor opened for writing
+ * before a flag went on keeps writing after it. Every process's open files
+ * are listed (libproc, as lsof does) and each descriptor of a file in `s`
+ * opened for writing is named on a `writer` line: its pid and program.
+ * This process's own descriptors do not count. Returns how many were
+ * named, -1 when the process list cannot be read.
+ *
+ * Not seen, by design: a writable shared mapping whose descriptor was
+ * closed, and a descriptor in flight in a socket message. The region data
+ * cannot tell a shared mapping from a written private one, so a mapping
+ * scan would raise false alarms. The fingerprint catches what either one
+ * writes.
+ */
+static int
+writer_scan(const iset_t *s)
+{
+	pid_t self = getpid(), *pids;
+	struct proc_fdinfo *fds;
+	struct vnode_fdinfowithpath vi;
+	char name[64];
+	size_t cap, nf, j, k;
+	int n, i, sz, hits = 0;
+
+	if (s->n == 0)
+		return (0);
+	n = proc_listallpids(NULL, 0);
+	if (n <= 0) {
+		errf("cannot list processes: %s", strerror(errno));
+		return (-1);
+	}
+	cap = (size_t)n + 256;
+	pids = xmalloc(cap * sizeof(*pids));
+	n = proc_listallpids(pids, (int)(cap * sizeof(*pids)));
+	if (n <= 0) {
+		errf("cannot list processes: %s", strerror(errno));
+		free(pids);
+		return (-1);
+	}
+	for (i = 0; i < n; i++) {
+		if (pids[i] == self || pids[i] == 0)
+			continue;
+		sz = proc_pidinfo(pids[i], PROC_PIDLISTFDS, 0, NULL, 0);
+		if (sz <= 0)
+			continue;	/* gone since the list was read */
+		sz += 64 * (int)sizeof(*fds);
+		fds = xmalloc((size_t)sz);
+		sz = proc_pidinfo(pids[i], PROC_PIDLISTFDS, 0, fds, sz);
+		nf = sz > 0 ? (size_t)sz / sizeof(*fds) : 0;
+		for (j = 0; j < nf; j++) {
+			if (fds[j].proc_fdtype != PROX_FDTYPE_VNODE)
+				continue;
+			if (proc_pidfdinfo(pids[i], fds[j].proc_fd,
+			    PROC_PIDFDVNODEPATHINFO, &vi, sizeof(vi)) !=
+			    (int)sizeof(vi))
+				continue;
+			if ((vi.pfi.fi_openflags & FWRITE) == 0)
+				continue;
+			for (k = 0; k < s->n; k++)
+				if ((uint32_t)vi.pvip.vip_vi.vi_stat.vst_dev ==
+				    (uint32_t)s->v[k].dev &&
+				    vi.pvip.vip_vi.vi_stat.vst_ino ==
+				    (uint64_t)s->v[k].ino)
+					break;
+			if (k == s->n)
+				continue;
+			if (proc_name(pids[i], name, sizeof(name)) <= 0)
+				strlcpy(name, "?", sizeof(name));
+			printf("writer\t%d\t", (int)pids[i]);
+			print_escaped(name);
+			fputc('\n', stdout);
+			hits++;
+		}
+		free(fds);
+	}
+	free(pids);
+	return (hits);
 }
 
 /* ---- the window --------------------------------------------------------- */
@@ -1264,9 +1455,11 @@ typedef struct {
 	const char	*mode;
 	const char	*as;
 	const char	*count;
-	const char	*acl_add;
 	const char	*acl_remove;
+	const char	*stage;
 	int		 recursive;
+	int		 swap;
+	int		 new_node;
 } opts_t;
 
 static int
@@ -1301,6 +1494,14 @@ parse_opts(int argc, char **argv, opts_t *o)
 			o->recursive = 1;
 			continue;
 		}
+		if (strcmp(a, "--swap") == 0) {
+			o->swap = 1;
+			continue;
+		}
+		if (strcmp(a, "--new") == 0) {
+			o->new_node = 1;
+			continue;
+		}
 #define TRY(flag, slot)							\
 		r = opt_str(a, flag, argv, &i, argc, &o->slot);		\
 		if (r < 0)						\
@@ -1328,8 +1529,8 @@ parse_opts(int argc, char **argv, opts_t *o)
 		TRY("--mode", mode)
 		TRY("--as", as)
 		TRY("--count", count)
-		TRY("--acl-add", acl_add)
 		TRY("--acl-remove", acl_remove)
+		TRY("--stage", stage)
 #undef TRY
 		errf("unknown option %s", a);
 		return (-1);
@@ -1556,16 +1757,15 @@ parse_count(const char *s, size_t *out)
 }
 
 /*
- * The one ACL entry a placement seal gives the invoker, and its release
- * takes off again: an allow naming one account by its uuid, with exactly
- * the listed rights and no inherit flag, so nothing created inside picks
- * it up. The rights are the ones locked's placement_entry grants, by the
- * names ls -le prints them under; any other right is refused, so no call
- * can hand the invoker a right over the directory's entries or its own
- * metadata.
+ * The one ACL entry a placement seal of locked 0.16 and earlier gave the
+ * invoker, which the one-shot conversion to system flags takes off again:
+ * an allow naming one account by its uuid, with exactly the listed rights
+ * and no inherit flag. The rights are the ones that seal granted, by the
+ * names ls -le prints them under; any other right is refused.
+ * TODO(0.18.0): remove with the conversion.
  */
 typedef struct {
-	int			 op;	/* 0 none, 1 add (seal), -1 remove (unseal) */
+	int			 op;	/* 0 none, -1 remove (unseal) */
 	uid_t			 uid;
 	uuid_t			 who;
 	acl_permset_mask_t	 rights;
@@ -2060,10 +2260,9 @@ gate_owner(const struct stat *st, const char *path, const owners_t *ok)
 }
 
 /*
- * `setid` is for a seal that gives the node to another account: a
- * set-user-id or set-group-id file would then run as that account, and the
- * lock account owns every sealed node. Root's chown keeps those bits, so the
- * seal refuses the file instead.
+ * `setid` is for a seal: locked does not seal a set-user-id or
+ * set-group-id file. That is policy, kept from the time a seal gave every
+ * node to another account; a sealed file stays its owner's now.
  */
 static int
 gate(const node_t *n, const char *path, const owners_t *ok, int setid)
@@ -2149,7 +2348,13 @@ typedef struct {
 	int		 has_mode;
 	mode_t		 mode;
 	int		 recursive;
-	aclspec_t	 acl;		/* --acl-add, --acl-remove */
+	aclspec_t	 acl;		/* --acl-remove */
+	int		 swap;		/* --swap: each file sealed is a copy */
+	int		 sfd;		/* --stage, held */
+	unsigned	 seq;		/* names in staging */
+	elist_t		 staged;	/* originals parked in staging */
+	iset_t		 flagged;	/* regular files this seal flagged */
+	int		 anomalies;	/* entry changes in a swap window */
 	size_t		 plan;		/* --count */
 	size_t		 seen;		/* nodes this pass has reached */
 	dev_t		 dev;
@@ -2259,24 +2464,6 @@ acl_read(int fd, const char *path, acl_t *out)
 	return (-1);
 }
 
-/* Some entry, allow or deny, inherited or not, names the account. */
-static int
-acl_names(acl_t acl, const aclspec_t *a)
-{
-	acl_entry_t e;
-	void *q;
-	int id, hit = 0;
-
-	for (id = ACL_FIRST_ENTRY; !hit && acl_get_entry(acl, id, &e) == 0;
-	    id = ACL_NEXT_ENTRY) {
-		if ((q = acl_get_qualifier(e)) == NULL)
-			continue;
-		hit = memcmp(q, a->who, sizeof(uuid_t)) == 0;
-		acl_free(q);
-	}
-	return (hit);
-}
-
 /* The entry is the one the spec names: an allow for that account, with
  * exactly those rights and no inherit flag. */
 static int
@@ -2305,13 +2492,11 @@ acl_is_ours(acl_entry_t e, const aclspec_t *a)
 }
 
 /*
- * The ACL node_apply sets: the node's own with the seal's entry added
- * where chmod +a puts an allow (after the explicit deny entries, ahead of
- * every other: probed 2026-10-23), or with the entry the unseal names
- * taken out and every other entry left where it is (~/Library carries
- * Apple's). *prev is what the node held, for the journal. *next stays
- * NULL when there is nothing to change: an unseal that finds no such
- * entry marks it absent, for the caller to report.
+ * The ACL node_apply sets: the node's own with the entry --acl-remove
+ * names taken out and every other entry left where it is (~/Library
+ * carries Apple's). *prev is what the node held, for the journal. *next
+ * stays NULL when there is nothing to change: no such entry marks it
+ * absent, for the caller to report.
  */
 static int
 acl_next(tree_t *t, const node_t *n, const char *path, acl_t *prev,
@@ -2319,72 +2504,45 @@ acl_next(tree_t *t, const node_t *n, const char *path, acl_t *prev,
 {
 	aclspec_t *a = &t->acl;
 	acl_entry_t e;
-	acl_tag_t tag;
-	acl_flagset_t fs;
-	int id, at = 0, found = 0, err;
+	int id, found = 0, err;
 
 	*next = NULL;
 	if (acl_read(n->fd, path, prev) != 0)
 		return (EX_HELPER_OPFAIL);
-	if (!t->sealing) {
-		if (*prev == NULL) {
-			a->absent = 1;
-			return (EX_HELPER_OK);
-		}
-		if ((*next = acl_dup(*prev)) == NULL)
-			fatal("out of memory");
-		for (id = ACL_FIRST_ENTRY; !found &&
-		    acl_get_entry(*next, id, &e) == 0; id = ACL_NEXT_ENTRY)
-			found = acl_is_ours(e, a);
-		if (found && acl_delete_entry(*next, e) == 0)
-			return (EX_HELPER_OK);
-		err = errno;
-		acl_free(*next);
-		*next = NULL;
-		if (found) {
-			errf("cannot take the ACL entry out (%s): %s",
-			    strerror(err), path);
-			return (EX_HELPER_OPFAIL);
-		}
+	if (*prev == NULL) {
 		a->absent = 1;
 		return (EX_HELPER_OK);
 	}
-	*next = *prev != NULL ? acl_dup(*prev) : acl_init(1);
-	if (*next == NULL)
+	if ((*next = acl_dup(*prev)) == NULL)
 		fatal("out of memory");
-	for (id = ACL_FIRST_ENTRY; acl_get_entry(*next, id, &e) == 0;
-	    id = ACL_NEXT_ENTRY) {
-		if (acl_get_tag_type(e, &tag) != 0 ||
-		    tag != ACL_EXTENDED_DENY || acl_get_flagset_np(e, &fs) != 0 ||
-		    acl_get_flag_np(fs, ACL_ENTRY_INHERITED) == 1)
-			break;
-		at++;
-	}
-	if (acl_create_entry_np(next, &e, at) != 0 ||
-	    acl_set_tag_type(e, ACL_EXTENDED_ALLOW) != 0 ||
-	    acl_set_qualifier(e, a->who) != 0 ||
-	    acl_set_permset_mask_np(e, a->rights) != 0 ||
-	    acl_get_flagset_np(e, &fs) != 0 || acl_clear_flags_np(fs) != 0 ||
-	    acl_set_flagset_np(e, fs) != 0) {
-		errf("cannot build the ACL entry (%s): %s", strerror(errno),
-		    path);
-		acl_free(*next);
-		*next = NULL;
+	for (id = ACL_FIRST_ENTRY; !found &&
+	    acl_get_entry(*next, id, &e) == 0; id = ACL_NEXT_ENTRY)
+		found = acl_is_ours(e, a);
+	if (found && acl_delete_entry(*next, e) == 0)
+		return (EX_HELPER_OK);
+	err = errno;
+	acl_free(*next);
+	*next = NULL;
+	if (found) {
+		errf("cannot take the ACL entry out (%s): %s",
+		    strerror(err), path);
 		return (EX_HELPER_OPFAIL);
 	}
+	a->absent = 1;
 	return (EX_HELPER_OK);
 }
 
 /*
  * One node's change, on its own descriptor. The blocking bits come off first
  * when the owner, the mode or the ACL has to change, since each is refused
- * on an immutable or append-only node, root included; then a seal's ACL
- * entry, so the invoker never loses their way in, not even for an instant;
- * then the owner; then the mode (the top node only, and never a link: a
- * link's mode gates nothing on macOS); then an unseal's ACL entry comes
- * off, once the owner bits are the invoker's way in again; then the flag
- * word, as found with the seal's flag added or the unseal's taken away.
- * Journaled before anything moves, the ACL as it was included.
+ * on an immutable or append-only node, root included; then the owner; then
+ * the mode (the top node only, and never a link: a link's mode gates
+ * nothing on macOS); then the ACL entry an unseal takes off, once the
+ * owner bits are the invoker's way in again; then the flag word, as found
+ * with the seal's flag added or the unseal's taken away. Journaled before
+ * anything moves, the ACL as it was included. A seal changes the flag word
+ * alone; owner, mode and ACL are the one-shot conversion's
+ * (TODO(0.18.0): remove those with it).
  */
 static int
 node_apply(tree_t *t, const node_t *n, const char *path, const char *rel,
@@ -2397,6 +2555,8 @@ node_apply(tree_t *t, const node_t *n, const char *path, const char *rel,
 	int own, mod, rc;
 
 	want = t->sealing ? (cur | t->flag) : (cur & ~t->flag);
+	if (t->sealing && S_ISREG(st->st_mode))
+		iset_add(&t->flagged, st->st_dev, st->st_ino);
 	own = t->chown && (st->st_uid != t->uid || st->st_gid != t->gid);
 	mod = t->has_mode && is_top && !S_ISLNK(st->st_mode) &&
 	    (st->st_mode & 07777) != t->mode;
@@ -2423,10 +2583,6 @@ node_apply(tree_t *t, const node_t *n, const char *path, const char *rel,
 		if (fchflags(n->fd, cur) != 0)
 			goto fail;
 	}
-	what = "add the ACL entry to";
-	if (next != NULL && t->sealing &&
-	    acl_set_fd_np(n->fd, next, ACL_TYPE_EXTENDED) != 0)
-		goto fail;
 	what = "change the owner of";
 	if (own && fchown(n->fd, t->uid, t->gid) != 0)
 		goto fail;
@@ -2434,8 +2590,7 @@ node_apply(tree_t *t, const node_t *n, const char *path, const char *rel,
 	if (mod && fchmod(n->fd, t->mode) != 0)
 		goto fail;
 	what = "take the ACL entry off";
-	if (next != NULL && !t->sealing &&
-	    acl_set_fd_np(n->fd, next, ACL_TYPE_EXTENDED) != 0)
+	if (next != NULL && acl_set_fd_np(n->fd, next, ACL_TYPE_EXTENDED) != 0)
 		goto fail;
 	what = "set the flags on";
 	if (want != cur && fchflags(n->fd, want) != 0)
@@ -2518,16 +2673,13 @@ restore_one(const tree_t *t, const jent_t *e)
 		if (fchflags(fd, cur) != 0)
 			goto out;
 	}
-	/* The ACL goes back on the side of the owner that keeps the invoker
-	 * in: an unseal's entry before the lock account owns the node again,
-	 * a seal's off only once the invoker does. */
-	if (e->acl_kept && !t->sealing && acl_put_back(fd, e) != 0)
+	/* The entry goes back before the old owner does, so the invoker never
+	 * loses their way in. */
+	if (e->acl_kept && acl_put_back(fd, e) != 0)
 		goto out;
 	if (own && fchown(fd, e->uid, e->gid) != 0)
 		goto out;
 	if (mod && fchmod(fd, e->mode) != 0)
-		goto out;
-	if (e->acl_kept && t->sealing && acl_put_back(fd, e) != 0)
 		goto out;
 	if (cur != e->flags && fchflags(fd, e->flags) != 0)
 		goto out;
@@ -2566,8 +2718,16 @@ rollback(const tree_t *t)
 	return (bad);
 }
 
-typedef int (*walk_fn)(tree_t *, const node_t *, const char *, const char *,
-    int);
+/* Where a node sits: its parent, held, and its name there. A copy is
+ * swapped in by that name. */
+typedef struct {
+	int		 pfd;
+	const char	*ppath;		/* error text only */
+	const char	*name;
+} place_t;
+
+typedef int (*walk_fn)(tree_t *, node_t *, const place_t *, const char *,
+    const char *, int);
 
 /*
  * Every entry of a held directory, each opened, checked and walked in turn.
@@ -2593,8 +2753,12 @@ walk_children(tree_t *t, const node_t *dir, const char *path, const char *rel,
 		const char *name = names.v[i].name;
 		char *cpath = join_path(path, name);
 		char *crel = rel_join(rel, name);
+		place_t at;
 		node_t c;
 
+		at.pfd = dir->fd;
+		at.ppath = path;
+		at.name = name;
 		rc = node_at(dir->fd, name, cpath, &c);
 		if (rc == EX_HELPER_OK && c.st.st_dev != t->dev) {
 			errf("refusing, a mount point inside the tree: %s",
@@ -2602,7 +2766,7 @@ walk_children(tree_t *t, const node_t *dir, const char *path, const char *rel,
 			rc = EX_HELPER_REFUSED;
 		}
 		if (rc == EX_HELPER_OK)
-			rc = fn(t, &c, cpath, crel, depth + 1);
+			rc = fn(t, &c, &at, cpath, crel, depth + 1);
 		if (c.fd >= 0)
 			close(c.fd);
 		free(cpath);
@@ -2613,32 +2777,184 @@ walk_children(tree_t *t, const node_t *dir, const char *path, const char *rel,
 }
 
 /*
- * Lock direction, top-down. Each directory is handed over and frozen BEFORE
- * its entries are read: a uchg on a directory the user still owns binds
- * nobody, since the owner can clear it, but once the lock account owns it
- * and the flag is on, no process running as the user can add, remove or
- * rename an entry. The list read after that is the final one, so anything
- * planted while the directory was still the user's is on it and meets the
- * gate like every other entry.
+ * Copy-and-swap, for one regular file a seal is about to flag. Root copies
+ * it into its staging folder (data, extended attributes, ACL), gives the
+ * copy the file's owner, group, mode, times and kept flags, and fingerprints
+ * the copy there, where nothing else can reach it. One rename then swaps
+ * the copy in and the original out, inside a window on the held parent:
+ * its blocking flags come off for that one call, and when they did, the
+ * parent's entries are compared across it (any other change is an
+ * anomaly, reported at the end). The original must be what went out, and
+ * must not have changed while it was copied; otherwise it is swapped back
+ * and the seal refuses. On return *n is the copy, held, and the original
+ * waits in staging for the end of the run.
  */
 static int
-seal_walk(tree_t *t, const node_t *n, const char *path, const char *rel,
-    int depth)
+swap_in(tree_t *t, node_t *n, const place_t *at, const char *path,
+    const char *rel)
+{
+	char tmp[64], hex[65];
+	struct stat cst, chk, now;
+	struct timespec ts[2];
+	struct attrlist al;
+	elist_t before, after;
+	expect_t exp;
+	uint32_t pflags;
+	const char *why = NULL;
+	int cfd, slot = -1, lifted = 0, rc = EX_HELPER_OK, e;
+
+	memset(&before, 0, sizeof(before));
+	memset(&after, 0, sizeof(after));
+	snprintf(tmp, sizeof(tmp), "swap.%d.%u", (int)getpid(), t->seq++);
+	cfd = openat(t->sfd, tmp, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW |
+	    O_CLOEXEC, 0600);
+	if (cfd < 0) {
+		errf("cannot create the copy in staging (%s): %s",
+		    strerror(errno), path);
+		return (EX_HELPER_OPFAIL);
+	}
+	ts[0] = n->st.st_atimespec;
+	ts[1] = n->st.st_mtimespec;
+	memset(&al, 0, sizeof(al));
+	al.bitmapcount = ATTR_BIT_MAP_COUNT;
+	al.commonattr = ATTR_CMN_CRTIME;
+	if (fcopyfile(n->fd, cfd, NULL,
+	    COPYFILE_DATA | COPYFILE_XATTR | COPYFILE_ACL) != 0 ||
+	    fchown(cfd, n->st.st_uid, n->st.st_gid) != 0 ||
+	    fchmod(cfd, n->st.st_mode & 07777) != 0 ||
+	    futimens(cfd, ts) != 0 ||
+	    fsetattrlist(cfd, &al, &n->st.st_birthtimespec,
+	    sizeof(n->st.st_birthtimespec), 0) != 0 ||
+	    fchflags(cfd, n->st.st_flags & KEPT_FLAGS) != 0 ||
+	    sha256_fd(cfd, hex) != 0 || fstat(cfd, &cst) != 0) {
+		errf("cannot make the copy to seal (%s): %s", strerror(errno),
+		    path);
+		close(cfd);
+		(void)unlinkat(t->sfd, tmp, 0);
+		return (EX_HELPER_OPFAIL);
+	}
+
+	if (fstat(at->pfd, &chk) != 0) {
+		errf("cannot stat its folder (%s): %s", strerror(errno), path);
+		close(cfd);
+		(void)unlinkat(t->sfd, tmp, 0);
+		return (EX_HELPER_OPFAIL);
+	}
+	pflags = chk.st_flags;
+	if ((pflags & BLOCKING_FLAGS) != 0) {
+		if (snapshot(at->pfd, at->ppath, &before) != 0) {
+			close(cfd);
+			(void)unlinkat(t->sfd, tmp, 0);
+			return (EX_HELPER_OPFAIL);
+		}
+		slot = live_add(at->pfd, pflags, at->ppath);
+		if (slot < 0 || fchflags(at->pfd,
+		    pflags & ~(uint32_t)BLOCKING_FLAGS) != 0) {
+			errf("cannot lift the flags on its folder (%s): %s",
+			    strerror(errno), path);
+			live_forget(slot);
+			elist_free(&before);
+			close(cfd);
+			(void)unlinkat(t->sfd, tmp, 0);
+			return (EX_HELPER_OPFAIL);
+		}
+		lifted = 1;
+	}
+
+	if (renameatx_np(t->sfd, tmp, at->pfd, at->name, RENAME_SWAP) != 0) {
+		e = errno;
+		if (e == EXDEV)
+			errf("refusing, it is not on the volume of locked's "
+			    "staging, so no copy can be swapped in: %s", path);
+		else
+			errf("cannot swap the copy in (%s): %s", strerror(e),
+			    path);
+		rc = e == EXDEV ? EX_HELPER_REFUSED : EX_HELPER_OPFAIL;
+		(void)unlinkat(t->sfd, tmp, 0);
+		goto restore;
+	}
+	if (fstatat(t->sfd, tmp, &chk, AT_SYMLINK_NOFOLLOW) != 0 ||
+	    chk.st_ino != n->st.st_ino || chk.st_dev != n->st.st_dev ||
+	    fstatat(at->pfd, at->name, &now, AT_SYMLINK_NOFOLLOW) != 0 ||
+	    now.st_ino != cst.st_ino)
+		why = "it was replaced while it was sealed";
+	else if (fstat(n->fd, &now) != 0 || now.st_size != n->st.st_size ||
+	    now.st_mtimespec.tv_sec != n->st.st_mtimespec.tv_sec ||
+	    now.st_mtimespec.tv_nsec != n->st.st_mtimespec.tv_nsec)
+		why = "it changed while it was copied; run the lock again";
+	if (why != NULL) {
+		/* Back as it was. Only a swap back that put the copy in staging
+		 * leaves anything there to remove. */
+		if (renameatx_np(t->sfd, tmp, at->pfd, at->name,
+		    RENAME_SWAP) == 0 &&
+		    fstatat(t->sfd, tmp, &chk, AT_SYMLINK_NOFOLLOW) == 0 &&
+		    chk.st_ino == cst.st_ino)
+			(void)unlinkat(t->sfd, tmp, 0);
+		else
+			errf("the file that went out is kept in staging as "
+			    "%s: %s", tmp, path);
+		errf("refusing, %s: %s", why, path);
+		rc = EX_HELPER_REFUSED;
+		goto restore;
+	}
+	elist_push(&t->staged, tmp, n->st.st_dev, n->st.st_ino);
+	print_sum(hex, rel);
+	close(n->fd);
+	n->fd = cfd;
+	n->st = cst;
+	cfd = -1;
+	if (rel[0] == '\0')
+		t->topfd = n->fd;
+
+restore:
+	if (cfd >= 0)
+		close(cfd);
+	if (lifted) {
+		if (live_restore(slot, at->ppath) != 0)
+			rc = EX_HELPER_WINOPEN;
+		else if (rc == EX_HELPER_OK &&
+		    snapshot(at->pfd, at->ppath, &after) == 0) {
+			memset(&exp, 0, sizeof(exp));
+			exp.swapped = at->name;
+			exp.swap_ino = n->st.st_ino;
+			t->anomalies += diff_report(&before, &after, &exp);
+		} else if (rc == EX_HELPER_OK) {
+			t->anomalies++;
+		}
+	}
+	elist_free(&before);
+	elist_free(&after);
+	return (rc);
+}
+
+/*
+ * Lock direction, top-down. Each directory is frozen BEFORE its entries are
+ * read: a system flag binds the owner too, so once it is on, no process
+ * running as the user can add, remove or rename an entry. The list read
+ * after that is the final one, so anything planted while the directory was
+ * still open is on it and meets the gate like every other entry. Each
+ * regular file is swapped for a copy first (with --swap), then flagged.
+ */
+static int
+seal_walk(tree_t *t, node_t *n, const place_t *at, const char *path,
+    const char *rel, int depth)
 {
 	int rc;
 
 	if ((rc = visit(t, path)) != EX_HELPER_OK)
 		return (rc);
 	if (depth > 0) {
-		/* A second name for a file this walk already sealed: it is
-		 * the lock account's now because of this run, not a plant. */
+		/* A second name for a file this walk already sealed. */
 		if (n->st.st_nlink > 1 && !S_ISDIR(n->st.st_mode) &&
 		    journal_has(t, n->st.st_ino))
 			return (EX_HELPER_OK);
-		rc = gate(n, path, t->owners, t->chown);
+		rc = gate(n, path, t->owners, 1);
 		if (rc != EX_HELPER_OK)
 			return (rc);
 	}
+	if (t->swap && S_ISREG(n->st.st_mode) &&
+	    (rc = swap_in(t, n, at, path, rel)) != EX_HELPER_OK)
+		return (rc);
 	rc = node_apply(t, n, path, rel, depth == 0);
 	if (rc != EX_HELPER_OK || !S_ISDIR(n->st.st_mode) || !t->recursive)
 		return (rc);
@@ -2646,24 +2962,25 @@ seal_walk(tree_t *t, const node_t *n, const char *path, const char *rel,
 }
 
 /*
- * Unlock direction, first pass: every directory frozen before it is read,
- * every node gated, nothing else changed. The tree is the lock account's,
- * so a directory frozen here stays closed to the user, and a refusal rolls
- * back the freezes this pass applied.
+ * Unlock direction, first pass: every directory frozen with the flag the
+ * unseal clears before it is read, every node gated, nothing else changed.
+ * A sealed tree is frozen already, so this pass changes nothing on one in
+ * order; a refusal rolls back any freeze it did apply.
  */
 static int
-check_walk(tree_t *t, const node_t *n, const char *path, const char *rel,
-    int depth)
+check_walk(tree_t *t, node_t *n, const place_t *at, const char *path,
+    const char *rel, int depth)
 {
+	(void)at;
 	if (visit(t, path) != EX_HELPER_OK)
 		return (EX_HELPER_REFUSED);
 	if (depth > 0 && gate(n, path, t->owners, 0) != EX_HELPER_OK)
 		return (EX_HELPER_REFUSED);
 	if (!S_ISDIR(n->st.st_mode))
 		return (EX_HELPER_OK);
-	if ((n->st.st_flags & UF_IMMUTABLE) == 0) {
+	if ((n->st.st_flags & t->flag) == 0) {
 		journal_push(t, rel, &n->st);
-		if (fchflags(n->fd, n->st.st_flags | UF_IMMUTABLE) != 0) {
+		if (fchflags(n->fd, n->st.st_flags | t->flag) != 0) {
 			errf("cannot freeze it (%s): %s", strerror(errno),
 			    path);
 			return (EX_HELPER_OPFAIL);
@@ -2674,16 +2991,17 @@ check_walk(tree_t *t, const node_t *n, const char *path, const char *rel,
 
 /*
  * Unlock direction, second pass, bottom-up: everything below a directory is
- * handed back while the directory is still frozen, and the directory last.
+ * released while the directory is still frozen, and the directory last.
  * A node already in the state the unseal asks for (a second name for a file
- * handed back further up the walk) is left alone.
+ * released further up the walk) is left alone.
  */
 static int
-unseal_walk(tree_t *t, const node_t *n, const char *path, const char *rel,
-    int depth)
+unseal_walk(tree_t *t, node_t *n, const place_t *at, const char *path,
+    const char *rel, int depth)
 {
 	int rc;
 
+	(void)at;
 	if ((rc = visit(t, path)) != EX_HELPER_OK)
 		return (rc);
 	if (depth > 0) {
@@ -2708,9 +3026,10 @@ unseal_walk(tree_t *t, const node_t *n, const char *path, const char *rel,
  * change, naming the number found.
  */
 static int
-count_walk(tree_t *t, const node_t *n, const char *path, const char *rel,
-    int depth)
+count_walk(tree_t *t, node_t *n, const place_t *at, const char *path,
+    const char *rel, int depth)
 {
+	(void)at;
 	t->seen++;
 	if (!S_ISDIR(n->st.st_mode) || !t->recursive)
 		return (EX_HELPER_OK);
@@ -3034,9 +3353,6 @@ cmd_trash(int argc, char **argv)
 	pid_t child = -1;
 	char buf[PATH_MAX + 64];
 	size_t got = 0;
-	uid_t prev_uid = 0;
-	gid_t prev_gid = 0;
-	int chowned = 0, trashed = 0;
 	int rc, wstat = 0, status = EX_HELPER_OK, anomalies = 0;
 
 	if (parse_opts(argc, argv, &o) != 0)
@@ -3093,27 +3409,6 @@ cmd_trash(int argc, char **argv)
 	if (rc != EX_HELPER_OK) {
 		status = rc;
 		goto cleanup;
-	}
-
-	/* Content-tier nodes belong to the lock account; the bin entry must
-	 * belong to whoever trashed it, or Put Back hands back a file they
-	 * cannot read. */
-	if (t.st.st_uid != uid) {
-		int ok;
-
-		prev_uid = t.st.st_uid;
-		prev_gid = t.st.st_gid;
-		if (t.fd >= 0)
-			ok = (fchown(t.fd, uid, gid) == 0);
-		else
-			ok = (lchown(t.path, uid, gid) == 0);
-		if (!ok) {
-			errf("cannot give %s to uid %lu: %s", t.path,
-			    (unsigned long)uid, strerror(errno));
-			status = EX_HELPER_OPFAIL;
-			goto cleanup;
-		}
-		chowned = 1;
 	}
 
 	if (pipe(pfds) != 0) {
@@ -3213,7 +3508,6 @@ cmd_trash(int argc, char **argv)
 
 	/* The node left with its blocking flags lifted, by design: it is the
 	 * bin's now, and the record carries the seal state. */
-	trashed = 1;
 	target_forget(&t);
 
 	/* --name is already free of tab and newline, and the service only adds
@@ -3244,16 +3538,6 @@ cleanup:
 		close(pfds[1]);
 	if (child > 0)
 		(void)waitpid(child, &wstat, 0);
-	/* A trash that never happened must not leave the ownership handover
-	 * behind: put the lock account back so the node reads exactly as its
-	 * record says. Best effort -- a failure here surfaces as owner drift
-	 * on the next verify, which is the alarm it deserves. */
-	if (chowned && !trashed) {
-		if (t.fd >= 0)
-			(void)fchown(t.fd, prev_uid, prev_gid);
-		else if (t.path != NULL)
-			(void)lchown(t.path, prev_uid, prev_gid);
-	}
 	/* A failed trash leaves the node in place: its blocking bits go back
 	 * on. After a successful one target_forget() made this a no-op. */
 	if (target_restore(&t, NULL) != 0)
@@ -3493,17 +3777,67 @@ block_signals(void)
 }
 
 /*
- * seal: give the node at --path (and, with --recursive, every node under it)
- * to --chown, set --mode on the top node, and add --flag to each node's flag
- * word. unseal: the same with the flag taken away. Every node must be a
- * directory, a regular file or a symlink, owned by one of --owner; the top
- * node must also be --id. A seal that gives nodes away refuses a set-user-id
- * or set-group-id file. On any refusal or failure everything already changed
- * is put back.
+ * A folder only root may enter or change, held: root's, no group or other
+ * bits. Staging for --stage and install's --src. "Root" is this process's
+ * own account, which the root gate makes root in every release run; a
+ * test build run by a user takes that user's own folder.
+ */
+static int
+open_root_dir(const char *path, const char *what, int *out)
+{
+	char buf[PATH_MAX];
+	const char *leaf;
+	node_t d;
+	int pfd, rc;
+
+	*out = -1;
+	pfd = open_parent(path, buf, sizeof(buf), &leaf, NULL, NULL);
+	if (pfd < 0)
+		return (pfd == -2 ? EX_HELPER_REFUSED : EX_HELPER_OPFAIL);
+	rc = node_at(pfd, leaf, path, &d);
+	close(pfd);
+	if (rc != EX_HELPER_OK)
+		return (rc);
+	if (!S_ISDIR(d.st.st_mode) || d.st.st_uid != g_self_uid ||
+	    (d.st.st_mode & 077) != 0) {
+		errf("refusing, %s is not a folder only root may enter: %s",
+		    what, path);
+		close(d.fd);
+		return (EX_HELPER_REFUSED);
+	}
+	*out = d.fd;
+	return (EX_HELPER_OK);
+}
+
+/* Remove the originals a swap parked in staging. One that will not go is
+ * named and left: it is root's, in root's folder. */
+static void
+staged_drop(tree_t *t)
+{
+	size_t i;
+
+	for (i = 0; i < t->staged.n; i++)
+		if (unlinkat(t->sfd, t->staged.v[i].name, 0) != 0)
+			errf("cannot remove a swapped-out file from staging "
+			    "(%s): %s", strerror(errno), t->staged.v[i].name);
+	elist_free(&t->staged);
+}
+
+/*
+ * seal: add --flag to the flag word of the node at --path and, with
+ * --recursive, of every node under it. unseal: take it away. Every node
+ * must be a directory, a regular file or a symlink, owned by one of
+ * --owner; the top node must also be --id. A seal refuses a set-user-id or
+ * set-group-id file. On any refusal or failure everything already changed
+ * is put back (a file already swapped stays the copy).
+ *
+ * seal --swap --stage DIR: each regular file is swapped for a copy made in
+ * DIR first (swap_in), and its fingerprint printed. DIR must be root's
+ * alone, on the volume of the files.
  *
  * unseal --recursive runs in two passes: the first freezes every directory
  * before reading it and gates every node, changing nothing else, so a
- * refusal finds the tree as it was; the second hands the nodes back, bottom
+ * refusal finds the tree as it was; the second releases the nodes, bottom
  * up.
  *
  * Before either verb changes anything, a read-only pass counts the nodes it
@@ -3511,13 +3845,13 @@ block_signals(void)
  * --recursive. Any other number refuses, and every pass after it is held
  * to the same count (visit).
  *
- * A placement directory also carries one ACL entry for the invoker (see
- * aclspec_t): seal --acl-add puts it on before the owner changes, and
- * refuses a directory that already has an entry naming that account,
- * since a release could not tell the two apart; unseal --acl-remove takes
- * exactly that entry off after the owner and mode are back, and an entry
- * that is not there as named is left to the caller, on an acl-absent line.
- * Both take a single directory, never a tree.
+ * After a seal, every process holding one of the sealed files open for
+ * writing is named (writer_scan): exit 8, the seal done.
+ *
+ * --chown, --mode and --acl-remove serve the one-shot conversion from the
+ * lock-account seals of 0.16 and earlier: an unseal hands a node back to
+ * its recorded owner, and takes a placement directory's ACL entry off.
+ * TODO(0.18.0): remove with the conversion.
  */
 static int
 cmd_tree(int argc, char **argv, int sealing)
@@ -3527,9 +3861,10 @@ cmd_tree(int argc, char **argv, int sealing)
 	owners_t owners;
 	tree_t t;
 	node_t top;
-	char buf[PATH_MAX];
+	place_t at;
+	char buf[PATH_MAX], pdir[PATH_MAX], *slash;
 	const char *leaf;
-	int pfd, rc;
+	int pfd, rc, hits;
 
 	if (parse_opts(argc, argv, &o) != 0)
 		return (EX_HELPER_USAGE);
@@ -3539,6 +3874,7 @@ cmd_tree(int argc, char **argv, int sealing)
 	    need(o.count, "--count") != 0)
 		return (EX_HELPER_USAGE);
 	memset(&t, 0, sizeof(t));
+	t.sfd = -1;
 	if (parse_owners(o.owner, &owners) != 0) {
 		errf("--owner is not a list of accounts");
 		return (EX_HELPER_USAGE);
@@ -3556,6 +3892,10 @@ cmd_tree(int argc, char **argv, int sealing)
 		return (EX_HELPER_USAGE);
 	}
 	if (o.chown != NULL) {
+		if (sealing) {
+			errf("--chown is for unseal");
+			return (EX_HELPER_USAGE);
+		}
 		if (parse_chown(o.chown, &t.uid, &t.gid) != 0) {
 			errf("--chown must be <user>:<group>");
 			return (EX_HELPER_USAGE);
@@ -3563,63 +3903,71 @@ cmd_tree(int argc, char **argv, int sealing)
 		t.chown = 1;
 	}
 	if (o.mode != NULL) {
+		if (sealing) {
+			errf("--mode is for unseal");
+			return (EX_HELPER_USAGE);
+		}
 		if (parse_mode(o.mode, &t.mode) != 0) {
 			errf("--mode must be octal permission bits");
 			return (EX_HELPER_USAGE);
 		}
 		t.has_mode = 1;
 	}
-	/* A directory the user still owns is closed by no flag, since its
-	 * owner can clear one; a tree is walked only as it changes hands. */
-	if (o.recursive && !t.chown) {
-		errf("--recursive needs --chown");
+	/* A tree is frozen whole: every directory and file immutable. An
+	 * unseal's first pass freezes with the flag it clears, so any other
+	 * flag would leave those freezes behind. */
+	if (o.recursive && t.flag != SF_IMMUTABLE && t.flag != UF_IMMUTABLE) {
+		errf("--recursive takes --flag schg or uchg");
 		return (EX_HELPER_USAGE);
 	}
-	/* An unseal's first pass freezes with uchg, and only the flag the
-	 * unseal clears comes off in the second: any other flag would leave
-	 * those freezes behind. A tree is sealed with uchg alone. */
-	if (o.recursive && t.flag != UF_IMMUTABLE) {
-		errf("--recursive takes --flag uchg");
+	if ((o.swap || o.stage != NULL) && !sealing) {
+		errf("--swap and --stage are for seal");
 		return (EX_HELPER_USAGE);
 	}
-	if (o.acl_add != NULL && !sealing) {
-		errf("--acl-add is for seal; unseal takes --acl-remove");
+	if (o.swap != (o.stage != NULL)) {
+		errf("--swap and --stage go together");
 		return (EX_HELPER_USAGE);
 	}
-	if (o.acl_remove != NULL && sealing) {
-		errf("--acl-remove is for unseal; seal takes --acl-add");
+	if (o.stage != NULL && need_abs(o.stage, "--stage") != 0)
 		return (EX_HELPER_USAGE);
-	}
-	if (o.acl_add != NULL || o.acl_remove != NULL) {
-		const char *what = sealing ? "--acl-add" : "--acl-remove";
-
+	if (o.acl_remove != NULL) {
+		if (sealing) {
+			errf("--acl-remove is for unseal");
+			return (EX_HELPER_USAGE);
+		}
 		/* One entry on one directory: nothing below it is the
 		 * placement seal's. */
 		if (o.recursive) {
-			errf("%s takes a single node, never --recursive", what);
+			errf("--acl-remove takes a single node, never "
+			    "--recursive");
 			return (EX_HELPER_USAGE);
 		}
-		if (parse_acl(sealing ? o.acl_add : o.acl_remove, what,
-		    &t.acl) != 0)
+		if (parse_acl(o.acl_remove, "--acl-remove", &t.acl) != 0)
 			return (EX_HELPER_USAGE);
-		t.acl.op = sealing ? 1 : -1;
+		t.acl.op = -1;
 	}
 	t.sealing = sealing;
 	t.owners = &owners;
 	t.recursive = o.recursive;
+	t.swap = o.swap;
 	t.top = o.path;
 	t.topfd = -1;
 
 	TEST_PAUSE(sealing ? "seal" : "unseal");
 	block_signals();
 
+	if (o.stage != NULL &&
+	    (rc = open_root_dir(o.stage, "--stage", &t.sfd)) != EX_HELPER_OK)
+		return (rc);
 	pfd = open_parent(o.path, buf, sizeof(buf), &leaf, NULL, NULL);
-	if (pfd < 0)
-		return (pfd == -2 ? EX_HELPER_REFUSED : EX_HELPER_OPFAIL);
+	if (pfd < 0) {
+		rc = pfd == -2 ? EX_HELPER_REFUSED : EX_HELPER_OPFAIL;
+		goto done;
+	}
 	rc = node_at(pfd, leaf, o.path, &top);
 	if (rc != EX_HELPER_OK) {
 		close(pfd);
-		return (rc);
+		goto done;
 	}
 	/* A link has no descriptor getattrlist answers for; its volume is
 	 * asked by the held parent and the name, never by a path. */
@@ -3627,70 +3975,68 @@ cmd_tree(int argc, char **argv, int sealing)
 	    at_name(pfd, leaf) : at_fd(top.fd)) != 0) {
 		close(pfd);
 		close(top.fd);
-		return (EX_HELPER_IDENT);
+		rc = EX_HELPER_IDENT;
+		goto done;
 	}
-	close(pfd);
-	rc = gate(&top, o.path, &owners, sealing && t.chown);
-	if (rc == EX_HELPER_OK && sealing && t.chown && t.has_mode &&
-	    S_ISREG(top.st.st_mode) && (t.mode & (S_ISUID | S_ISGID)) != 0) {
-		errf("refusing, a set-user-id or set-group-id mode would run "
-		    "as the file's new owner once sealed: %s", o.path);
-		rc = EX_HELPER_REFUSED;
-	}
+	rc = gate(&top, o.path, &owners, sealing);
 	if (rc == EX_HELPER_OK && t.acl.op != 0 &&
 	    !S_ISDIR(top.st.st_mode)) {
 		errf("refusing, an ACL entry goes on a directory only: %s",
 		    o.path);
 		rc = EX_HELPER_REFUSED;
 	}
-	if (rc == EX_HELPER_OK && t.acl.op > 0) {
-		acl_t had;
-
-		if (acl_read(top.fd, o.path, &had) != 0) {
-			rc = EX_HELPER_OPFAIL;
-		} else if (had != NULL) {
-			if (acl_names(had, &t.acl)) {
-				char who[64];
-
-				user_name(t.acl.uid, who, sizeof(who));
-				errf("refusing, it already carries an ACL entry "
-				    "for %s, which a release could not tell "
-				    "from the seal's own: %s", who, o.path);
-				rc = EX_HELPER_REFUSED;
-			}
-			acl_free(had);
-		}
-	}
 	if (rc != EX_HELPER_OK) {
+		close(pfd);
 		close(top.fd);
-		return (rc);
+		goto done;
 	}
 	t.dev = top.st.st_dev;
 	t.topfd = top.fd;
+	/* The top's folder stays held: a file at the top is swapped in by
+	 * its name there. The walk reached it for search only, and a swap's
+	 * entry diff lists it, so it is held readable from here. */
+	if ((rc = openat(pfd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0) {
+		errf("cannot open its folder (%s): %s", strerror(errno),
+		    o.path);
+		close(pfd);
+		close(top.fd);
+		rc = EX_HELPER_OPFAIL;
+		goto done;
+	}
+	close(pfd);
+	pfd = rc;
+	rc = EX_HELPER_OK;
+	strlcpy(pdir, o.path, sizeof(pdir));
+	slash = strrchr(pdir, '/');
+	if (slash == pdir)
+		slash[1] = '\0';
+	else
+		*slash = '\0';
+	at.pfd = pfd;
+	at.ppath = pdir;
+	at.name = leaf;
 
-	rc = count_walk(&t, &top, o.path, "", 0);
+	rc = count_walk(&t, &top, &at, o.path, "", 0);
 	if (rc == EX_HELPER_OK)
 		rc = count_matches(&t, "the tree holds");
-	if (rc != EX_HELPER_OK) {
-		close(top.fd);
-		return (rc);
-	}
+	if (rc != EX_HELPER_OK)
+		goto close_top;
 	/* The moment between the count and the first change, held open in a
 	 * test build so a test can plant a node the count did not see. */
 	TEST_PAUSE(sealing ? "seal-walk" : "unseal-walk");
 
 	t.seen = 0;
 	if (sealing) {
-		rc = seal_walk(&t, &top, o.path, "", 0);
+		rc = seal_walk(&t, &top, &at, o.path, "", 0);
 		if (rc == EX_HELPER_OK)
 			rc = count_matches(&t, "the seal reached");
 	} else {
 		/* Only a tree has a first pass. A single node (a file, a link,
-		 * or a directory such as a chain anchor whose entries are not
+		 * or a directory such as a chain folder whose entries are not
 		 * part of the seal) was gated above, and nothing below it is
 		 * read, gated or frozen. */
 		if (t.recursive) {
-			rc = check_walk(&t, &top, o.path, "", 0);
+			rc = check_walk(&t, &top, &at, o.path, "", 0);
 			if (rc == EX_HELPER_OK)
 				rc = count_matches(&t, "the first pass reached");
 			t.seen = 0;
@@ -3703,7 +4049,7 @@ cmd_tree(int argc, char **argv, int sealing)
 			rc = EX_HELPER_OPFAIL;
 		}
 		if (rc == EX_HELPER_OK)
-			rc = unseal_walk(&t, &top, o.path, "", 0);
+			rc = unseal_walk(&t, &top, &at, o.path, "", 0);
 		if (rc == EX_HELPER_OK)
 			rc = count_matches(&t, "the unseal reached");
 	}
@@ -3714,8 +4060,23 @@ cmd_tree(int argc, char **argv, int sealing)
 		print_escaped(o.path);
 		fputc('\n', stdout);
 	}
+	if (rc == EX_HELPER_OK && t.anomalies > 0)
+		rc = EX_HELPER_ANOMALY;
+	if ((rc == EX_HELPER_OK || rc == EX_HELPER_ANOMALY) && sealing) {
+		hits = writer_scan(&t.flagged);
+		if (hits != 0)
+			rc = EX_HELPER_WRITER;
+	}
+close_top:
 	journal_free(&t);
 	close(top.fd);
+	close(pfd);
+done:
+	if (t.sfd >= 0) {
+		staged_drop(&t);
+		close(t.sfd);
+	}
+	iset_free(&t.flagged);
 	return (rc);
 }
 
@@ -3936,6 +4297,408 @@ cmd_copy_tree(int argc, char **argv)
 	return (rc);
 }
 
+/* ---- verb: install ------------------------------------------------------ */
+
+/*
+ * install: put an approved file in place, sealed. --src is the staged file,
+ * root's, in a folder only root may enter, on the volume of --parent. It
+ * takes --chown and --mode while it is still there, and its fingerprint is
+ * taken there. Then, inside a window on the held parent, one rename puts
+ * it at --name: swapped with the sealed file --target-id names (owned by
+ * one of --owner; its flag lifted for the swap, the inode that went out
+ * checked, then removed from staging), or, with --new, at a name nothing
+ * holds yet. The flag goes on through the held descriptor of the new file,
+ * and every process holding it open for writing is named (exit 8, the
+ * install done). When the parent's own flags had to come off, its entries
+ * are compared across the window (exit 6 on any other change).
+ */
+static int
+cmd_install(int argc, char **argv)
+{
+	opts_t o;
+	nodeid_t pid, tid;
+	owners_t owners;
+	window_t w;
+	target_t t;
+	expect_t exp;
+	node_t src;
+	iset_t one;
+	struct stat chk, out;
+	uid_t uid;
+	gid_t gid;
+	mode_t mode;
+	uint32_t flag, keep = 0;
+	char sbuf[PATH_MAX], hex[65];
+	const char *sleaf;
+	int sdir = -1, rc, status = EX_HELPER_OK, moved = 0, hits;
+
+	if (parse_opts(argc, argv, &o) != 0)
+		return (EX_HELPER_USAGE);
+	if (need_abs(o.src, "--src") != 0 ||
+	    need_abs(o.parent, "--parent") != 0 ||
+	    need_component(o.name, "--name") != 0 ||
+	    parse_ids(o.parent_id, &pid, "--parent-id") != 0 ||
+	    need(o.chown, "--chown") != 0 || need(o.mode, "--mode") != 0 ||
+	    need(o.flag, "--flag") != 0)
+		return (EX_HELPER_USAGE);
+	if (o.new_node && (o.target_id != NULL || o.owner != NULL)) {
+		errf("--new names no target; --target-id and --owner do not apply");
+		return (EX_HELPER_USAGE);
+	}
+	if (!o.new_node && (parse_ids(o.target_id, &tid, "--target-id") != 0 ||
+	    need(o.owner, "--owner") != 0))
+		return (EX_HELPER_USAGE);
+	if (!o.new_node && !tid.given) {
+		errf("--target-id must name the sealed file");
+		return (EX_HELPER_USAGE);
+	}
+	if (!o.new_node && parse_owners(o.owner, &owners) != 0) {
+		errf("--owner is not a list of accounts");
+		return (EX_HELPER_USAGE);
+	}
+	if (parse_chown(o.chown, &uid, &gid) != 0) {
+		errf("--chown must be <user>:<group>");
+		return (EX_HELPER_USAGE);
+	}
+	if (parse_mode(o.mode, &mode) != 0 || (mode & (S_ISUID | S_ISGID))) {
+		errf("--mode must be octal permission bits, no set-id bit");
+		return (EX_HELPER_USAGE);
+	}
+	if (parse_flag(o.flag, &flag) != 0) {
+		errf("--flag must be one of uchg, uappnd, schg, sappnd");
+		return (EX_HELPER_USAGE);
+	}
+
+	window_init(&w);
+	target_init(&t);
+	memset(&one, 0, sizeof(one));
+	src.fd = -1;
+	TEST_PAUSE("install");
+
+	/* The staged file: root's, alone in name, in root's own folder (this
+	 * process's account, as open_root_dir takes it). */
+	sdir = open_parent(o.src, sbuf, sizeof(sbuf), &sleaf, NULL, NULL);
+	if (sdir < 0)
+		return (sdir == -2 ? EX_HELPER_REFUSED : EX_HELPER_OPFAIL);
+	if (fstat(sdir, &chk) != 0 || chk.st_uid != g_self_uid ||
+	    (chk.st_mode & 077) != 0) {
+		errf("refusing, the staged file is not in a folder only root "
+		    "may enter: %s", o.src);
+		close(sdir);
+		return (EX_HELPER_REFUSED);
+	}
+	rc = node_at(sdir, sleaf, o.src, &src);
+	if (rc == EX_HELPER_OK && (!S_ISREG(src.st.st_mode) ||
+	    src.st.st_uid != g_self_uid || src.st.st_nlink != 1)) {
+		errf("refusing, the staged file is not a regular file of "
+		    "root's with one name: %s", o.src);
+		rc = EX_HELPER_REFUSED;
+	}
+	if (rc != EX_HELPER_OK) {
+		status = rc;
+		goto cleanup;
+	}
+
+	rc = window_open(&w, o.parent, &pid);
+	if (rc != EX_HELPER_OK) {
+		status = rc;
+		goto cleanup;
+	}
+	if (w.st.st_dev != src.st.st_dev) {
+		errf("refusing, it is not on the volume of locked's staging: "
+		    "%s", o.parent);
+		status = EX_HELPER_REFUSED;
+		goto cleanup;
+	}
+	if (o.new_node) {
+		if (fstatat(w.fd, o.name, &chk, AT_SYMLINK_NOFOLLOW) == 0 ||
+		    errno != ENOENT) {
+			errf("refusing, something is already at the new "
+			    "name: %s/%s", o.parent, o.name);
+			status = EX_HELPER_REFUSED;
+			goto cleanup;
+		}
+	} else {
+		rc = target_open(&t, w.fd, o.parent, o.name, &tid);
+		if (rc == EX_HELPER_OK && (t.fd < 0 || !S_ISREG(t.st.st_mode))) {
+			errf("refusing, not a regular file: %s", t.path);
+			rc = EX_HELPER_REFUSED;
+		}
+		if (rc == EX_HELPER_OK)
+			rc = gate_owner(&t.st, t.path, &owners);
+		if (rc != EX_HELPER_OK) {
+			status = rc;
+			goto cleanup;
+		}
+		keep = t.st.st_flags & KEPT_FLAGS;
+	}
+
+	/* Owner, mode and kept flags while the file is still out of reach,
+	 * and the fingerprint of exactly these bytes. */
+	if (fchown(src.fd, uid, gid) != 0 || fchmod(src.fd, mode) != 0 ||
+	    fchflags(src.fd, keep) != 0 || sha256_fd(src.fd, hex) != 0 ||
+	    fstat(src.fd, &src.st) != 0) {
+		errf("cannot prepare the staged file (%s): %s",
+		    strerror(errno), o.src);
+		status = EX_HELPER_OPFAIL;
+		goto cleanup;
+	}
+
+	if ((rc = window_clear(&w)) != EX_HELPER_OK ||
+	    (!o.new_node && (rc = target_clear(&t)) != EX_HELPER_OK)) {
+		status = rc;
+		goto cleanup;
+	}
+	if (renameatx_np(sdir, sleaf, w.fd, o.name,
+	    o.new_node ? RENAME_EXCL : RENAME_SWAP) != 0) {
+		errf("cannot put it in place (%s): %s/%s", strerror(errno),
+		    o.parent, o.name);
+		status = EX_HELPER_OPFAIL;
+		goto cleanup;
+	}
+	moved = 1;
+	/* The new file is at the name, and for a swap the sealed one is what
+	 * went out; anything else is a race, put back as it was. */
+	if (fstatat(w.fd, o.name, &chk, AT_SYMLINK_NOFOLLOW) != 0 ||
+	    chk.st_ino != src.st.st_ino || (!o.new_node &&
+	    (fstatat(sdir, sleaf, &out, AT_SYMLINK_NOFOLLOW) != 0 ||
+	    out.st_ino != t.st.st_ino))) {
+		if (o.new_node)
+			rc = renameatx_np(w.fd, o.name, sdir, sleaf,
+			    RENAME_EXCL);
+		else
+			rc = renameatx_np(sdir, sleaf, w.fd, o.name,
+			    RENAME_SWAP);
+		errf("refusing, the file at the name changed while it was "
+		    "replaced%s: %s/%s", rc == 0 ? "" :
+		    ", and could not be put back", o.parent, o.name);
+		status = rc == 0 ? EX_HELPER_IDENT : EX_HELPER_OPFAIL;
+		goto cleanup;
+	}
+	if (fchflags(src.fd, src.st.st_flags | flag) != 0) {
+		errf("cannot seal it (%s): %s/%s", strerror(errno), o.parent,
+		    o.name);
+		fputs("window-open\t", stdout);
+		print_escaped(t.path != NULL ? t.path : o.name);
+		fputc('\n', stdout);
+		status = EX_HELPER_WINOPEN;
+	}
+	/* The sealed file went out with its flags lifted; it leaves. */
+	if (!o.new_node) {
+		target_forget(&t);
+		if (unlinkat(sdir, sleaf, 0) != 0)
+			errf("cannot remove the replaced file from staging "
+			    "(%s): %s", strerror(errno), o.src);
+	}
+	print_sum(hex, "");
+	iset_add(&one, src.st.st_dev, src.st.st_ino);
+
+cleanup:
+	if (target_restore(&t, NULL) != 0)
+		status = EX_HELPER_WINOPEN;
+	if (window_restore(&w) != 0)
+		status = EX_HELPER_WINOPEN;
+	if (moved && status == EX_HELPER_OK &&
+	    (w.saved & BLOCKING_FLAGS) != 0) {
+		if (snapshot(w.fd, w.path, &w.after) != 0) {
+			status = EX_HELPER_ANOMALY;
+		} else {
+			memset(&exp, 0, sizeof(exp));
+			if (o.new_node) {
+				exp.added = o.name;
+				exp.add_dev = src.st.st_dev;
+				exp.add_ino = src.st.st_ino;
+			} else {
+				exp.swapped = o.name;
+				exp.swap_ino = src.st.st_ino;
+			}
+			if (diff_report(&w.before, &w.after, &exp) > 0)
+				status = EX_HELPER_ANOMALY;
+		}
+	}
+	if (status == EX_HELPER_OK || status == EX_HELPER_ANOMALY) {
+		hits = writer_scan(&one);
+		if (hits != 0)
+			status = EX_HELPER_WRITER;
+	}
+	iset_free(&one);
+	target_close(&t);
+	window_close(&w);
+	if (src.fd >= 0)
+		close(src.fd);
+	close(sdir);
+	return (status);
+}
+
+/* ---- verb: digest ------------------------------------------------------- */
+
+/* Every regular file under a held directory, depth first in name order --
+ * the order seal_walk takes, so the two print the same lines. */
+static int
+digest_dir(const reader_t *r, const owners_t *owners, const node_t *dir,
+    const char *path, const char *rel, dev_t dev, int depth, int inr)
+{
+	elist_t names;
+	size_t i;
+	char hex[65];
+	int rc = EX_HELPER_OK;
+
+	if (depth >= MAX_DEPTH) {
+		errf("refusing a tree deeper than %d levels: %s", MAX_DEPTH,
+		    path);
+		return (EX_HELPER_REFUSED);
+	}
+	if (snapshot(dir->fd, path, &names) != 0)
+		return (EX_HELPER_OPFAIL);
+	for (i = 0; i < names.n && rc == EX_HELPER_OK; i++) {
+		char *cpath = join_path(path, names.v[i].name);
+		char *crel = rel_join(rel, names.v[i].name);
+		int cinr = inr;
+		node_t c;
+
+		rc = node_at_as(dir->fd, names.v[i].name, cpath, &c, r, &cinr);
+		become_self();
+		if (rc == EX_HELPER_OK && c.st.st_dev != dev) {
+			errf("refusing, a mount point inside the tree: %s",
+			    cpath);
+			rc = EX_HELPER_REFUSED;
+		}
+		if (rc == EX_HELPER_OK)
+			rc = gate_owner(&c.st, cpath, owners);
+		if (rc == EX_HELPER_OK && S_ISDIR(c.st.st_mode))
+			rc = digest_dir(r, owners, &c, cpath, crel, dev,
+			    depth + 1, cinr);
+		else if (rc == EX_HELPER_OK && S_ISREG(c.st.st_mode)) {
+			if (sha256_fd(c.fd, hex) != 0) {
+				errf("cannot read (%s): %s", strerror(errno),
+				    cpath);
+				rc = EX_HELPER_OPFAIL;
+			} else {
+				print_sum(hex, crel);
+			}
+		}
+		if (c.fd >= 0)
+			close(c.fd);
+		free(cpath);
+		free(crel);
+	}
+	elist_free(&names);
+	return (rc);
+}
+
+/*
+ * digest: the fingerprint of the file at --src, or with --recursive of
+ * every regular file in the folder there, in the lines seal --swap and
+ * install print. Read as --as wherever --as owns the path, through the
+ * owner gate, the top pinned by --src-id: what verify compares against the
+ * fingerprints a seal recorded.
+ */
+static int
+cmd_digest(int argc, char **argv)
+{
+	opts_t o;
+	nodeid_t sid;
+	owners_t owners;
+	reader_t r;
+	struct stat st;
+	node_t top;
+	char buf[PATH_MAX], hex[65];
+	const char *leaf;
+	int fd, pfd, inr = 1, rc;
+
+	if (parse_opts(argc, argv, &o) != 0)
+		return (EX_HELPER_USAGE);
+	if (need_abs(o.src, "--src") != 0 ||
+	    parse_ids(o.src_id, &sid, "--src-id") != 0 ||
+	    parse_source(&o, &owners, &r) != 0)
+		return (EX_HELPER_USAGE);
+
+	if (!o.recursive) {
+		rc = open_source(&o, &r, &owners, &sid, &fd, &st);
+		if (rc != EX_HELPER_OK)
+			return (rc);
+		rc = sha256_fd(fd, hex);
+		close(fd);
+		if (rc != 0) {
+			errf("cannot read (%s): %s", strerror(errno), o.src);
+			return (EX_HELPER_OPFAIL);
+		}
+		print_sum(hex, "");
+		return (EX_HELPER_OK);
+	}
+	pfd = open_parent(o.src, buf, sizeof(buf), &leaf, &r, &inr);
+	if (pfd < 0) {
+		become_self();
+		return (pfd == -2 ? EX_HELPER_REFUSED : EX_HELPER_OPFAIL);
+	}
+	rc = node_at_as(pfd, leaf, o.src, &top, &r, &inr);
+	become_self();
+	close(pfd);
+	if (rc != EX_HELPER_OK)
+		return (rc);
+	if (check_id("source", o.src, &sid, &top.st, at_fd(top.fd)) != 0)
+		rc = EX_HELPER_IDENT;
+	else if ((rc = gate_owner(&top.st, o.src, &owners)) == EX_HELPER_OK &&
+	    !S_ISDIR(top.st.st_mode)) {
+		errf("not a directory: %s", o.src);
+		rc = EX_HELPER_OPFAIL;
+	}
+	if (rc == EX_HELPER_OK)
+		rc = digest_dir(&r, &owners, &top, o.src, "", top.st.st_dev, 0,
+		    inr);
+	close(top.fd);
+	return (rc);
+}
+
+/* ---- verb: mount -------------------------------------------------------- */
+
+/*
+ * The mount point of the volume a path resolves into: for a folder, the
+ * folder itself; for anything else, its parent. A disk image attached over
+ * a sealed folder, or over a folder above one, makes the path resolve into
+ * the image, so its mount point is what this prints. Changes nothing and
+ * needs no root, like `id`.
+ */
+static int
+cmd_mount(int argc, char **argv)
+{
+	struct stat st;
+	struct statfs sf;
+	char buf[PATH_MAX], *slash;
+	const char *q;
+
+	if (argc != 3) {
+		errf("mount takes exactly one path");
+		return (EX_HELPER_USAGE);
+	}
+	if (need_abs(argv[2], "<path>") != 0)
+		return (EX_HELPER_USAGE);
+	q = argv[2];
+	if (lstat(q, &st) != 0) {
+		errf("cannot stat %s: %s", q, strerror(errno));
+		return (EX_HELPER_OPFAIL);
+	}
+	if (!S_ISDIR(st.st_mode)) {
+		if (strlcpy(buf, q, sizeof(buf)) >= sizeof(buf)) {
+			errf("path too long: %s", q);
+			return (EX_HELPER_USAGE);
+		}
+		slash = strrchr(buf, '/');
+		if (slash == buf)
+			slash[1] = '\0';
+		else
+			*slash = '\0';
+		q = buf;
+	}
+	if (statfs(q, &sf) != 0) {
+		errf("cannot read the volume of %s: %s", q, strerror(errno));
+		return (EX_HELPER_OPFAIL);
+	}
+	print_escaped(sf.f_mntonname);
+	fputc('\n', stdout);
+	return (EX_HELPER_OK);
+}
+
 /* ---- verb: id ----------------------------------------------------------- */
 
 /*
@@ -4006,10 +4769,11 @@ main(int argc, char **argv)
 		usage();
 		return (EX_HELPER_USAGE);
 	}
-	/* Dispatched before the root gate: `id` changes nothing, and the bash
-	 * side's unprivileged verbs need it. */
-	if (strcmp(argv[1], "id") == 0) {
-		status = cmd_id(argc, argv);
+	/* Dispatched before the root gate: `id` and `mount` change nothing,
+	 * and the bash side's unprivileged verbs need them. */
+	if (strcmp(argv[1], "id") == 0 || strcmp(argv[1], "mount") == 0) {
+		status = strcmp(argv[1], "id") == 0 ? cmd_id(argc, argv) :
+		    cmd_mount(argc, argv);
 		if (status == EX_HELPER_USAGE)
 			usage();
 		fflush(stdout);
@@ -4039,6 +4803,10 @@ main(int argc, char **argv)
 		status = cmd_tree(argc, argv, 1);
 	else if (strcmp(argv[1], "unseal") == 0)
 		status = cmd_tree(argc, argv, 0);
+	else if (strcmp(argv[1], "install") == 0)
+		status = cmd_install(argc, argv);
+	else if (strcmp(argv[1], "digest") == 0)
+		status = cmd_digest(argc, argv);
 	else {
 		errf("unknown verb %s", argv[1]);
 		usage();
