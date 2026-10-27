@@ -72,6 +72,12 @@ let
       from = "readonly LOCKED_GIT=/Library/Developer/CommandLineTools/usr/bin/git";
       to = "readonly LOCKED_GIT=${pkgs.git}/bin/git";
     }
+    {
+      # The diff pager's terminfo, from the root-owned system profile, so a
+      # terminal whose entry the system profile installs pages normally.
+      from = "readonly PAGER_TERMINFO_DIRS=";
+      to = "readonly PAGER_TERMINFO_DIRS=/run/current-system/sw/share/terminfo";
+    }
   ];
   scriptText =
     assert lib.assertMsg (lib.all (a: lib.hasInfix a.from srcText) anchors)

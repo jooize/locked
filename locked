@@ -87,6 +87,17 @@ VERSION=0.17.0
 # inside /Applications, a folder the admin group can write -- so walking
 # the shim's own path would vouch for a program it does not run.
 readonly LOCKED_GIT=/Library/Developer/CommandLineTools/usr/bin/git
+# Where the diff pager looks up the terminal's description (terminfo), ahead
+# of the system's own database: a colon-separated list of root-owned
+# directories. The pager runs under env -i, which drops the caller's
+# TERMINFO and TERMINFO_DIRS (a user process can set either, and the entry
+# chooses the control sequences a root less writes). A terminal newer than
+# the OS database (TERM=xterm-ghostty) then has no entry, and less runs in
+# dumb mode: "terminal is not fully functional", no paging. Empty here: the
+# system database only. The nix module rewrites it to the system profile's
+# terminfo directory (keep the exact `readonly PAGER_TERMINFO_DIRS=` shape
+# for its anchor); the system database stays searched after it.
+readonly PAGER_TERMINFO_DIRS=
 # Everything locked keeps: one root-owned dir per user under it, holding
 # that user's pool (see the root convergence block below for the shape).
 # The helper walks every path it reads from "/", and follows a symlink only
@@ -2875,7 +2886,11 @@ show_diff() { # <rule> <row label> <path> <old> <new> <old-label> <new-label> [<
       # A clean environment and secure mode: no lesskey file (which can
       # bind a key to a shell command), LESS or LESSOPEN from the caller
       # reaches this root less, and its shell, pipe and edit commands are off.
-      env -i PATH="$PATH" HOME=/var/empty TERM="${TERM:-dumb}" \
+      # Terminfo comes from PAGER_TERMINFO_DIRS, then the system database
+      # (the trailing empty entry), never from the caller.
+      local ti=()
+      [[ -n "$PAGER_TERMINFO_DIRS" ]] && ti=(TERMINFO_DIRS="$PAGER_TERMINFO_DIRS:")
+      env -i PATH="$PATH" HOME=/var/empty TERM="${TERM:-dumb}" ${ti[@]+"${ti[@]}"} \
         LESSSECURE=1 LESSCHARSET=utf-8 /usr/bin/less -RF -- "$enc" || true
       shown=1
     fi
