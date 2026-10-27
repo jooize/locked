@@ -189,6 +189,8 @@ done
 ```
 If any ancestor is user-owned -- common on Intel Macs where Homebrew once `chown`ed `/usr/local` -- repair before continuing: `sudo chown root:wheel PATH && sudo chmod 755 PATH`.
 
+The diff pager runs as root in a clean environment, so it never sees your `TERMINFO` or `TERMINFO_DIRS` and finds your terminal only in the system terminfo database. A terminal macOS does not know (Ghostty's `xterm-ghostty`) gets less's dumb mode: no paging. To fix that, edit the `readonly PAGER_TERMINFO_DIRS=` line in your copy before installing, naming root-owned terminfo directories (colon-separated) to search ahead of the system database. Homebrew's `/opt/homebrew/share/terminfo` does not qualify: your user owns it. The nix module fills this line in for you.
+
 Then install:
 ```sh
 sudo install -d -m 755 -o root -g wheel /usr/local/sbin
